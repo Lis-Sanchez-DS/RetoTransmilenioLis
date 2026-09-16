@@ -18,14 +18,22 @@ def get_cursor() -> str | None:
     return row[0] if row else None
 
 
-def collect_once() -> int:
+def collect_last_15(fetcher=None) -> dict:
+    """Collect exactly the next 15 stream records and persist the cursor."""
     cursor = get_cursor()
-    query = urlencode({"cursor": cursor}) if cursor else ""
-    request = Request(f"{API_URL}/v1/stream/observations?{query}")
-    with urlopen(request, timeout=30) as response:
-        payload = json.load(response)
+    query = {"limit": 15}
+    if cursor:
+        query["cursor"] = cursor
+    if fetcher is None:
+        request = Request(f"{API_URL}/v1/stream/observations?{urlencode(query)}")
+        with urlopen(request, timeout=30) as response:
+            payload = json.load(response)
+    else:
+        payload = fetcher(cursor=cursor, limit=15)
 
     records = payload.get("observations", payload.get("data", []))
+    if len(records) > 15:
+        records = records[:15]
     next_cursor = payload.get("next_cursor")
     if next_cursor is None:
         raise RuntimeError("The stream response did not include next_cursor")
@@ -46,16 +54,12 @@ def collect_once() -> int:
                    SET cursor_value = EXCLUDED.cursor_value, updated_at = now()""",
                 (next_cursor,),
             )
-    return len(records)
+    return {"collected": len(records), "cursor": next_cursor}
 
 
 def run() -> None:
-    while True:
-        try:
-            print(f"Collected {collect_once()} observations", flush=True)
-        except Exception as error:
-            print(f"Collector error: {error}", flush=True)
-        time.sleep(POLL_SECONDS)
+    result = collect_last_15()
+    print(f"Collected {result['collected']} observations; cursor={result['cursor']}", flush=True)
 
 
 if __name__ == "__main__":

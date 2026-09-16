@@ -46,7 +46,6 @@ services:
     environment:
       DATABASE_URL: postgresql://${API_DB_USER:-pulso_api}:${API_DB_PASSWORD:?Set API_DB_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-pulso_transmi}
       PULSO_API_URL: ${PULSO_API_URL:-https://pulso-transmi.72-60-245-2.sslip.io}
-      COLLECTOR_POLL_SECONDS: ${COLLECTOR_POLL_SECONDS:-120}
     depends_on:
       postgres:
         condition: service_healthy
