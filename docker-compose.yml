@@ -1,0 +1,68 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-pulso_transmi}
+      POSTGRES_USER: ${POSTGRES_USER:-pulso_admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      API_DB_USER: ${API_DB_USER:-pulso_api}
+      API_DB_PASSWORD: ${API_DB_PASSWORD:?Set API_DB_PASSWORD in .env}
+      SCHEDULER_DB_USER: ${SCHEDULER_DB_USER:-pulso_scheduler}
+      SCHEDULER_DB_PASSWORD: ${SCHEDULER_DB_PASSWORD:?Set SCHEDULER_DB_PASSWORD in .env}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build: .
+    environment:
+      DATABASE_URL: postgresql://${API_DB_USER:-pulso_api}:${API_DB_PASSWORD:?Set API_DB_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-pulso_transmi}
+      APP_ENV: ${APP_ENV:-production}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    expose:
+      - "8010"
+
+  scheduler:
+    build: .
+    command: ["python", "-m", "app.scheduler"]
+    environment:
+      DATABASE_URL: postgresql://${SCHEDULER_DB_USER:-pulso_scheduler}:${SCHEDULER_DB_PASSWORD:?Set SCHEDULER_DB_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-pulso_transmi}
+      SCHEDULER_POLL_SECONDS: ${SCHEDULER_POLL_SECONDS:-30}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  collector:
+    build: .
+    command: ["python", "-m", "app.collector"]
+    environment:
+      DATABASE_URL: postgresql://${API_DB_USER:-pulso_api}:${API_DB_PASSWORD:?Set API_DB_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-pulso_transmi}
+      PULSO_API_URL: ${PULSO_API_URL:-https://pulso-transmi.72-60-245-2.sslip.io}
+      COLLECTOR_POLL_SECONDS: ${COLLECTOR_POLL_SECONDS:-120}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "8010:80"
+    volumes:
+      - ./deploy/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - api
+
+volumes:
+  postgres_data:
+  caddy_data:
+  caddy_config:
