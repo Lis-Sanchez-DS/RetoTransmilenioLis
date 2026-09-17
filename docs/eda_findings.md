@@ -1,109 +1,82 @@
-# Pulso TransMi EDA findings
+# Hallazgos del análisis exploratorio de datos (EDA)
 
-## Dataset
+## Conjunto de datos
 
-The PostgreSQL table `"Original Data"` contains 51,840 observations from 12
-stations at 15-minute intervals. The available period is July 26 through
-September 9, 2026. The dataset contains 4,320 observations per station.
+La tabla PostgreSQL `"Original Data"` contiene 51.840 observaciones de 12 estaciones, registradas cada 15 minutos. El periodo disponible va del 26 de julio al 9 de septiembre de 2026. Cada estación tiene 4.320 observaciones.
 
-The demand variable is a non-negative count. The first day contains 1,152
-observations (12 stations × 96 intervals) without a previous-day reference.
+La variable `demand` es un conteo no negativo. El primer día contiene 1.152 observaciones (12 estaciones × 96 intervalos) sin una referencia del día anterior.
 
-## Demand behavior
+## Hallazgos principales
 
-The original time-series plots show strong recurring intraday patterns. Most
-stations have pronounced morning and evening peaks, with lower demand during
-the night and between peak periods. Demand levels differ substantially by
-station:
+- La demanda presenta una estacionalidad diaria marcada, con picos recurrentes en la mañana y la tarde.
+- Los días laborales y los fines de semana presentan patrones diferentes, lo que indica estacionalidad semanal.
+- Banderas, Ricaurte - NQS, Portal Américas y Portal El Dorado generalmente tienen los rangos más altos.
+- Universidades - CityU generalmente tiene el rango más bajo.
+- La forma y magnitud de los picos varía por estación; conviene incluir variables específicas de estación.
 
-- Banderas, Ricaurte - NQS, Portal Américas, and Portal El Dorado generally
-  have the largest demand ranges.
-- Universidades - CityU generally has the lowest range.
-- The peak shape and magnitude vary by station, so a single global baseline
-  should be complemented by station-specific features or models.
-- Weekdays and weekends have visibly different patterns, indicating weekly
-  structure in addition to daily seasonality.
+## Desestacionalización
 
-## Deseasonalization
+La estacionalidad diaria se removió por estación restando la mediana de demanda del intervalo de 15 minutos correspondiente. Hay 96 intervalos por día. Las gráficas desestacionalizadas todavía muestran secuencias de residuos positivos y negativos, especialmente durante periodos inusuales y fines de semana. Por lo tanto, remover la estacionalidad diaria no elimina toda la estructura predecible.
 
-Daily seasonality was removed separately for each station by subtracting the
-median demand for the corresponding 15-minute time-of-day slot. There are 96
-slots per day. This removes the typical daily profile while preserving
-unexpected changes and longer-term effects.
+## Autocorrelación y ruido blanco
 
-The deseasonalized plots still show multi-interval runs of positive and
-negative residuals, especially around unusual demand periods and weekends.
-This means daily deseasonalization does not remove all predictable structure.
+Se calculó la ACF de los residuos desestacionalizados hasta el rezago 96, donde 96 equivale a un día. La mayoría de estaciones conserva autocorrelación positiva significativa durante varios rezagos. Universidades - CityU y Universidad Nacional muestran una persistencia especialmente fuerte; Calle 100 - Marketmedios y Calle 72 también muestran estructura de mayor duración.
 
-## Autocorrelation
+Los residuos no deben tratarse como ruido blanco solo porque estén dentro de un umbral de valores atípicos. La autocorrelación indica que los rezagos de demanda, estadísticas móviles o términos autorregresivos todavía pueden mejorar los pronósticos.
 
-The ACF was calculated for each station's deseasonalized residuals through lag
-96, where lag 96 equals one day. Most stations retain significant positive
-autocorrelation over many lags. Several show especially persistent behavior,
-including Universidades - CityU and Universidad Nacional. Calle 100 -
-Marketmedios and Calle 72 also show longer-range structure.
+## Valores atípicos
 
-The residuals therefore cannot be treated as white noise merely because they
-fall inside an outlier threshold. The persistence indicates that lagged demand,
-rolling statistics, or autoregressive terms may improve forecasts. Weekly
-effects should also be represented explicitly, for example with weekday and
-weekend features or a weekly seasonal model.
-
-## Outlier analysis
-
-Potential outliers were identified on the deseasonalized residuals using a
-station-specific robust MAD rule:
+Se usó una regla MAD robusta específica por estación:
 
 ```text
-robust_z = (residual - station_median) / (1.4826 × station_MAD)
-outlier  = abs(robust_z) > 3.5
+z_robusto = (residuo - mediana_estación) / (1,4826 × MAD_estación)
+atípico   = abs(z_robusto) > 3,5
 ```
 
-The threshold graph displays upper and lower station-specific limits as dashed
-lines and shades the area beyond those limits in gray. A flagged observation
-is not automatically an error; it may represent an event, operational change,
-or genuine unusual demand.
+Las gráficas muestran los límites superior e inferior con líneas discontinuas y sombrean en gris las áreas que los superan. Un valor atípico no necesariamente es un error: puede representar un evento, un cambio operativo o una demanda genuinamente inusual.
 
-## Baseline model
+## Modelo base
 
-The first baseline uses the demand from the same station exactly one day
-earlier. Since the sampling interval is 15 minutes, this is a lag of 96
-observations. If the previous-day value is unavailable, the prediction is 0.
+El modelo base usa la demanda de la misma estación exactamente un día antes. Como el muestreo es cada 15 minutos, esto corresponde a un rezago de 96 observaciones. Cuando el valor anterior no está disponible, la predicción es 0.
 
-Accuracy follows the project metric:
+La métrica utilizada es:
 
 ```text
 Accuracy = 100 × max(0, 1 − WAPE)
 ```
 
-WAPE is calculated per station and the station accuracies are averaged. The
-baseline achieved an overall Accuracy of 75.86%:
+El WAPE se calcula por estación y luego se promedian las precisiones. El modelo base obtuvo 75,86 % de precisión general:
 
-| Station | Accuracy |
+| Estación | Precisión |
 | --- | ---: |
-| Calle 100 - Marketmedios | 67.74% |
-| Portal Suba | 80.61% |
-| Portal Américas | 80.39% |
-| Banderas | 80.97% |
-| Portal El Dorado | 79.76% |
-| Universidades - CityU | 68.55% |
-| Movistar Arena | 76.37% |
-| Universidad Nacional | 69.29% |
-| Ricaurte - NQS | 80.68% |
-| Portal Usme | 79.85% |
-| Calle 72 | 69.82% |
-| Museo Nacional | 76.23% |
+| Calle 100 - Marketmedios | 67,74 % |
+| Portal Suba | 80,61 % |
+| Portal Américas | 80,39 % |
+| Banderas | 80,97 % |
+| Portal El Dorado | 79,76 % |
+| Universidades - CityU | 68,55 % |
+| Movistar Arena | 76,37 % |
+| Universidad Nacional | 69,29 % |
+| Ricaurte - NQS | 80,68 % |
+| Portal Usme | 79,85 % |
+| Calle 72 | 69,82 % |
+| Museo Nacional | 76,23 % |
 
-The baseline is a useful reference because it captures daily seasonality, but
-its errors show that daily repetition alone is insufficient. The next models
-should consider weekday/weekend effects, recent lags, rolling demand, and
-possibly station-specific behavior.
+## Evidencia gráfica
 
-## Modeling implications
+Las siguientes gráficas respaldan los hallazgos anteriores. Fueron generadas a
+partir de `"Original Data"` y se encuentran en `docs/figures/`.
 
-Holt-Winters is a suitable interpretable benchmark for level, trend, and daily
-seasonality. ARIMA or SARIMA can model the remaining autocorrelation; a daily
-seasonal period is 96 intervals and a weekly period is 672 intervals. Because
-the history contains only about 45 days, a full 672-point seasonal model
-should be evaluated carefully. Feature-based models with lagged demand and
-calendar variables are another practical candidate.
+- [Demanda original de las 12 estaciones](figures/demand_by_station.png): muestra
+  las diferencias de escala y los picos intradía.
+- [Demanda original durante una semana](figures/demand_original_week.png): muestra
+  la repetición diaria y las diferencias entre días laborales y fines de semana.
+- [Demanda de un día](figures/demand_single_day.png): muestra la forma de los picos
+  durante el 1 de septiembre de 2026 en hora local de Bogotá.
+- [Demanda desestacionalizada durante una semana](figures/demand_deseasonalized_week.png):
+  muestra los residuos después de remover el perfil diario típico.
+- [Residuos con umbrales MAD](figures/demand_deseasonalized_thresholds_week.png):
+  las líneas discontinuas representan los umbrales superior e inferior y el
+  sombreado gris indica las regiones que los superan.
+- [ACF de los residuos desestacionalizados](figures/acf_deseasonalized_by_station.png):
+  muestra la autocorrelación persistente hasta un día de rezago.
