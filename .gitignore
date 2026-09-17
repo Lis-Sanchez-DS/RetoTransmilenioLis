@@ -6,3 +6,11 @@ data/raw/
 data/processed/
 data/metadata/
 models/
+demand_by_station.png
+demand_deseasonalized_by_station.png
+demand_single_day.png
+demand_deseasonalized_week.png
+demand_original_week.png
+demand_deseasonalized_outliers_week.png
+demand_deseasonalized_thresholds_week.png
+acf_deseasonalized_by_station.png
