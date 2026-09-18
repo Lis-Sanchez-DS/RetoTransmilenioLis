@@ -1,0 +1,6 @@
+BEGIN;
+
+ALTER TABLE "Temp"
+    ADD COLUMN IF NOT EXISTS prediction NUMERIC;
+
+COMMIT;

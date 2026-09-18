@@ -11,6 +11,7 @@ CREATE TABLE IF NOT EXISTS "Original Data" (
     station_id TEXT NOT NULL REFERENCES stations(station_id),
     observed_at TIMESTAMPTZ NOT NULL,
     demand INTEGER NOT NULL CHECK (demand >= 0),
+    prediction NUMERIC,
     PRIMARY KEY (station_id, observed_at)
 );
 
