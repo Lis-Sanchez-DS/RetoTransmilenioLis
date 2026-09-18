@@ -1,6 +1,8 @@
 services:
   postgres:
     image: postgres:17-alpine
+    ports:
+      - "5433:5432"
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-pulso_transmi}
       POSTGRES_USER: ${POSTGRES_USER:-pulso_admin}
@@ -27,6 +29,10 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    volumes:
+      - ./models:/app/models
+    volumes:
+      - ./models:/app/models
     expose:
       - "8010"
 
