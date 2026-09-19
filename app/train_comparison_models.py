@@ -6,6 +6,7 @@ import pandas as pd
 from xgboost import XGBRegressor
 
 from app.db import connection
+from app.features import temporal_features
 
 LAGS = [1, 2, 4, 96, 672]
 
@@ -24,13 +25,10 @@ def run():
         group = group.sort_values("observed_at").reset_index(drop=True)
         y = group.demand.astype(float)
         lagged = pd.concat({f"lag_{lag}": y.shift(lag) for lag in LAGS}, axis=1)
-        slot = np.arange(len(group))
-        calendar = pd.DataFrame({
-            "hour_sin": np.sin(2 * np.pi * (slot % 96) / 96),
-            "hour_cos": np.cos(2 * np.pi * (slot % 96) / 96),
-            "week_sin": np.sin(2 * np.pi * (slot % 672) / 672),
-            "week_cos": np.cos(2 * np.pi * (slot % 672) / 672),
-        })
+        calendar = pd.DataFrame(
+            [temporal_features(value) for value in group["observed_at"]],
+            columns=["hour_sin", "hour_cos", "week_sin", "week_cos"],
+        )
         features = pd.concat([lagged, calendar], axis=1)
         valid = features.notna().all(axis=1)
         model = XGBRegressor(n_estimators=400, learning_rate=0.05, max_leaves=40,

@@ -8,6 +8,7 @@ import joblib
 import numpy as np
 
 from app.db import connection
+from app.features import temporal_features
 
 API_URL = os.getenv("PULSO_API_URL", "https://pulso-transmi.72-60-245-2.sslip.io")
 PAGE_SIZE = min(max(int(os.getenv("COLLECTOR_PAGE_SIZE", "5000")), 1), 5000)
@@ -51,13 +52,7 @@ def predict_records(records: list[dict]) -> list[tuple[dict, float]]:
             if key not in history:
                 raise RuntimeError(f"Missing lag {lag} for station {item['station_id']} at {ts.isoformat()}")
             features.append(history[key])
-        slot = int(ts.timestamp() // 900)
-        features.extend((
-            np.sin(2 * np.pi * (slot % 96) / 96),
-            np.cos(2 * np.pi * (slot % 96) / 96),
-            np.sin(2 * np.pi * (slot % 672) / 672),
-            np.cos(2 * np.pi * (slot % 672) / 672),
-        ))
+        features.extend(temporal_features(ts))
         prediction = max(0.0, float(models[item["station_id"]].predict(np.array([features]))[0]))
         predictions.append((item, round(prediction, 4)))
         history[(item["station_id"], ts)] = float(item["demand"])

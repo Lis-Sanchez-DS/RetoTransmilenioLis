@@ -4,7 +4,7 @@ services:
     command: ["python", "-m", "app.scheduler"]
     environment:
       DATABASE_URL: ${SUPABASE_DATABASE_URL:?Set SUPABASE_DATABASE_URL in .env}
-      COLLECTOR_INTERVAL_SECONDS: ${COLLECTOR_INTERVAL_SECONDS:-7200}
+      COLLECTOR_INTERVAL_SECONDS: ${COLLECTOR_INTERVAL_SECONDS:-1800}
 
   collector:
     build: .
@@ -21,6 +21,7 @@ services:
     env_file:
       - .env
     environment:
+      DATABASE_URL: ${SUPABASE_DATABASE_URL:?Set SUPABASE_DATABASE_URL in .env}
       PULSO_API_URL: ${PULSO_API_URL:-https://pulso-transmi.72-60-245-2.sslip.io}
       PREDICTION_INTERVAL_SECONDS: ${PREDICTION_INTERVAL_SECONDS:-300}
     volumes:

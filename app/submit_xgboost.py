@@ -9,6 +9,9 @@ import joblib
 import pandas as pd
 import requests
 
+from app.db import connection
+from app.features import temporal_features
+
 
 BASE_URL = os.getenv("PULSO_API_URL", "https://pulso-transmi.72-60-245-2.sslip.io").rstrip("/")
 API_KEY = os.getenv("PULSO_API_KEY") or os.getenv("API-KEY-PulsoTransmi")
@@ -47,15 +50,7 @@ def features_for_target(history: pd.DataFrame, target: dict) -> list[float]:
     if len(values) < max(LAGS):
         raise RuntimeError(f"No hay suficiente historia para {station}")
     features = [float(values[-lag]) for lag in LAGS]
-    slot = int(timestamp.timestamp() // 900)
-    features.extend(
-        [
-            math.sin(2 * math.pi * (slot % 96) / 96),
-            math.cos(2 * math.pi * (slot % 96) / 96),
-            math.sin(2 * math.pi * (slot % 672) / 672),
-            math.cos(2 * math.pi * (slot % 672) / 672),
-        ]
-    )
+    features.extend(temporal_features(timestamp.to_pydatetime()))
     return features
 
 
@@ -69,10 +64,13 @@ def submit_current_cycle() -> dict | None:
         if exc.response is not None and exc.response.status_code == 404:
             return None
         raise
-    history = pd.read_csv(
-        f"{BASE_URL}/v1/downloads/observations.csv",
-        dtype={"station_id": "string"},
-    )
+    with connection() as conn:
+        rows = conn.execute(
+            'SELECT station_id, observed_at, demand FROM "Original Data" '
+            'WHERE observed_at <= %s ORDER BY station_id, observed_at',
+            (cycle["data_cutoff"],),
+        ).fetchall()
+    history = pd.DataFrame(rows, columns=["station_id", "observed_at", "demand"])
     history["observed_at"] = pd.to_datetime(history["observed_at"], utc=True)
 
     predictions = []
