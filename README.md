@@ -1,4 +1,66 @@
-# Hallazgos del análisis exploratorio de datos (EDA)
+# Pulso TransMi: análisis y predicción de demanda
+
+Este repositorio implementa la recolección incremental de observaciones de
+Pulso TransMi, su persistencia en Supabase y la generación de predicciones por
+estación mediante XGBoost. También contiene el análisis exploratorio de las
+series de demanda y el flujo de submissions hacia la API del profesor.
+
+## Componentes principales
+
+- `app/collector.py`: recoge observaciones nuevas usando el cursor y las guarda
+  en `Temp` junto con una predicción.
+- `app/scheduler.py`: ejecuta el collector cada 30 minutos.
+- `app/prediction_scheduler.py`: descubre ciclos y envía submissions.
+- `app/submit_xgboost.py`: genera submissions con los modelos XGBoost guardados.
+- `app/train_comparison_models.py`: entrena un modelo XGBoost por estación.
+- `app/load_original.py`: carga el histórico inicial.
+- `database/`: esquema y migraciones PostgreSQL.
+- `docs/figures/`: gráficas del análisis exploratorio.
+
+## Configuración
+
+Crear `.env` a partir de `.env.example` y configurar Supabase:
+
+```env
+SUPABASE_DATABASE_URL=postgresql://...
+PULSO_API_KEY=ptm_live_...
+```
+
+No subir `.env` al repositorio. La API key debe permanecer como secreto y
+enviarse únicamente mediante el encabezado `Authorization`.
+
+## Ejecución
+
+```bash
+docker compose config --quiet
+docker compose up -d --build
+```
+
+Los servicios son:
+
+- `collector`: descarga datos nuevos cada 30 minutos.
+- `scheduler`: activa el collector.
+- `prediction_scheduler`: revisa ciclos abiertos y envía predicciones.
+
+## Modelo XGBoost
+
+Se entrena un modelo independiente por estación con rezagos de 15, 30 y 60
+minutos, del día anterior y de la semana anterior. También utiliza variables
+cíclicas diarias y semanales.
+
+Configuración seleccionada:
+
+```text
+n_estimators  = 400
+learning_rate = 0,05
+max_leaves    = 40
+max_depth     = 0
+grow_policy   = lossguide
+reg_lambda    = 1,0
+```
+
+Los modelos se guardan localmente en `models/xgboost/`, una carpeta excluida de
+Git por su tamaño.
 
 ## Conjunto de datos
 
@@ -92,18 +154,18 @@ base calculado sobre las mismas filas comparables.
 Las siguientes gráficas respaldan los hallazgos anteriores. Fueron generadas a
 partir de `"Original Data"` y se encuentran en `docs/figures/`.
 
-- [Demanda original de las 12 estaciones](figures/demand_by_station.png): muestra
+- [Demanda original de las 12 estaciones](docs/figures/demand_by_station.png): muestra
   las diferencias de escala y los picos intradía.
-- [Demanda original durante una semana](figures/demand_original_week.png): muestra
+- [Demanda original durante una semana](docs/figures/demand_original_week.png): muestra
   la repetición diaria y las diferencias entre días laborales y fines de semana.
-- [Demanda de un día](figures/demand_single_day.png): muestra la forma de los picos
+- [Demanda de un día](docs/figures/demand_single_day.png): muestra la forma de los picos
   durante el 1 de septiembre de 2026 en hora local de Bogotá.
-- [Demanda desestacionalizada durante una semana](figures/demand_deseasonalized_week.png):
+- [Demanda desestacionalizada durante una semana](docs/figures/demand_deseasonalized_week.png):
   muestra los residuos después de remover el perfil diario típico.
-- [Residuos con umbrales MAD](figures/demand_deseasonalized_thresholds_week.png):
+- [Residuos con umbrales MAD](docs/figures/demand_deseasonalized_thresholds_week.png):
   las líneas discontinuas representan los umbrales superior e inferior y el
   sombreado gris indica las regiones que los superan.
-- [ACF de los residuos desestacionalizados](figures/acf_deseasonalized_by_station.png):
+- [ACF de los residuos desestacionalizados](docs/figures/acf_deseasonalized_by_station.png):
   muestra la autocorrelación persistente hasta un día de rezago.
 
 ## Modelo XGBoost
