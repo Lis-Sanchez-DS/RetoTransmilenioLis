@@ -12,7 +12,12 @@ concurrency:
 jobs:
   submit:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # GitHub's cron has no SLA and can be delayed well past its 5-minute
+    # interval under load, so this job polls internally for ~5.75h instead
+    # of relying on the next scheduled tick. The concurrency group above
+    # queues (not skips) any scheduled run that fires meanwhile, so as soon
+    # as this loop ends the next one picks up immediately.
+    timeout-minutes: 355
     env:
       DATABASE_URL: ${{ secrets.SUPABASE_DATABASE_URL }}
       PULSO_API_KEY: ${{ secrets.PULSO_API_KEY }}
@@ -44,5 +49,24 @@ jobs:
           done
           test "$(find models/xgboost -name '*.joblib' | wc -l)" -eq 12
 
-      - name: Enviar submission si hay ciclo abierto
-        run: python -m app.submit_xgboost
+      - name: Enviar submission cada 5 minutos mientras el job siga vivo
+        shell: bash
+        run: |
+          set +e
+          end=$(( $(date +%s) + 345 * 60 ))
+          fails=0
+          while [ "$(date +%s)" -lt "$end" ]; do
+            python -m app.submit_xgboost
+            status=$?
+            if [ $status -ne 0 ]; then
+              fails=$((fails + 1))
+              echo "Intento fallido ($fails consecutivo(s))."
+              if [ $fails -ge 3 ]; then
+                echo "3 fallos consecutivos: se detiene el job para que quede visible en Actions."
+                exit 1
+              fi
+            else
+              fails=0
+            fi
+            sleep 300
+          done
