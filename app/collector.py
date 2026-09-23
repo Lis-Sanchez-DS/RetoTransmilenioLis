@@ -8,6 +8,7 @@ import joblib
 import numpy as np
 
 from app.db import connection
+from app.drift import check_and_retrain
 from app.features import temporal_features
 
 API_URL = os.getenv("PULSO_API_URL", "https://pulso-transmi.72-60-245-2.sslip.io")
@@ -119,6 +120,11 @@ collect_last_15 = collect_new_data
 def run() -> None:
     result = collect_new_data()
     print(f"Collected {result['collected']} observations in {result['pages']} pages; cursor={result['cursor']}", flush=True)
+    retrained = check_and_retrain()
+    if retrained:
+        print(f"Modelos reentrenados por drift: {', '.join(retrained)}", flush=True)
+    else:
+        print("Sin drift detectado.", flush=True)
 
 
 if __name__ == "__main__":
