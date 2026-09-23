@@ -1,5 +1,6 @@
 import json
 import os
+import sys
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -10,7 +11,7 @@ import numpy as np
 from app.db import connection
 from app.drift import check_and_retrain
 from app.features import temporal_features
-from app.net import with_retries
+from app.net import with_retries, UpstreamUnavailable
 
 API_URL = os.getenv("PULSO_API_URL", "https://pulso-transmi.72-60-245-2.sslip.io")
 PAGE_SIZE = min(max(int(os.getenv("COLLECTOR_PAGE_SIZE", "5000")), 1), 5000)
@@ -134,7 +135,11 @@ collect_last_15 = collect_new_data
 
 
 def run() -> None:
-    result = collect_new_data()
+    try:
+        result = collect_new_data()
+    except UpstreamUnavailable as exc:
+        print(f"AVISO: {exc}", flush=True)
+        sys.exit(75)
     print(f"Collected {result['collected']} observations in {result['pages']} pages; cursor={result['cursor']}", flush=True)
     retrained = check_and_retrain()
     if retrained:
