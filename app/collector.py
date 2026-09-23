@@ -10,6 +10,7 @@ import numpy as np
 from app.db import connection
 from app.drift import check_and_retrain
 from app.features import temporal_features
+from app.net import with_retries
 
 API_URL = os.getenv("PULSO_API_URL", "https://pulso-transmi.72-60-245-2.sslip.io")
 PAGE_SIZE = min(max(int(os.getenv("COLLECTOR_PAGE_SIZE", "5000")), 1), 5000)
@@ -89,9 +90,11 @@ def collect_new_data(fetcher=None) -> dict:
         if cursor:
             query["cursor"] = cursor
         if fetcher is None:
-            request = Request(f"{API_URL}/v1/stream/observations?{urlencode(query)}")
-            with urlopen(request, timeout=30) as response:
-                payload = json.load(response)
+            def _get():
+                request = Request(f"{API_URL}/v1/stream/observations?{urlencode(query)}")
+                with urlopen(request, timeout=30) as response:
+                    return json.load(response)
+            payload = with_retries(_get)
         else:
             payload = fetcher(cursor=cursor, limit=PAGE_SIZE)
 
