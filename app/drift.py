@@ -2,9 +2,10 @@
 
 El collector guarda en "Temp" cada observación nueva junto con la
 predicción que el modelo vigente le habría dado. Ese historial reciente es
-la señal de drift: si el modelo lleva muchas observaciones acertando poco
-y de forma consistente (no solo un pico ruidoso), se reentrena con el
-histórico ampliado y se republica el modelo en Supabase Storage.
+la señal de drift: si con más de 50 observaciones la accuracy de la
+estación (la misma métrica del proyecto, 1 - WAPE) cae por debajo de 0.85,
+se reentrena con el histórico ampliado y se republica el modelo en
+Supabase Storage.
 """
 
 import os
@@ -24,45 +25,37 @@ MODEL_BUCKET = "models"
 LAGS = (1, 2, 4, 96, 672)
 
 ACCURACY_THRESHOLD = 0.85
-STD_THRESHOLD = 0.025
 MIN_DATAPOINTS = 50
 
 
-def _row_accuracy(demand: float, prediction: float) -> float:
-    """Per-observation accuracy, protecting the denominator like the project WAPE."""
-    denom = max(abs(float(demand)), 1.0)
-    return max(0.0, 1.0 - abs(float(demand) - float(prediction)) / denom)
-
-
 def station_accuracy_stats() -> pd.DataFrame:
-    """Mean, std and count of per-observation accuracy in "Temp", per station."""
+    """Accuracy and count per station over "Temp", using the project's own metric:
+
+    Accuracy = max(0, 1 - WAPE), i.e. 1 - sum(|demand - prediction|) / sum(|demand|),
+    the same formula as train_comparison_models.py's score() (there scaled by 100).
+    """
     with connection() as conn:
         rows = conn.execute(
             'SELECT station_id, demand, prediction FROM "Temp" WHERE prediction IS NOT NULL'
         ).fetchall()
-    columns = ["station_id", "mean_accuracy", "std_accuracy", "count"]
+    columns = ["station_id", "accuracy", "count"]
     if not rows:
         return pd.DataFrame(columns=columns)
     data = pd.DataFrame(rows, columns=["station_id", "demand", "prediction"])
-    data["accuracy"] = [
-        _row_accuracy(demand, prediction)
-        for demand, prediction in zip(data["demand"], data["prediction"])
-    ]
-    stats = data.groupby("station_id")["accuracy"].agg(
-        mean_accuracy="mean", std_accuracy="std", count="count"
+    data["abs_error"] = (data["demand"] - data["prediction"]).abs()
+    data["abs_demand"] = data["demand"].abs()
+    stats = data.groupby("station_id").agg(
+        abs_error=("abs_error", "sum"), abs_demand=("abs_demand", "sum"), count=("demand", "size")
     )
+    stats["accuracy"] = (1 - stats["abs_error"] / stats["abs_demand"].clip(lower=1)).clip(lower=0)
     return stats.reset_index()[columns]
 
 
 def stations_needing_retrain(stats: pd.DataFrame) -> list[str]:
-    """Stations with a sustained, low-variance accuracy drop: real drift, not noise."""
+    """Stations with enough recent data whose accuracy has dropped below the bar."""
     if stats.empty:
         return []
-    drifted = stats[
-        (stats["count"] > MIN_DATAPOINTS)
-        & (stats["mean_accuracy"] < ACCURACY_THRESHOLD)
-        & (stats["std_accuracy"] < STD_THRESHOLD)
-    ]
+    drifted = stats[(stats["count"] > MIN_DATAPOINTS) & (stats["accuracy"] < ACCURACY_THRESHOLD)]
     return sorted(drifted["station_id"].tolist())
 
 

@@ -20,7 +20,7 @@ class FakeConnection:
         return self.rows
 
 
-def test_station_accuracy_stats_computes_mean_std_count(monkeypatch):
+def test_station_accuracy_stats_computes_wape_accuracy_and_count(monkeypatch):
     rows = [
         ("A", 100, 100),
         ("A", 100, 90),
@@ -32,7 +32,8 @@ def test_station_accuracy_stats_computes_mean_std_count(monkeypatch):
 
     row = stats.loc[stats["station_id"] == "A"].iloc[0]
     assert row["count"] == 3
-    assert 0.9 < row["mean_accuracy"] < 1.0
+    # abs_error = 0 + 10 + 5 = 15; abs_demand = 300; accuracy = 1 - 15/300 = 0.95
+    assert row["accuracy"] == 0.95
 
 
 def test_station_accuracy_stats_empty_when_no_rows(monkeypatch):
@@ -43,17 +44,15 @@ def test_station_accuracy_stats_empty_when_no_rows(monkeypatch):
     assert stats.empty
 
 
-def test_stations_needing_retrain_requires_all_three_conditions():
+def test_stations_needing_retrain_requires_enough_points_and_low_accuracy():
     stats = pd.DataFrame(
         [
-            # Consistently bad and stable with enough data: should retrain.
-            {"station_id": "drifted", "mean_accuracy": 0.80, "std_accuracy": 0.01, "count": 60},
-            # Bad mean but too noisy (high std): not a stable drift signal.
-            {"station_id": "noisy", "mean_accuracy": 0.80, "std_accuracy": 0.10, "count": 60},
-            # Bad and stable but not enough datapoints yet.
-            {"station_id": "too_few", "mean_accuracy": 0.80, "std_accuracy": 0.01, "count": 10},
-            # Stable and plenty of data, but accuracy is fine.
-            {"station_id": "healthy", "mean_accuracy": 0.95, "std_accuracy": 0.01, "count": 60},
+            # Bad accuracy with enough data: should retrain.
+            {"station_id": "drifted", "accuracy": 0.80, "count": 60},
+            # Bad accuracy but not enough datapoints yet.
+            {"station_id": "too_few", "accuracy": 0.80, "count": 10},
+            # Plenty of data, but accuracy is fine.
+            {"station_id": "healthy", "accuracy": 0.95, "count": 60},
         ]
     )
 
@@ -63,4 +62,4 @@ def test_stations_needing_retrain_requires_all_three_conditions():
 
 
 def test_stations_needing_retrain_empty_stats():
-    assert stations_needing_retrain(pd.DataFrame(columns=["station_id", "mean_accuracy", "std_accuracy", "count"])) == []
+    assert stations_needing_retrain(pd.DataFrame(columns=["station_id", "accuracy", "count"])) == []
