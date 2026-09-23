@@ -2,7 +2,13 @@ from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 
-from app.drift import check_and_retrain, station_accuracy_stats, stations_needing_retrain
+from app.drift import (
+    REGIME_SAMPLE_SIZE,
+    check_and_retrain,
+    _new_data_matches_history,
+    station_accuracy_stats,
+    stations_needing_retrain,
+)
 
 
 class FakeConnection:
@@ -67,6 +73,32 @@ def test_stations_needing_retrain_empty_stats():
     assert stations_needing_retrain(pd.DataFrame(columns=["station_id", "accuracy", "count"])) == []
 
 
+def test_new_data_matches_history_true_for_same_distribution(monkeypatch):
+    # Reference and new samples both drawn from the same tight, repeating pattern.
+    reference_rows = [(100 + (i % 20),) for i in range(REGIME_SAMPLE_SIZE)]
+    monkeypatch.setattr("app.drift.connection", lambda: FakeConnection(reference_rows))
+    recent = [(None, 100 + (i % 20)) for i in range(REGIME_SAMPLE_SIZE)]
+
+    assert _new_data_matches_history("A", recent) is True
+
+
+def test_new_data_matches_history_false_for_shifted_distribution(monkeypatch):
+    # Reference is a tight low range; new data is a much larger, non-overlapping range.
+    reference_rows = [(100 + (i % 20),) for i in range(REGIME_SAMPLE_SIZE)]
+    monkeypatch.setattr("app.drift.connection", lambda: FakeConnection(reference_rows))
+    recent = [(None, 5000 + (i % 7) * 500) for i in range(REGIME_SAMPLE_SIZE)]
+
+    assert _new_data_matches_history("A", recent) is False
+
+
+def test_new_data_matches_history_defaults_true_when_not_enough_data(monkeypatch):
+    reference_rows = [(100,)] * 10  # fewer than REGIME_SAMPLE_SIZE
+    monkeypatch.setattr("app.drift.connection", lambda: FakeConnection(reference_rows))
+    recent = [(None, 100)] * 10
+
+    assert _new_data_matches_history("A", recent) is True
+
+
 class RoutedFakeConnection:
     """Dispatches each query to canned rows based on the table/params it touches."""
 
@@ -93,9 +125,17 @@ class RoutedFakeConnection:
         elif 'INSERT INTO "Original Data"' in query:
             self._result = None
             self._last_rowcount = 0
+        elif 'DELETE FROM "Original Data"' in query:
+            # drop_oldest = params[1]; not asserted on directly here.
+            self._result = None
+            self._last_rowcount = params[1] if params else 0
         elif 'DELETE FROM "Temp"' in query:
             self._result = None
             self._last_rowcount = len(self.temp_recent_rows)
+        elif 'ORDER BY observed_at DESC' in query:
+            # Regime-check reference sample: most recent `limit` demand values.
+            limit = params[1]
+            self._result = [(demand,) for _, demand in self.historical_rows[-limit:]]
         elif 'FROM "Original Data" WHERE station_id' in query:
             self._result = self.historical_rows
         elif 'FROM "Temp" WHERE station_id' in query:
@@ -112,7 +152,19 @@ class RoutedFakeConnection:
         return self._last_rowcount
 
 
-def test_check_and_retrain_trains_uploads_and_promotes_only_drifted_stations(monkeypatch, tmp_path):
+def _fake_upload(monkeypatch, uploads):
+    class FakeResponse:
+        def raise_for_status(self):
+            pass
+
+    def fake_post(url, headers=None, data=None, timeout=None):
+        uploads.append({"url": url, "headers": headers, "bytes": len(data)})
+        return FakeResponse()
+
+    monkeypatch.setattr("app.drift.requests.post", fake_post)
+
+
+def test_check_and_retrain_keeps_full_history_when_new_data_matches_distribution(monkeypatch, tmp_path):
     station = "A"
     start = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
@@ -120,7 +172,7 @@ def test_check_and_retrain_trains_uploads_and_promotes_only_drifted_stations(mon
     historical_rows = [
         (start + timedelta(minutes=15 * i), 100 + (i % 20)) for i in range(700)
     ]
-    # 60 fresh points the collector has staged in Temp, continuing the series.
+    # 60 fresh points continuing the exact same pattern: same distribution.
     temp_recent_rows = [
         (start + timedelta(minutes=15 * (700 + i)), 100 + (i % 20)) for i in range(60)
     ]
@@ -132,18 +184,8 @@ def test_check_and_retrain_trains_uploads_and_promotes_only_drifted_stations(mon
     monkeypatch.setattr("app.drift.MODEL_DIR", str(tmp_path))
     monkeypatch.setattr("app.drift.SUPABASE_URL", "https://fake.supabase.co")
     monkeypatch.setattr("app.drift.SUPABASE_SERVICE_ROLE_KEY", "fake-service-role-key")
-
     uploads = []
-
-    class FakeResponse:
-        def raise_for_status(self):
-            pass
-
-    def fake_post(url, headers=None, data=None, timeout=None):
-        uploads.append({"url": url, "headers": headers, "bytes": len(data)})
-        return FakeResponse()
-
-    monkeypatch.setattr("app.drift.requests.post", fake_post)
+    _fake_upload(monkeypatch, uploads)
 
     retrained = check_and_retrain()
 
@@ -161,3 +203,39 @@ def test_check_and_retrain_trains_uploads_and_promotes_only_drifted_stations(mon
     queries = [q for q, _ in fake_conn.executed]
     assert any('INSERT INTO "Original Data"' in q for q in queries)
     assert any('DELETE FROM "Temp"' in q for q in queries)
+    # Same distribution: no history should have been discarded.
+    assert not any('DELETE FROM "Original Data"' in q for q in queries)
+
+
+def test_check_and_retrain_drops_oldest_rows_when_distribution_shifted(monkeypatch, tmp_path):
+    station = "A"
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    # 700 historical points following a small, tight sawtooth (100-119).
+    historical_rows = [
+        (start + timedelta(minutes=15 * i), 100 + (i % 20)) for i in range(700)
+    ]
+    # 60 new points from a completely different, much larger regime.
+    temp_recent_rows = [
+        (start + timedelta(minutes=15 * (700 + i)), 5000 + (i % 7) * 500) for i in range(60)
+    ]
+    temp_accuracy_rows = [(station, demand, demand * 0.7) for _, demand in temp_recent_rows]
+
+    fake_conn = RoutedFakeConnection(temp_accuracy_rows, historical_rows, temp_recent_rows)
+    monkeypatch.setattr("app.drift.connection", lambda: fake_conn)
+    monkeypatch.setattr("app.drift.MODEL_DIR", str(tmp_path))
+    monkeypatch.setattr("app.drift.SUPABASE_URL", "https://fake.supabase.co")
+    monkeypatch.setattr("app.drift.SUPABASE_SERVICE_ROLE_KEY", "fake-service-role-key")
+    uploads = []
+    _fake_upload(monkeypatch, uploads)
+
+    retrained = check_and_retrain()
+
+    assert retrained == ["A"]
+    queries_with_params = [(q, p) for q, p in fake_conn.executed]
+    drop_queries = [(q, p) for q, p in queries_with_params if 'DELETE FROM "Original Data"' in q]
+    # The regime shift was detected: the oldest len(temp_recent_rows) rows are dropped.
+    assert len(drop_queries) == 1
+    assert drop_queries[0][1] == (station, len(temp_recent_rows))
+    assert any('INSERT INTO "Original Data"' in q for q, _ in queries_with_params)
+    assert any('DELETE FROM "Temp"' in q for q, _ in queries_with_params)

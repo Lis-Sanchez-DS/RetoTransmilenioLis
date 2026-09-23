@@ -4,15 +4,28 @@ El collector guarda en "Temp" cada observación nueva junto con la
 predicción que el modelo vigente le habría dado. Ese historial reciente es
 la señal de drift: si con más de 50 observaciones la accuracy de la
 estación (la misma métrica del proyecto, 1 - WAPE) cae por debajo de 0.85,
-se reentrena con el histórico ampliado y se republica el modelo en
-Supabase Storage.
+se evalúa si el patrón de demanda cambió antes de reentrenar.
+
+Esa evaluación compara, con una prueba de Kolmogorov-Smirnov de dos
+muestras (alpha=0.10), los 50 puntos históricos más recientes contra los
+primeros 50 puntos nuevos (cronológicamente adyacentes, para no confundir
+el resultado con la estacionalidad diaria/semanal del proyecto). Si no se
+rechaza la hipótesis de que vienen de la misma distribución, la caída de
+accuracy se trata como sobreajuste: se conserva todo el histórico. Si se
+rechaza, se asume un cambio real de régimen: se descartan las filas más
+antiguas de "Original Data" (tantas como puntos nuevos) antes de
+reentrenar, para que el modelo no se diluya con datos ya obsoletos. En
+ambos casos, una vez publicado el nuevo modelo, los puntos nuevos se
+incorporan a "Original Data".
 """
 
 import os
 
 import joblib
+import numpy as np
 import pandas as pd
 import requests
+from scipy.stats import ks_2samp
 from xgboost import XGBRegressor
 
 from app.db import connection
@@ -26,6 +39,8 @@ LAGS = (1, 2, 4, 96, 672)
 
 ACCURACY_THRESHOLD = 0.85
 MIN_DATAPOINTS = 50
+REGIME_SAMPLE_SIZE = 50
+REGIME_TEST_ALPHA = 0.10
 
 
 def station_accuracy_stats() -> pd.DataFrame:
@@ -59,17 +74,47 @@ def stations_needing_retrain(stats: pd.DataFrame) -> list[str]:
     return sorted(drifted["station_id"].tolist())
 
 
-def _training_frame(station_id: str) -> pd.DataFrame:
-    """Historical data plus the not-yet-merged Temp observations for this station."""
+def _fetch_recent(station_id: str) -> list[tuple]:
+    """New (Temp) observations for this station, oldest first."""
+    with connection() as conn:
+        return conn.execute(
+            'SELECT observed_at, demand FROM "Temp" WHERE station_id = %s ORDER BY observed_at',
+            (station_id,),
+        ).fetchall()
+
+
+def _new_data_matches_history(station_id: str, recent: list[tuple]) -> bool:
+    """Two-sample KS test: True if we fail to reject 'same distribution' at alpha=0.10.
+
+    Compares the most recent REGIME_SAMPLE_SIZE historical points (adjacent
+    in time to the new data, to control for daily/weekly seasonality) against
+    the first REGIME_SAMPLE_SIZE new points. Too little data to compare
+    reliably defaults to True: keep all history rather than discard it on an
+    inconclusive read.
+    """
+    with connection() as conn:
+        reference_rows = conn.execute(
+            'SELECT demand FROM "Original Data" WHERE station_id = %s '
+            'ORDER BY observed_at DESC LIMIT %s',
+            (station_id, REGIME_SAMPLE_SIZE),
+        ).fetchall()
+    reference = np.array([row[0] for row in reference_rows], dtype=float)
+    new_sample = np.array([demand for _, demand in recent[:REGIME_SAMPLE_SIZE]], dtype=float)
+    if len(reference) < REGIME_SAMPLE_SIZE or len(new_sample) < REGIME_SAMPLE_SIZE:
+        return True
+    _, p_value = ks_2samp(reference, new_sample)
+    return bool(p_value >= REGIME_TEST_ALPHA)
+
+
+def _training_frame(station_id: str, recent: list[tuple], drop_oldest: int) -> pd.DataFrame:
+    """Historical data (minus the oldest `drop_oldest` rows) plus the new Temp observations."""
     with connection() as conn:
         historical = conn.execute(
-            'SELECT observed_at, demand FROM "Original Data" WHERE station_id = %s',
+            'SELECT observed_at, demand FROM "Original Data" WHERE station_id = %s ORDER BY observed_at',
             (station_id,),
         ).fetchall()
-        recent = conn.execute(
-            'SELECT observed_at, demand FROM "Temp" WHERE station_id = %s',
-            (station_id,),
-        ).fetchall()
+    if drop_oldest > 0:
+        historical = historical[drop_oldest:]
     frame = pd.DataFrame(historical + recent, columns=["observed_at", "demand"])
     return frame.drop_duplicates(subset="observed_at").sort_values("observed_at").reset_index(drop=True)
 
@@ -120,10 +165,28 @@ def _upload_model(station_id: str, path: str) -> None:
     response.raise_for_status()
 
 
-def _promote_temp_to_original(station_id: str) -> int:
-    """Once the new model is live, fold the Temp rows into permanent history."""
+def _promote_temp_to_original(station_id: str, drop_oldest: int) -> int:
+    """Once the new model is live: optionally slide the window, then fold Temp into history.
+
+    The new Temp rows are always merged in, regardless of the regime-shift
+    verdict; `drop_oldest` only controls whether the oldest historical rows
+    are discarded first.
+    """
     with connection() as conn:
         with conn.transaction():
+            if drop_oldest > 0:
+                conn.execute(
+                    """WITH oldest AS (
+                           SELECT station_id, observed_at FROM "Original Data"
+                           WHERE station_id = %s
+                           ORDER BY observed_at ASC
+                           LIMIT %s
+                       )
+                       DELETE FROM "Original Data" o
+                       USING oldest
+                       WHERE o.station_id = oldest.station_id AND o.observed_at = oldest.observed_at""",
+                    (station_id, drop_oldest),
+                )
             conn.execute(
                 """INSERT INTO "Original Data" (station_id, observed_at, demand)
                    SELECT station_id, observed_at, demand FROM "Temp"
@@ -141,16 +204,33 @@ def check_and_retrain() -> list[str]:
     drifted = stations_needing_retrain(stats)
     retrained = []
     for station_id in drifted:
-        frame = _training_frame(station_id)
+        recent = _fetch_recent(station_id)
+        if not recent:
+            continue
+        same_distribution = _new_data_matches_history(station_id, recent)
+        drop_oldest = 0 if same_distribution else len(recent)
+        print(
+            f"{station_id}: KS test ({'misma' if same_distribution else 'distinta'} distribución, "
+            f"alpha={REGIME_TEST_ALPHA}); "
+            + (
+                "se conserva todo el histórico."
+                if same_distribution
+                else f"se descartarán {drop_oldest} filas antiguas al publicar el nuevo modelo."
+            ),
+            flush=True,
+        )
+
+        frame = _training_frame(station_id, recent, drop_oldest)
         if len(frame) <= max(LAGS):
             continue
         path = _train_station_model(station_id, frame)
         _upload_model(station_id, path)
-        merged = _promote_temp_to_original(station_id)
+        merged = _promote_temp_to_original(station_id, drop_oldest)
         retrained.append(station_id)
+        note = f", {drop_oldest} antiguas descartadas por cambio de distribución" if drop_oldest else ""
         print(
             f"Drift en {station_id}: reentrenado con {len(frame)} observaciones "
-            f"({merged} nuevas incorporadas al histórico), modelo republicado en Supabase.",
+            f"({merged} nuevas incorporadas al histórico{note}), modelo republicado en Supabase.",
             flush=True,
         )
     return retrained
