@@ -1,6 +1,8 @@
+from datetime import datetime, timedelta, timezone
+
 import pandas as pd
 
-from app.drift import station_accuracy_stats, stations_needing_retrain
+from app.drift import check_and_retrain, station_accuracy_stats, stations_needing_retrain
 
 
 class FakeConnection:
@@ -63,3 +65,99 @@ def test_stations_needing_retrain_requires_enough_points_and_low_accuracy():
 
 def test_stations_needing_retrain_empty_stats():
     assert stations_needing_retrain(pd.DataFrame(columns=["station_id", "accuracy", "count"])) == []
+
+
+class RoutedFakeConnection:
+    """Dispatches each query to canned rows based on the table/params it touches."""
+
+    def __init__(self, temp_accuracy_rows, historical_rows, temp_recent_rows):
+        self.temp_accuracy_rows = temp_accuracy_rows
+        self.historical_rows = historical_rows
+        self.temp_recent_rows = temp_recent_rows
+        self.executed = []
+        self._last_rowcount = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        pass
+
+    def transaction(self):
+        return self
+
+    def execute(self, query, params=None):
+        self.executed.append((query, params))
+        if 'FROM "Temp" WHERE prediction IS NOT NULL' in query:
+            self._result = self.temp_accuracy_rows
+        elif 'INSERT INTO "Original Data"' in query:
+            self._result = None
+            self._last_rowcount = 0
+        elif 'DELETE FROM "Temp"' in query:
+            self._result = None
+            self._last_rowcount = len(self.temp_recent_rows)
+        elif 'FROM "Original Data" WHERE station_id' in query:
+            self._result = self.historical_rows
+        elif 'FROM "Temp" WHERE station_id' in query:
+            self._result = self.temp_recent_rows
+        else:
+            raise AssertionError(f"Unexpected query in test: {query}")
+        return self
+
+    def fetchall(self):
+        return self._result
+
+    @property
+    def rowcount(self):
+        return self._last_rowcount
+
+
+def test_check_and_retrain_trains_uploads_and_promotes_only_drifted_stations(monkeypatch, tmp_path):
+    station = "A"
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    # 700 historical points: enough to clear every lag (max lag is 672).
+    historical_rows = [
+        (start + timedelta(minutes=15 * i), 100 + (i % 20)) for i in range(700)
+    ]
+    # 60 fresh points the collector has staged in Temp, continuing the series.
+    temp_recent_rows = [
+        (start + timedelta(minutes=15 * (700 + i)), 100 + (i % 20)) for i in range(60)
+    ]
+    # Same 60 points scored against the (drifted) live model: consistently ~30% off.
+    temp_accuracy_rows = [(station, demand, demand * 0.7) for _, demand in temp_recent_rows]
+
+    fake_conn = RoutedFakeConnection(temp_accuracy_rows, historical_rows, temp_recent_rows)
+    monkeypatch.setattr("app.drift.connection", lambda: fake_conn)
+    monkeypatch.setattr("app.drift.MODEL_DIR", str(tmp_path))
+    monkeypatch.setattr("app.drift.SUPABASE_URL", "https://fake.supabase.co")
+    monkeypatch.setattr("app.drift.SUPABASE_SERVICE_ROLE_KEY", "fake-service-role-key")
+
+    uploads = []
+
+    class FakeResponse:
+        def raise_for_status(self):
+            pass
+
+    def fake_post(url, headers=None, data=None, timeout=None):
+        uploads.append({"url": url, "headers": headers, "bytes": len(data)})
+        return FakeResponse()
+
+    monkeypatch.setattr("app.drift.requests.post", fake_post)
+
+    retrained = check_and_retrain()
+
+    assert retrained == ["A"]
+    # The retrained model was actually written to disk (not just claimed).
+    model_path = tmp_path / "xgboost_A.joblib"
+    assert model_path.exists()
+    assert model_path.stat().st_size > 0
+    # It was uploaded to the right bucket/path with upsert, and with real file bytes.
+    assert len(uploads) == 1
+    assert uploads[0]["url"] == "https://fake.supabase.co/storage/v1/object/models/xgboost/xgboost_A.joblib"
+    assert uploads[0]["headers"]["x-upsert"] == "true"
+    assert uploads[0]["bytes"] == model_path.stat().st_size
+    # Temp rows for the drifted station were folded into Original Data and cleared.
+    queries = [q for q, _ in fake_conn.executed]
+    assert any('INSERT INTO "Original Data"' in q for q in queries)
+    assert any('DELETE FROM "Temp"' in q for q in queries)
