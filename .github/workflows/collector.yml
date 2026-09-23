@@ -47,7 +47,7 @@ jobs:
               -o "models/xgboost/xgboost_${station}.joblib"
           done
 
-      - name: Ejecutar collector cada 15 minutos mientras el job siga vivo
+      - name: Ejecutar collector cada 30 minutos mientras el job siga vivo
         shell: bash
         run: |
           set +e
@@ -66,5 +66,5 @@ jobs:
             else
               fails=0
             fi
-            sleep 900
+            sleep 1800
           done
