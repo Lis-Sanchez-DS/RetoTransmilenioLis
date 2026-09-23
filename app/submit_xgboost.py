@@ -1,14 +1,13 @@
 """Genera y envía la primera submission usando los XGBoost guardados."""
 
-from datetime import datetime, timezone
-import math
+from datetime import datetime, timedelta, timezone
 import os
 import subprocess
 
 import joblib
-import pandas as pd
 import requests
 
+from app.collector import collect_new_data
 from app.db import connection
 from app.features import temporal_features
 
@@ -39,24 +38,61 @@ def git_commit() -> str | None:
         return None
 
 
-def features_for_target(history: pd.DataFrame, target: dict) -> list[float]:
-    station = target["station_id"]
-    timestamp = pd.Timestamp(target["target_at"])
-    values = (
-        history.loc[history["station_id"] == station]
-        .sort_values("observed_at")["demand"]
-        .to_numpy()
-    )
-    if len(values) < max(LAGS):
-        raise RuntimeError(f"No hay suficiente historia para {station}")
-    features = [float(values[-lag]) for lag in LAGS]
-    features.extend(temporal_features(timestamp.to_pydatetime()))
-    return features
+def _parse_utc(value) -> datetime:
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+
+
+def predict_cycle_targets(targets: list[dict], history: dict, models: dict) -> list[dict]:
+    """Predict every target, recursing forward through each station's horizons.
+
+    Each station gets 4 targets (+15/+30/+45/+60 min from data_cutoff). The
+    model was trained so lag_k means "demand k*15 minutes before the exact
+    timestamp being predicted" - true only for the +15min target if lags are
+    read straight off data_cutoff, since the shorter lags for +30/+45/+60min
+    fall on timestamps that haven't been observed yet. So each station's
+    targets are predicted in chronological order, feeding each prediction
+    back into that station's local history as the stand-in value for the
+    not-yet-observed timestamp its own lags need next.
+    """
+    by_station: dict[str, list[dict]] = {}
+    for target in targets:
+        by_station.setdefault(target["station_id"], []).append(target)
+
+    predictions = []
+    for station_id, station_targets in by_station.items():
+        local_history = dict(history)
+        model = models[station_id]
+        for target in sorted(station_targets, key=lambda t: t["target_at"]):
+            timestamp = _parse_utc(target["target_at"])
+            features = []
+            for lag in LAGS:
+                key = (station_id, timestamp - timedelta(minutes=15 * lag))
+                if key not in local_history:
+                    raise RuntimeError(f"No hay suficiente historia para {station_id} en lag {lag}")
+                features.append(local_history[key])
+            features.extend(temporal_features(timestamp))
+            value = max(0.0, float(model.predict([features])[0]))
+            local_history[(station_id, timestamp)] = value
+            predictions.append(
+                {
+                    "station_id": station_id,
+                    "target_at": target["target_at"],
+                    "value": round(value, 3),
+                }
+            )
+    return predictions
 
 
 def submit_current_cycle() -> dict | None:
     if not API_KEY:
         raise RuntimeError("Define PULSO_API_KEY antes de ejecutar el script.")
+    # Pull the freshest data first, exactly like the reference student loop
+    # (collect, then check the cycle). Without this, a station's history can
+    # lag the cycle's data_cutoff by up to a collector cycle whenever
+    # collection and submission run as separate, independently-scheduled jobs.
+    collect_new_data()
     identity = api_get("/v1/me")
     try:
         cycle = api_get("/v1/forecast-cycles/current")
@@ -65,27 +101,30 @@ def submit_current_cycle() -> dict | None:
             return None
         raise
     with connection() as conn:
-        rows = conn.execute(
-            'SELECT station_id, observed_at, demand FROM "Original Data" '
-            'WHERE observed_at <= %s ORDER BY station_id, observed_at',
+        # "Temp" holds every observation collected since the last drift
+        # retrain for a station (see drift.py); only drifted stations ever
+        # get folded into "Original Data". Both tables must be read here or
+        # any non-drifted station's history goes stale the moment new data
+        # stops landing in "Original Data".
+        original = conn.execute(
+            'SELECT station_id, observed_at, demand FROM "Original Data" WHERE observed_at <= %s',
             (cycle["data_cutoff"],),
         ).fetchall()
-    history = pd.DataFrame(rows, columns=["station_id", "observed_at", "demand"])
-    history["observed_at"] = pd.to_datetime(history["observed_at"], utc=True)
+        recent = conn.execute(
+            'SELECT station_id, observed_at, demand FROM "Temp" WHERE observed_at <= %s',
+            (cycle["data_cutoff"],),
+        ).fetchall()
+    history = {
+        (station_id, _parse_utc(observed_at)): float(demand)
+        for station_id, observed_at, demand in original + recent
+    }
 
-    predictions = []
-    for target in cycle["targets"]:
-        model = joblib.load(
-            os.path.join(MODEL_DIR, f"xgboost_{target['station_id']}.joblib")
-        )
-        value = max(0.0, float(model.predict([features_for_target(history, target)])[0]))
-        predictions.append(
-            {
-                "station_id": target["station_id"],
-                "target_at": target["target_at"],
-                "value": round(value, 3),
-            }
-        )
+    station_ids = sorted({target["station_id"] for target in cycle["targets"]})
+    models = {
+        station_id: joblib.load(os.path.join(MODEL_DIR, f"xgboost_{station_id}.joblib"))
+        for station_id in station_ids
+    }
+    predictions = predict_cycle_targets(cycle["targets"], history, models)
 
     run_id = f"xgboost-{cycle['cycle_id']}"
     model_info = {
