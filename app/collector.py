@@ -31,12 +31,25 @@ def predict_records(records: list[dict]) -> list[tuple[dict, float]]:
         return []
     station_ids = sorted({item["station_id"] for item in records})
     with connection() as conn:
-        rows = conn.execute(
+        # "Temp" holds every observation collected since a station's last
+        # drift retrain (see drift.py); only drifted stations ever get
+        # folded into "Original Data". Both tables must be read here or a
+        # non-drifted station's lag lookups fall back on stale seed data
+        # once a run's own batch is too small to bridge the gap itself.
+        original_rows = conn.execute(
             'SELECT station_id, observed_at, demand FROM "Original Data" '
             'WHERE station_id = ANY(%s)',
             (station_ids,),
         ).fetchall()
-    history = {(station, observed_at): float(demand) for station, observed_at, demand in rows}
+        temp_rows = conn.execute(
+            'SELECT station_id, observed_at, demand FROM "Temp" '
+            'WHERE station_id = ANY(%s)',
+            (station_ids,),
+        ).fetchall()
+    history = {
+        (station, observed_at): float(demand)
+        for station, observed_at, demand in original_rows + temp_rows
+    }
     models = {
         station_id: joblib.load(os.path.join(MODEL_DIR, f"xgboost_{station_id}.joblib"))
         for station_id in station_ids
