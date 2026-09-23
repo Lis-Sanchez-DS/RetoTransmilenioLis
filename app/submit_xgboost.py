@@ -3,6 +3,7 @@
 from datetime import datetime, timedelta, timezone
 import os
 import subprocess
+import sys
 
 import joblib
 import requests
@@ -10,6 +11,7 @@ import requests
 from app.collector import collect_new_data
 from app.db import connection
 from app.features import temporal_features
+from app.net import with_retries, UpstreamUnavailable
 
 
 BASE_URL = os.getenv("PULSO_API_URL", "https://pulso-transmi.72-60-245-2.sslip.io").rstrip("/")
@@ -19,13 +21,15 @@ LAGS = (1, 2, 4, 96, 672)
 
 
 def api_get(path: str) -> dict:
-    response = requests.get(
-        f"{BASE_URL}{path}",
-        headers={"Authorization": f"Bearer {API_KEY}"},
-        timeout=30,
-    )
-    response.raise_for_status()
-    return response.json()
+    def _get():
+        response = requests.get(
+            f"{BASE_URL}{path}",
+            headers={"Authorization": f"Bearer {API_KEY}"},
+            timeout=30,
+        )
+        response.raise_for_status()
+        return response.json()
+    return with_retries(_get)
 
 
 def git_commit() -> str | None:
@@ -146,18 +150,22 @@ def submit_current_cycle() -> dict | None:
         "model": model_info,
         "predictions": predictions,
     }
-    response = requests.post(
-        f"{BASE_URL}/v1/submissions",
-        headers={
-            "Authorization": f"Bearer {API_KEY}",
-            "Idempotency-Key": run_id,
-            "Content-Type": "application/json",
-        },
-        json=payload,
-        timeout=30,
-    )
-    response.raise_for_status()
-    receipt = response.json()
+
+    def _post():
+        response = requests.post(
+            f"{BASE_URL}/v1/submissions",
+            headers={
+                "Authorization": f"Bearer {API_KEY}",
+                "Idempotency-Key": run_id,
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=30,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    receipt = with_retries(_post)
     result = {
         "student": identity["display_name"],
         "submission_id": receipt["submission_id"],
@@ -173,7 +181,11 @@ def submit_current_cycle() -> dict | None:
 
 
 def main() -> None:
-    submit_current_cycle()
+    try:
+        submit_current_cycle()
+    except UpstreamUnavailable as exc:
+        print(f"AVISO: {exc}", flush=True)
+        sys.exit(75)
 
 
 if __name__ == "__main__":
