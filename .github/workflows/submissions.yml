@@ -58,6 +58,11 @@ jobs:
           while [ "$(date +%s)" -lt "$end" ]; do
             python -m app.submit_xgboost
             status=$?
+            if [ $status -eq 75 ]; then
+              echo "Servidor PulsoTransmi no disponible; no cuenta como fallo de la app. Reintentando en 5 min."
+              sleep 300
+              continue
+            fi
             if [ $status -ne 0 ]; then
               fails=$((fails + 1))
               echo "Intento fallido ($fails consecutivo(s))."
