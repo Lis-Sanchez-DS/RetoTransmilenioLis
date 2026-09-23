@@ -60,7 +60,13 @@ def predict_records(records: list[dict]) -> list[tuple[dict, float]]:
 
 
 def collect_new_data(fetcher=None) -> dict:
-    """Collect all pages released after the saved cursor into Temp."""
+    """Collect all pages released after the saved cursor into Temp.
+
+    Per the API contract, `next_cursor: null` means the stream has been
+    drained up to the current live edge; it is not an error. The saved
+    cursor only advances when the server hands back a real next_cursor, so a
+    drained response safely replays on the next run once new data appears.
+    """
     cursor = get_cursor()
     total = 0
     pages = 0
@@ -77,14 +83,10 @@ def collect_new_data(fetcher=None) -> dict:
 
         records = payload.get("data", payload.get("observations", []))
         next_cursor = payload.get("next_cursor")
-        if not records and next_cursor is None:
-            pages += 1
+        pages += 1
+        if not records:
             break
-        if next_cursor is None:
-            raise RuntimeError("The stream response did not include next_cursor")
-        previous_cursor = cursor
-        if records and next_cursor == previous_cursor:
-            raise RuntimeError("The stream response returned an unchanged cursor")
+
         predicted_records = predict_records(records)
 
         with connection() as conn:
@@ -96,18 +98,18 @@ def collect_new_data(fetcher=None) -> dict:
                            ON CONFLICT (station_id, observed_at) DO NOTHING""",
                         (item["station_id"], item["observed_at"], item["demand"], prediction),
                     )
-                conn.execute(
-                    """INSERT INTO collector_state (state_key, cursor_value, updated_at)
-                       VALUES ('observations', %s, now())
-                       ON CONFLICT (state_key) DO UPDATE
-                       SET cursor_value = EXCLUDED.cursor_value, updated_at = now()""",
-                    (next_cursor,),
-                )
+                if next_cursor is not None:
+                    conn.execute(
+                        """INSERT INTO collector_state (state_key, cursor_value, updated_at)
+                           VALUES ('observations', %s, now())
+                           ON CONFLICT (state_key) DO UPDATE
+                           SET cursor_value = EXCLUDED.cursor_value, updated_at = now()""",
+                        (next_cursor,),
+                    )
         total += len(records)
-        pages += 1
-        cursor = next_cursor
-        if not records or next_cursor == previous_cursor:
+        if next_cursor is None or next_cursor == cursor:
             break
+        cursor = next_cursor
     return {"collected": total, "pages": pages, "cursor": cursor}
 
 

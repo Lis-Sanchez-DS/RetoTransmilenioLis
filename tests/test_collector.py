@@ -48,12 +48,38 @@ def test_collector_collects_all_pages_and_returns_cursor(monkeypatch):
         calls.append(kwargs)
         if len(calls) == 1:
             return {"data": records[:15], "next_cursor": "cursor-15"}
-        if len(calls) == 2:
-            return {"data": records[15:], "next_cursor": "cursor-16"}
-        return {"data": [], "next_cursor": "cursor-16"}
+        return {"data": records[15:], "next_cursor": None}
 
     result = collect_new_data(fetcher)
 
-    assert result == {"collected": 16, "pages": 2, "cursor": "cursor-16"}
+    assert result == {"collected": 16, "pages": 2, "cursor": "cursor-15"}
     insert_queries = [q for q, _ in captured["queries"] if 'INSERT INTO "Temp"' in q]
     assert len(insert_queries) == 16
+
+
+def test_collector_stops_when_stream_is_drained(monkeypatch):
+    class FakeConnection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def transaction(self):
+            return self
+
+        def execute(self, query, params=None):
+            return self
+
+        def fetchone(self):
+            return None
+
+    monkeypatch.setattr("app.collector.connection", lambda: FakeConnection())
+    monkeypatch.setattr("app.collector.predict_records", lambda batch: [])
+
+    def fetcher(**kwargs):
+        return {"data": [], "next_cursor": None}
+
+    result = collect_new_data(fetcher)
+
+    assert result == {"collected": 0, "pages": 1, "cursor": None}
