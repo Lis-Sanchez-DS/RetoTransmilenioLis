@@ -1,0 +1,6 @@
+BEGIN;
+
+ALTER TABLE "Original Data"
+    ADD COLUMN IF NOT EXISTS prediction NUMERIC;
+
+COMMIT;
