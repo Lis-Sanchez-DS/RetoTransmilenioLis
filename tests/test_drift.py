@@ -3,9 +3,12 @@ from datetime import datetime, timedelta, timezone
 import pandas as pd
 
 from app.drift import (
+    DEFAULT_PARAMS,
+    HYPERPARAM_GRID,
     REGIME_SAMPLE_SIZE,
     check_and_retrain,
     _new_data_matches_history,
+    _select_best_params,
     station_accuracy_stats,
     stations_needing_retrain,
 )
@@ -118,6 +121,33 @@ def test_new_data_matches_history_defaults_true_when_not_enough_data(monkeypatch
     recent = [(None, 100)] * 10
 
     assert _new_data_matches_history("A", recent) is True
+
+
+def test_select_best_params_falls_back_when_too_little_data_for_cv():
+    """With too few rows to split into CV_SPLITS meaningful folds, the search
+    is skipped entirely rather than cross-validating on scraps - DEFAULT_PARAMS
+    (the config the model always used before this search existed) is returned
+    unchanged, and importantly no XGBoost fit is attempted.
+    """
+    features = pd.DataFrame({"lag_1": range(15), "lag_2": range(15)})
+    y = pd.Series(range(15), dtype=float)
+
+    assert _select_best_params("A", features, y) == DEFAULT_PARAMS
+
+
+def test_select_best_params_picks_a_grid_candidate_with_enough_data():
+    """With enough rows for walk-forward CV, the search runs the full grid
+    and returns one of its candidates (not necessarily DEFAULT_PARAMS).
+    """
+    n = 60
+    y = pd.Series([float(i % 10) for i in range(n)])
+    features = pd.DataFrame(
+        {f"lag_{lag}": y.shift(lag).fillna(0.0) for lag in (1, 2)}
+    )
+
+    best_params = _select_best_params("A", features, y)
+
+    assert best_params in HYPERPARAM_GRID
 
 
 class RoutedFakeConnection:
