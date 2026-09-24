@@ -2,7 +2,6 @@
 
 from datetime import datetime, timedelta, timezone
 import os
-import subprocess
 import sys
 
 import joblib
@@ -11,6 +10,7 @@ import requests
 from app.collector import collect_new_data
 from app.db import connection
 from app.features import temporal_features
+from app.health import check_collector_heartbeat
 from app.net import with_retries, UpstreamUnavailable
 
 
@@ -32,16 +32,6 @@ def api_get(path: str) -> dict:
     return with_retries(_get)
 
 
-def git_commit() -> str | None:
-    try:
-        value = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL
-        ).strip()
-        return value if len(value) == 40 else None
-    except (OSError, subprocess.CalledProcessError):
-        return None
-
-
 def _parse_utc(value) -> datetime:
     if isinstance(value, datetime):
         return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
@@ -59,6 +49,11 @@ def predict_cycle_targets(targets: list[dict], history: dict, models: dict) -> l
     targets are predicted in chronological order, feeding each prediction
     back into that station's local history as the stand-in value for the
     not-yet-observed timestamp its own lags need next.
+
+    A station missing history for one of its lags (e.g. lag_672 needs a full
+    unbroken week of data) is skipped entirely rather than aborting the whole
+    cycle - one gap in one station's history shouldn't zero out every other
+    station's otherwise-valid submission.
     """
     by_station: dict[str, list[dict]] = {}
     for target in targets:
@@ -68,24 +63,30 @@ def predict_cycle_targets(targets: list[dict], history: dict, models: dict) -> l
     for station_id, station_targets in by_station.items():
         local_history = dict(history)
         model = models[station_id]
-        for target in sorted(station_targets, key=lambda t: t["target_at"]):
-            timestamp = _parse_utc(target["target_at"])
-            features = []
-            for lag in LAGS:
-                key = (station_id, timestamp - timedelta(minutes=15 * lag))
-                if key not in local_history:
-                    raise RuntimeError(f"No hay suficiente historia para {station_id} en lag {lag}")
-                features.append(local_history[key])
-            features.extend(temporal_features(timestamp))
-            value = max(0.0, float(model.predict([features])[0]))
-            local_history[(station_id, timestamp)] = value
-            predictions.append(
-                {
-                    "station_id": station_id,
-                    "target_at": target["target_at"],
-                    "value": round(value, 3),
-                }
-            )
+        try:
+            station_predictions = []
+            for target in sorted(station_targets, key=lambda t: t["target_at"]):
+                timestamp = _parse_utc(target["target_at"])
+                features = []
+                for lag in LAGS:
+                    key = (station_id, timestamp - timedelta(minutes=15 * lag))
+                    if key not in local_history:
+                        raise RuntimeError(f"No hay suficiente historia para {station_id} en lag {lag}")
+                    features.append(local_history[key])
+                features.extend(temporal_features(timestamp))
+                value = max(0.0, float(model.predict([features])[0]))
+                local_history[(station_id, timestamp)] = value
+                station_predictions.append(
+                    {
+                        "station_id": station_id,
+                        "target_at": target["target_at"],
+                        "value": round(value, 3),
+                    }
+                )
+        except RuntimeError as exc:
+            print(f"AVISO: se omite estación {station_id} en este ciclo: {exc}", flush=True)
+            continue
+        predictions.extend(station_predictions)
     return predictions
 
 
@@ -129,19 +130,18 @@ def submit_current_cycle() -> dict | None:
         for station_id in station_ids
     }
     predictions = predict_cycle_targets(cycle["targets"], history, models)
+    if not predictions:
+        raise RuntimeError("Ninguna estación tenía suficiente historia para este ciclo; no se envía submission.")
 
-    run_id = f"xgboost-{cycle['cycle_id']}"
+    run_id = f"run-{cycle['cycle_id']}"
     model_info = {
-        "version": "xgboost-per-station:1.0",
+        "version": "v1",
         "trained_at": datetime.fromtimestamp(
-            os.path.getmtime(os.path.join(MODEL_DIR, f"xgboost_{predictions[0]['station_id']}.joblib")),
+            os.path.getmtime(os.path.join(MODEL_DIR, f"xgboost_{station_ids[0]}.joblib")),
             timezone.utc,
         ).isoformat(),
         "training_data_end": cycle["data_cutoff"],
     }
-    commit = git_commit()
-    if commit:
-        model_info["git_commit"] = commit
     payload = {
         "schema_version": "1.0",
         "cycle_id": cycle["cycle_id"],
@@ -177,6 +177,10 @@ def submit_current_cycle() -> dict | None:
     print(f"Entrega: {result['submission_id']}")
     print(f"Estado: {result['status']}")
     print(f"Predicciones: {result['predictions_received']}/{result['expected_predictions']}")
+    # Checked last, after the submission is already out: a stale collector
+    # shouldn't block a submission that otherwise succeeded, but it should
+    # still surface as a loud failure so it doesn't go unnoticed.
+    check_collector_heartbeat()
     return result
 
 

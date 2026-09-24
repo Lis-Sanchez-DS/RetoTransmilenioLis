@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta, timezone
 
-from app.submit_xgboost import predict_cycle_targets
+from app.submit_xgboost import LAGS, predict_cycle_targets
 
 
 class EchoPlusOneModel:
@@ -62,15 +62,26 @@ def test_predict_cycle_targets_keeps_stations_independent():
     assert b_values == [501.0, 502.0, 503.0, 504.0]
 
 
-def test_predict_cycle_targets_raises_on_missing_history():
-    station = "A"
-    cutoff = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
-    targets = [{"station_id": station, "target_at": (cutoff + timedelta(minutes=15)).isoformat()}]
-    models = {station: EchoPlusOneModel()}
+def test_predict_cycle_targets_skips_station_with_missing_history():
+    """A station missing lag history is skipped, not fatal to the whole cycle.
 
-    try:
-        predict_cycle_targets(targets, {}, models)
-    except RuntimeError as exc:
-        assert "No hay suficiente historia" in str(exc)
-    else:
-        raise AssertionError("Expected RuntimeError for missing history")
+    One station's incomplete history (e.g. a gap in the week lag_672 needs)
+    shouldn't zero out every other station's otherwise-valid submission.
+    """
+    incomplete_station = "A"
+    healthy_station = "B"
+    cutoff = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+    target_ts = cutoff + timedelta(minutes=15)
+    targets = [
+        {"station_id": incomplete_station, "target_at": target_ts.isoformat()},
+        {"station_id": healthy_station, "target_at": target_ts.isoformat()},
+    ]
+    history = {
+        (healthy_station, target_ts - timedelta(minutes=15 * lag)): 500.0 + lag
+        for lag in LAGS
+    }
+    models = {incomplete_station: EchoPlusOneModel(), healthy_station: EchoPlusOneModel()}
+
+    predictions = predict_cycle_targets(targets, history, models)
+
+    assert [p["station_id"] for p in predictions] == [healthy_station]

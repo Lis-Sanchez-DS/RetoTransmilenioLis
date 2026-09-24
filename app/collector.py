@@ -11,6 +11,7 @@ import numpy as np
 from app.db import connection
 from app.drift import check_and_retrain
 from app.features import temporal_features
+from app.health import record_job_run
 from app.net import with_retries, UpstreamUnavailable
 
 API_URL = os.getenv("PULSO_API_URL", "https://pulso-transmi.72-60-245-2.sslip.io")
@@ -135,6 +136,7 @@ collect_last_15 = collect_new_data
 
 
 def run() -> None:
+    started_at = datetime.now(timezone.utc)
     try:
         result = collect_new_data()
     except UpstreamUnavailable as exc:
@@ -146,6 +148,10 @@ def run() -> None:
         print(f"Modelos reentrenados por drift: {', '.join(retrained)}", flush=True)
     else:
         print("Sin drift detectado.", flush=True)
+    # Heartbeat: submit_xgboost.py checks this to notice a collector that
+    # went silent (disabled, cancelled, stuck failing) instead of quietly
+    # submitting against an aging model forever.
+    record_job_run("collector", "ok", started_at)
 
 
 if __name__ == "__main__":

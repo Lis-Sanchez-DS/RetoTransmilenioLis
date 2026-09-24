@@ -38,16 +38,7 @@ jobs:
 
       - name: Descargar modelos desde Supabase Storage
         shell: bash
-        run: |
-          mkdir -p models/xgboost
-          for station in 02300 03000 05000 05100 06000 06111 07105 07107 07111 09000 09122 10009; do
-            curl --fail --silent --show-error \
-              -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" \
-              -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
-              "$SUPABASE_URL/storage/v1/object/models/xgboost/xgboost_${station}.joblib" \
-              -o "models/xgboost/xgboost_${station}.joblib"
-          done
-          test "$(find models/xgboost -name '*.joblib' | wc -l)" -eq 12
+        run: scripts/download_models.sh
 
       - name: Enviar submission cada 20 minutos mientras el job siga vivo
         shell: bash
@@ -56,6 +47,13 @@ jobs:
           end=$(( $(date +%s) + 345 * 60 ))
           fails=0
           while [ "$(date +%s)" -lt "$end" ]; do
+            # Re-descargar antes de cada vuelta: si collector.yml reentrenó y
+            # republicó un modelo por drift a mitad de este job (que vive
+            # hasta ~5.75h), esto lo recoge en la siguiente vuelta en vez de
+            # seguir usando el modelo viejo hasta que el job se reinicie.
+            if ! scripts/download_models.sh; then
+              echo "No se pudieron refrescar los modelos; se sigue con la copia local ya descargada."
+            fi
             python -m app.submit_xgboost
             status=$?
             if [ $status -eq 75 ]; then
