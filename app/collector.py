@@ -1,6 +1,8 @@
+import base64
 import json
 import os
 import sys
+import urllib.error
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -76,29 +78,72 @@ def predict_records(records: list[dict]) -> list[tuple[dict, float]]:
     return predictions
 
 
+def _synthetic_cursor(record: dict) -> str:
+    """Build a resume cursor for when the server hands back next_cursor: null.
+
+    That happens on every run once the collector is caught up to the live
+    edge - the normal steady state, not a rare corner case - and the API
+    issues no bookmark for it. Verified against the live API: encoding the
+    last record's own (released_at, observed_at, station_id) the same way
+    reproduces the server's own next_cursor byte-for-byte, and round-trips
+    correctly when sent back as ?cursor=. Without this, every single run
+    forever would silently re-fetch and re-process the entire stream from
+    scratch instead of just what's new - which is what was happening before
+    this fix (collector_state never accumulated a single saved row).
+
+    This relies on the server's cursor encoding being what it is today, not
+    on anything the API contract (`cursor` is documented as an opaque
+    `string | null`) actually promises - see _fetch_page's fallback for what
+    happens if a saved cursor (real or synthetic) ever stops being accepted.
+    """
+    payload = [
+        record["released_at"].replace("Z", "+00:00"),
+        record["observed_at"].replace("Z", "+00:00"),
+        record["station_id"],
+    ]
+    return base64.b64encode(json.dumps(payload, separators=(",", ":")).encode()).decode()
+
+
+def _fetch_page(fetcher, cursor: str | None, retry_without_cursor: bool = True) -> dict:
+    """Fetch one page. If a saved cursor - real or synthetic - gets rejected by
+    the server, fall back to a full refetch instead of failing the run: no
+    worse than the un-fixed behavior, and self-heals once it succeeds and a
+    fresh valid cursor gets saved again.
+    """
+    query = {"limit": PAGE_SIZE}
+    if cursor:
+        query["cursor"] = cursor
+    if fetcher is not None:
+        return fetcher(cursor=cursor, limit=PAGE_SIZE)
+
+    def _get():
+        request = Request(f"{API_URL}/v1/stream/observations?{urlencode(query)}")
+        with urlopen(request, timeout=30) as response:
+            return json.load(response)
+
+    try:
+        return with_retries(_get)
+    except urllib.error.HTTPError as exc:
+        if cursor and retry_without_cursor and 400 <= exc.code < 500:
+            print(f"AVISO: el cursor guardado fue rechazado ({exc.code}); se reintenta sin cursor.", flush=True)
+            return _fetch_page(fetcher, None, retry_without_cursor=False)
+        raise
+
+
 def collect_new_data(fetcher=None) -> dict:
     """Collect all pages released after the saved cursor into Temp.
 
     Per the API contract, `next_cursor: null` means the stream has been
-    drained up to the current live edge; it is not an error. The saved
-    cursor only advances when the server hands back a real next_cursor, so a
-    drained response safely replays on the next run once new data appears.
+    drained up to the current live edge; it is not an error, and it's the
+    normal outcome of every run once caught up - see _synthetic_cursor for
+    how a resume point still gets saved in that case.
     """
     cursor = get_cursor()
+    saved_cursor = cursor
     total = 0
     pages = 0
     while True:
-        query = {"limit": PAGE_SIZE}
-        if cursor:
-            query["cursor"] = cursor
-        if fetcher is None:
-            def _get():
-                request = Request(f"{API_URL}/v1/stream/observations?{urlencode(query)}")
-                with urlopen(request, timeout=30) as response:
-                    return json.load(response)
-            payload = with_retries(_get)
-        else:
-            payload = fetcher(cursor=cursor, limit=PAGE_SIZE)
+        payload = _fetch_page(fetcher, cursor)
 
         records = payload.get("data", payload.get("observations", []))
         next_cursor = payload.get("next_cursor")
@@ -107,6 +152,7 @@ def collect_new_data(fetcher=None) -> dict:
             break
 
         predicted_records = predict_records(records)
+        resume_cursor = next_cursor if next_cursor is not None else _synthetic_cursor(records[-1])
 
         with connection() as conn:
             with conn.transaction():
@@ -117,19 +163,20 @@ def collect_new_data(fetcher=None) -> dict:
                            ON CONFLICT (station_id, observed_at) DO NOTHING""",
                         (item["station_id"], item["observed_at"], item["demand"], prediction),
                     )
-                if next_cursor is not None:
+                if resume_cursor != saved_cursor:
                     conn.execute(
                         """INSERT INTO collector_state (state_key, cursor_value, updated_at)
                            VALUES ('observations', %s, now())
                            ON CONFLICT (state_key) DO UPDATE
                            SET cursor_value = EXCLUDED.cursor_value, updated_at = now()""",
-                        (next_cursor,),
+                        (resume_cursor,),
                     )
+                    saved_cursor = resume_cursor
         total += len(records)
         if next_cursor is None or next_cursor == cursor:
             break
         cursor = next_cursor
-    return {"collected": total, "pages": pages, "cursor": cursor}
+    return {"collected": total, "pages": pages, "cursor": saved_cursor}
 
 
 collect_last_15 = collect_new_data

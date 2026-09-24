@@ -1,11 +1,17 @@
+import urllib.error
 from datetime import datetime, timedelta, timezone
 
-from app.collector import LAGS, collect_new_data, predict_records
+from app.collector import LAGS, _synthetic_cursor, collect_new_data, predict_records
 
 
 def test_collector_collects_all_pages_and_returns_cursor(monkeypatch):
     records = [
-        {"station_id": "station-1", "observed_at": f"2026-01-01T00:{i:02d}:00Z", "demand": i}
+        {
+            "station_id": "station-1",
+            "observed_at": f"2026-01-01T00:{i:02d}:00Z",
+            "demand": i,
+            "released_at": f"2026-01-02T00:{i:02d}:00Z",
+        }
         for i in range(16)
     ]
     captured = {}
@@ -54,9 +60,15 @@ def test_collector_collects_all_pages_and_returns_cursor(monkeypatch):
 
     result = collect_new_data(fetcher)
 
-    assert result == {"collected": 16, "pages": 2, "cursor": "cursor-15"}
+    # The first page's real server cursor gets saved as-is; the second (and
+    # final) page hits next_cursor: null - the normal "caught up" case - so
+    # the resume point falls back to a cursor built from its own last record.
+    expected_final_cursor = _synthetic_cursor(records[-1])
+    assert result == {"collected": 16, "pages": 2, "cursor": expected_final_cursor}
     insert_queries = [q for q, _ in captured["queries"] if 'INSERT INTO "Temp"' in q]
     assert len(insert_queries) == 16
+    cursor_saves = [params[0] for q, params in captured["queries"] if "INSERT INTO collector_state" in q]
+    assert cursor_saves == ["cursor-15", expected_final_cursor]
 
 
 def test_collector_stops_when_stream_is_drained(monkeypatch):
@@ -85,6 +97,56 @@ def test_collector_stops_when_stream_is_drained(monkeypatch):
     result = collect_new_data(fetcher)
 
     assert result == {"collected": 0, "pages": 1, "cursor": None}
+
+
+def test_synthetic_cursor_matches_real_api_cursor():
+    """Regression fixture: this is a real cursor the live Pulso TransMi API
+    returned for this exact record during development. If the server ever
+    changes its cursor encoding, this is the test that should catch it.
+    """
+    record = {
+        "station_id": "05000",
+        "observed_at": "2026-09-09T05:00:00Z",
+        "demand": 109,
+        "released_at": "2026-09-21T15:30:04.958049Z",
+    }
+    real_cursor_from_api = (
+        "WyIyMDI2LTA5LTIxVDE1OjMwOjA0Ljk1ODA0OSswMDowMCIsIjIwMjYtMDktMDlUMDU6MDA6MDArMDA6MDAiLCIwNTAwMCJd"
+    )
+
+    assert _synthetic_cursor(record) == real_cursor_from_api
+
+
+def test_fetch_page_falls_back_to_full_refetch_when_cursor_rejected(monkeypatch):
+    from app.collector import _fetch_page
+
+    requests_made = []
+
+    def fake_urlopen(request, timeout=None):
+        requests_made.append(request.full_url)
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+            def read(self):
+                return b'{"data": [], "next_cursor": null}'
+
+        if "cursor=" in request.full_url:
+            raise urllib.error.HTTPError(request.full_url, 422, "cursor invalido", None, None)
+        return FakeResponse()
+
+    monkeypatch.setattr("app.collector.urlopen", fake_urlopen)
+
+    payload = _fetch_page(None, "un-cursor-que-el-servidor-ya-no-acepta")
+
+    assert payload == {"data": [], "next_cursor": None}
+    assert len(requests_made) == 2
+    assert "cursor=" in requests_made[0]
+    assert "cursor=" not in requests_made[1]
 
 
 def test_predict_records_reads_history_from_both_tables(monkeypatch):
