@@ -1,10 +1,20 @@
 """Detección de drift por estación y reentrenamiento automático.
 
 El collector guarda en "Temp" cada observación nueva junto con la
-predicción que el modelo vigente le habría dado. Ese historial reciente es
-la señal de drift: si con más de 50 observaciones la accuracy de la
-estación (la misma métrica del proyecto, 1 - WAPE) cae por debajo de 0.85,
-se evalúa si el patrón de demanda cambió antes de reentrenar.
+predicción que el modelo vigente le habría dado. La señal de drift es la
+accuracy (la misma métrica del proyecto, 1 - WAPE) de esa estación, medida
+solo sobre las últimas ACCURACY_WINDOW_HOURS horas de datos (no sobre todo
+lo acumulado en "Temp" desde el último reentrenamiento) - así el disparador
+reacciona a cómo está funcionando el modelo *ahora mismo* en vez de diluirse
+con un histórico largo que puede mezclar tramos buenos y malos. Con el tick
+de ~15 minutos del stream, una ventana de 6 horas deja como máximo ~24
+puntos por estación, de ahí que MIN_DATAPOINTS esté fijado bien por debajo
+de ese techo. Si esa accuracy reciente cae por debajo de 0.90 con
+suficientes puntos, se evalúa si el patrón de demanda cambió antes de
+reentrenar. Nótese que esta ventana solo afecta a la *decisión* de
+disparar el drift: una vez disparado, el reentrenamiento sigue usando TODO
+lo acumulado en "Temp" para esa estación (ver _fetch_recent), no solo la
+ventana de 6 horas.
 
 Esa evaluación compara, con una prueba de Kolmogorov-Smirnov de dos
 muestras (alpha=0.10), los 50 puntos históricos más recientes contra los
@@ -37,21 +47,44 @@ MODEL_DIR = os.getenv("MODEL_DIR", "models/xgboost")
 MODEL_BUCKET = "models"
 LAGS = (1, 2, 4, 96, 672)
 
-ACCURACY_THRESHOLD = 0.85
-MIN_DATAPOINTS = 50
+ACCURACY_THRESHOLD = 0.90
+ACCURACY_WINDOW_HOURS = 6
+# At the stream's ~15-minute tick, 6h caps out around 24 points/station, so
+# this has to sit comfortably under that ceiling or the trigger could never
+# fire. 20 leaves room for a handful of missed/late ticks.
+MIN_DATAPOINTS = 20
 REGIME_SAMPLE_SIZE = 50
 REGIME_TEST_ALPHA = 0.10
 
 
 def station_accuracy_stats() -> pd.DataFrame:
-    """Accuracy and count per station over "Temp", using the project's own metric:
+    """Accuracy and count per station over the last ACCURACY_WINDOW_HOURS of data.
 
     Accuracy = max(0, 1 - WAPE), i.e. 1 - sum(|demand - prediction|) / sum(|demand|),
     the same formula as train_comparison_models.py's score() (there scaled by 100).
+
+    The window is anchored to the newest observed_at across both tables rather
+    than wall-clock now(): the competition runs on a virtual clock decoupled
+    from real time, so "now" has to mean "as of the freshest data we have."
+
+    A retrain empties "Temp" for the stations it just touched (their rows move
+    into "Original Data" - see _promote_temp_to_original). Right after that, a
+    just-retrained station's own "Temp" history can be shorter than the full
+    window, even though the data itself still exists - it just moved. So this
+    reads both tables for the window and lets whichever one holds each point
+    fill it in; it's the same rows, just possibly in their new location.
     """
     with connection() as conn:
         rows = conn.execute(
-            'SELECT station_id, demand, prediction FROM "Temp" WHERE prediction IS NOT NULL'
+            """WITH combined AS (
+                   SELECT station_id, demand, prediction, observed_at FROM "Temp"
+                   UNION ALL
+                   SELECT station_id, demand, prediction, observed_at FROM "Original Data"
+               ),
+               cutoff AS (SELECT max(observed_at) - %s::interval AS ts FROM combined)
+               SELECT station_id, demand, prediction FROM combined, cutoff
+               WHERE prediction IS NOT NULL AND observed_at > cutoff.ts""",
+            (f"{ACCURACY_WINDOW_HOURS} hours",),
         ).fetchall()
     columns = ["station_id", "accuracy", "count"]
     if not rows:
@@ -187,9 +220,13 @@ def _promote_temp_to_original(station_id: str, drop_oldest: int) -> int:
                        WHERE o.station_id = oldest.station_id AND o.observed_at = oldest.observed_at""",
                     (station_id, drop_oldest),
                 )
+            # `prediction` is carried over too (not just demand): once these rows
+            # move into "Original Data", station_accuracy_stats() needs to be able
+            # to keep reading them there for the 6h accuracy window - see its
+            # docstring for why.
             conn.execute(
-                """INSERT INTO "Original Data" (station_id, observed_at, demand)
-                   SELECT station_id, observed_at, demand FROM "Temp"
+                """INSERT INTO "Original Data" (station_id, observed_at, demand, prediction)
+                   SELECT station_id, observed_at, demand, prediction FROM "Temp"
                    WHERE station_id = %s
                    ON CONFLICT (station_id, observed_at) DO NOTHING""",
                 (station_id,),

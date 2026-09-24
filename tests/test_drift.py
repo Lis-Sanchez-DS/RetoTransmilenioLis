@@ -52,6 +52,27 @@ def test_station_accuracy_stats_empty_when_no_rows(monkeypatch):
     assert stats.empty
 
 
+def test_station_accuracy_stats_reads_both_tables(monkeypatch):
+    """A station just promoted by a retrain has a short "Temp" history (it was
+    just emptied); the accuracy window has to keep counting those rows once
+    they move into "Original Data", or a freshly-retrained station would look
+    like it has too little data to ever be checked again for hours.
+    """
+    captured = {}
+
+    class CapturingConnection(FakeConnection):
+        def execute(self, query, params=None):
+            captured["query"] = query
+            return self
+
+    monkeypatch.setattr("app.drift.connection", lambda: CapturingConnection([]))
+
+    station_accuracy_stats()
+
+    assert '"Temp"' in captured["query"]
+    assert '"Original Data"' in captured["query"]
+
+
 def test_stations_needing_retrain_requires_enough_points_and_low_accuracy():
     stats = pd.DataFrame(
         [
@@ -120,7 +141,7 @@ class RoutedFakeConnection:
 
     def execute(self, query, params=None):
         self.executed.append((query, params))
-        if 'FROM "Temp" WHERE prediction IS NOT NULL' in query:
+        if 'FROM combined, cutoff' in query:
             self._result = self.temp_accuracy_rows
         elif 'INSERT INTO "Original Data"' in query:
             self._result = None
@@ -205,6 +226,11 @@ def test_check_and_retrain_keeps_full_history_when_new_data_matches_distribution
     assert any('DELETE FROM "Temp"' in q for q in queries)
     # Same distribution: no history should have been discarded.
     assert not any('DELETE FROM "Original Data"' in q for q in queries)
+    # The promotion must carry `prediction` along with `demand` - once these
+    # rows move into "Original Data", station_accuracy_stats() needs the
+    # prediction column there to keep scoring them within the 6h window.
+    promote_query = next(q for q in queries if 'INSERT INTO "Original Data"' in q)
+    assert "prediction" in promote_query
 
 
 def test_check_and_retrain_drops_oldest_rows_when_distribution_shifted(monkeypatch, tmp_path):
