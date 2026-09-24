@@ -36,7 +36,7 @@ MODEL_DIR = os.getenv("MODEL_DIR", "models/xgboost")
 MODEL_BUCKET = "models"
 LAGS = (1, 2, 4, 96, 672)
 
-ACCURACY_THRESHOLD = 0.90
+ACCURACY_THRESHOLD = 0.85
 ACCURACY_WINDOW_HOURS = 6
 # At the stream's ~15-minute tick, 6h caps out around 24 points/station, so
 # this has to sit comfortably under that ceiling or the trigger could never
