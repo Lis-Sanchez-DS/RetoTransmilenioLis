@@ -165,7 +165,20 @@ def submit_current_cycle() -> dict | None:
         response.raise_for_status()
         return response.json()
 
-    receipt = with_retries(_post)
+    try:
+        receipt = with_retries(_post)
+    except requests.HTTPError as exc:
+        # The forecast cycle window (currently longer than our 5-minute poll
+        # interval) can still be "current" on the next loop iteration after
+        # we already submitted for it. The server rejects the repeat as a
+        # real conflict rather than replaying the original response, so this
+        # is an expected steady-state case, not a failure - treat it as a
+        # no-op instead of letting it count toward the loop's fail counter.
+        if exc.response is not None and exc.response.status_code == 409:
+            print(f"Ciclo {cycle['cycle_id']} ya tenía una submission enviada; se omite.", flush=True)
+            check_collector_heartbeat()
+            return None
+        raise
     result = {
         "student": identity["display_name"],
         "submission_id": receipt["submission_id"],

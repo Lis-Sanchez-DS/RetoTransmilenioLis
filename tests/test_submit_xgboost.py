@@ -1,6 +1,8 @@
 from datetime import datetime, timedelta, timezone
 
-from app.submit_xgboost import LAGS, predict_cycle_targets
+import requests
+
+from app.submit_xgboost import LAGS, predict_cycle_targets, submit_current_cycle
 
 
 class EchoPlusOneModel:
@@ -85,3 +87,61 @@ def test_predict_cycle_targets_skips_station_with_missing_history():
     predictions = predict_cycle_targets(targets, history, models)
 
     assert [p["station_id"] for p in predictions] == [healthy_station]
+
+
+def test_submit_current_cycle_treats_409_as_already_submitted(monkeypatch):
+    """A forecast cycle can still be "current" on the loop's next 5-min tick
+    after we already submitted for it. The server rejects the repeat with
+    409 (not an idempotent replay), which must be treated as a benign no-op
+    - not raised as a real failure that trips the workflow's fail counter.
+    """
+    station = "A"
+    cutoff = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+    target_ts = cutoff + timedelta(minutes=15)
+    cycle = {
+        "cycle_id": "cycle-1",
+        "data_cutoff": cutoff.isoformat(),
+        "targets": [
+            {"station_id": station, "target_at": target_ts.isoformat()},
+        ],
+    }
+
+    class FakeConnection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def execute(self, query, params=None):
+            self._rows = [
+                (station, (target_ts - timedelta(minutes=15 * lag)).isoformat(), 500.0 + lag)
+                for lag in LAGS
+            ] if 'FROM "Original Data"' in query else []
+            return self
+
+        def fetchall(self):
+            return self._rows
+
+    class FakeModel:
+        def predict(self, features):
+            return [42.0]
+
+    class FakeResponse:
+        status_code = 409
+
+        def raise_for_status(self):
+            raise requests.HTTPError("409 Client Error: Conflict", response=self)
+
+    monkeypatch.setattr("app.submit_xgboost.collect_new_data", lambda: None)
+    monkeypatch.setattr("app.submit_xgboost.api_get", lambda path: cycle if "current" in path else {"display_name": "x"})
+    monkeypatch.setattr("app.submit_xgboost.connection", lambda: FakeConnection())
+    monkeypatch.setattr("app.submit_xgboost.joblib.load", lambda path: FakeModel())
+    monkeypatch.setattr("app.submit_xgboost.os.path.getmtime", lambda path: 0)
+    monkeypatch.setattr("app.submit_xgboost.check_collector_heartbeat", lambda: None)
+    monkeypatch.setattr("app.submit_xgboost.requests.post", lambda *a, **k: FakeResponse())
+    monkeypatch.setattr("app.submit_xgboost.API_KEY", "test-key", raising=False)
+
+    result = submit_current_cycle()
+
+    assert result is None
