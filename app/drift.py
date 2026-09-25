@@ -11,13 +11,15 @@ de ~15 minutos del stream, una ventana de 6 horas deja como máximo ~24
 puntos por estación, de ahí que MIN_DATAPOINTS esté fijado bien por debajo
 de ese techo.
 
-Cuando una estación dispara el drift, el reentrenamiento reemplaza el
-histórico 1:1: por cada punto nuevo incorporado desde "Temp", se descarta
-el punto más antiguo de "Original Data" - una ventana deslizante de tamaño
-fijo, sin evaluar si el cambio de distribución es "real" o no. (Antes se
-usaba una prueba de Kolmogorov-Smirnov para decidir si conservar todo el
-histórico o recortarlo; se quitó a propósito para simplificar el
-comportamiento a un reemplazo 1:1 siempre.)
+Cuando una estación dispara el drift, el reentrenamiento SIEMPRE conserva
+todo el histórico: los puntos nuevos de "Temp" se incorporan a
+"Original Data" y nunca se descarta nada. (Antes hubo dos variantes que sí
+recortaban historia - una prueba de Kolmogorov-Smirnov que decidía
+conservar todo o recortar, y luego un reemplazo 1:1 fijo sin esa prueba -
+ambas se quitaron el 2026-09-24 después de que una comparación directa
+mostrara que un modelo entrenado con todo el histórico predice mejor que
+uno entrenado solo con una ventana reciente, en 12/12 estaciones. No
+reintroducir un recorte de historia sin repetir esa comparación.)
 """
 
 import os
@@ -105,15 +107,13 @@ def _fetch_recent(station_id: str) -> list[tuple]:
         ).fetchall()
 
 
-def _training_frame(station_id: str, recent: list[tuple], drop_oldest: int) -> pd.DataFrame:
-    """Historical data (minus the oldest `drop_oldest` rows) plus the new Temp observations."""
+def _training_frame(station_id: str, recent: list[tuple]) -> pd.DataFrame:
+    """All historical data plus the new Temp observations - history only ever grows."""
     with connection() as conn:
         historical = conn.execute(
             'SELECT observed_at, demand FROM "Original Data" WHERE station_id = %s ORDER BY observed_at',
             (station_id,),
         ).fetchall()
-    if drop_oldest > 0:
-        historical = historical[drop_oldest:]
     frame = pd.DataFrame(historical + recent, columns=["observed_at", "demand"])
     return frame.drop_duplicates(subset="observed_at").sort_values("observed_at").reset_index(drop=True)
 
@@ -162,28 +162,12 @@ def _upload_model(station_id: str, path: str) -> None:
     response.raise_for_status()
 
 
-def _promote_temp_to_original(station_id: str, drop_oldest: int) -> int:
-    """Once the new model is live: slide the window, then fold Temp into history.
-
-    The new Temp rows are always merged in; `drop_oldest` (always equal to
-    the number of new rows, for the 1:1 sliding window) controls how many of
-    the oldest historical rows are discarded first.
+def _promote_temp_to_original(station_id: str) -> int:
+    """Once the new model is live: fold Temp into history. History only ever grows -
+    no rows are ever dropped from "Original Data" here.
     """
     with connection() as conn:
         with conn.transaction():
-            if drop_oldest > 0:
-                conn.execute(
-                    """WITH oldest AS (
-                           SELECT station_id, observed_at FROM "Original Data"
-                           WHERE station_id = %s
-                           ORDER BY observed_at ASC
-                           LIMIT %s
-                       )
-                       DELETE FROM "Original Data" o
-                       USING oldest
-                       WHERE o.station_id = oldest.station_id AND o.observed_at = oldest.observed_at""",
-                    (station_id, drop_oldest),
-                )
             # `prediction` is carried over too (not just demand): once these rows
             # move into "Original Data", station_accuracy_stats() needs to be able
             # to keep reading them there for the 6h accuracy window - see its
@@ -208,21 +192,17 @@ def check_and_retrain() -> list[str]:
         recent = _fetch_recent(station_id)
         if not recent:
             continue
-        # 1:1 sliding-window replacement: every new point incorporated from
-        # "Temp" bumps out the oldest point in "Original Data", no exceptions.
-        drop_oldest = len(recent)
 
-        frame = _training_frame(station_id, recent, drop_oldest)
+        frame = _training_frame(station_id, recent)
         if len(frame) <= max(LAGS):
             continue
         path = _train_station_model(station_id, frame)
         _upload_model(station_id, path)
-        merged = _promote_temp_to_original(station_id, drop_oldest)
+        merged = _promote_temp_to_original(station_id)
         retrained.append(station_id)
         print(
             f"Drift en {station_id}: reentrenado con {len(frame)} observaciones "
-            f"({merged} nuevas incorporadas al histórico, {drop_oldest} antiguas descartadas 1:1), "
-            "modelo republicado en Supabase.",
+            f"({merged} nuevas incorporadas al histórico), modelo republicado en Supabase.",
             flush=True,
         )
     return retrained

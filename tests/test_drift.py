@@ -118,10 +118,6 @@ class RoutedFakeConnection:
         elif 'INSERT INTO "Original Data"' in query:
             self._result = None
             self._last_rowcount = 0
-        elif 'DELETE FROM "Original Data"' in query:
-            # drop_oldest = params[1]; not asserted on directly here.
-            self._result = None
-            self._last_rowcount = params[1] if params else 0
         elif 'DELETE FROM "Temp"' in query:
             self._result = None
             self._last_rowcount = len(self.temp_recent_rows)
@@ -153,11 +149,10 @@ def _fake_upload(monkeypatch, uploads):
     monkeypatch.setattr("app.drift.requests.post", fake_post)
 
 
-def test_check_and_retrain_always_replaces_history_1_to_1(monkeypatch, tmp_path):
-    """No statistical test gates the decision anymore: every retrain drops
-    exactly as many of the oldest "Original Data" rows as new points it
-    incorporates from "Temp" - a fixed-size sliding window, regardless of
-    whether the new data "looks like" a distribution shift or not.
+def test_check_and_retrain_never_drops_history(monkeypatch, tmp_path):
+    """Retraining only ever grows "Original Data": the new "Temp" points are
+    folded in and nothing is ever deleted from history, regardless of how
+    much new data arrived or what it looks like.
     """
     station = "A"
     start = datetime(2026, 1, 1, tzinfo=timezone.utc)
@@ -166,8 +161,6 @@ def test_check_and_retrain_always_replaces_history_1_to_1(monkeypatch, tmp_path)
     historical_rows = [
         (start + timedelta(minutes=15 * i), 100 + (i % 20)) for i in range(700)
     ]
-    # 60 fresh points continuing the exact same pattern - previously this
-    # would have been judged "same distribution" and kept all history.
     temp_recent_rows = [
         (start + timedelta(minutes=15 * (700 + i)), 100 + (i % 20)) for i in range(60)
     ]
@@ -194,10 +187,8 @@ def test_check_and_retrain_always_replaces_history_1_to_1(monkeypatch, tmp_path)
     assert uploads[0]["headers"]["x-upsert"] == "true"
     assert uploads[0]["bytes"] == model_path.stat().st_size
     queries_with_params = [(q, p) for q, p in fake_conn.executed]
-    # 1:1 replacement: exactly len(temp_recent_rows) oldest rows dropped, always.
-    drop_queries = [(q, p) for q, p in queries_with_params if 'DELETE FROM "Original Data"' in q]
-    assert len(drop_queries) == 1
-    assert drop_queries[0][1] == (station, len(temp_recent_rows))
+    # History only grows: no DELETE FROM "Original Data" should ever run.
+    assert not any('DELETE FROM "Original Data"' in q for q, _ in queries_with_params)
     assert any('INSERT INTO "Original Data"' in q for q, _ in queries_with_params)
     assert any('DELETE FROM "Temp"' in q for q, _ in queries_with_params)
     # The promotion must carry `prediction` along with `demand` - once these
