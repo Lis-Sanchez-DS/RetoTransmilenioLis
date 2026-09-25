@@ -3,13 +3,13 @@
 El collector guarda en "Temp" cada observación nueva junto con la
 predicción que el modelo vigente le habría dado. La señal de drift es la
 accuracy (la misma métrica del proyecto, 1 - WAPE) de esa estación, medida
-solo sobre las últimas ACCURACY_WINDOW_HOURS horas de datos (no sobre todo
-lo acumulado en "Temp" desde el último reentrenamiento) - así el disparador
-reacciona a cómo está funcionando el modelo *ahora mismo* en vez de diluirse
-con un histórico largo que puede mezclar tramos buenos y malos. Con el tick
-de ~15 minutos del stream, una ventana de 6 horas deja como máximo ~24
-puntos por estación, de ahí que MIN_DATAPOINTS esté fijado bien por debajo
-de ese techo.
+solo sobre sus últimos RECENT_CHECKS puntos con predicción registrada (no
+sobre una ventana de tiempo fija ni sobre todo lo acumulado en "Temp" desde
+el último reentrenamiento) - así el disparador reacciona a cómo está
+funcionando el modelo *ahora mismo* en vez de diluirse con un histórico
+largo que puede mezclar tramos buenos y malos, y no se queda ciego si el
+stream se ralentiza o se detiene (una ventana de tiempo fija podría no
+llegar nunca a acumular puntos suficientes; un conteo fijo de chequeos sí).
 
 Cuando una estación dispara el drift, el reentrenamiento SIEMPRE conserva
 todo el histórico: los puntos nuevos de "Temp" se incorporan a
@@ -46,11 +46,13 @@ LAGS = (1, 2, 4, 96, 672)
 HORIZONS = (1, 2, 3, 4)
 
 ACCURACY_THRESHOLD = 0.85
-ACCURACY_WINDOW_HOURS = 6
-# At the stream's ~15-minute tick, 6h caps out around 24 points/station, so
-# this has to sit comfortably under that ceiling or the trigger could never
-# fire. 20 leaves room for a handful of missed/late ticks.
-MIN_DATAPOINTS = 20
+# Count-based window, not a time window: a station's drift signal is its
+# accuracy over its own last RECENT_CHECKS real prediction/actual pairs,
+# whichever tick they landed on. MIN_DATAPOINTS requires the window to be
+# full before trusting the signal - a station with only 1-2 checks so far
+# shouldn't be judged (or retrained) off a handful of points.
+RECENT_CHECKS = 4
+MIN_DATAPOINTS = RECENT_CHECKS
 
 # Chosen per station via walk-forward CV grid search restricted to the train
 # split (2026-09-25): every station's own CV picked a smaller/slower model
@@ -85,21 +87,23 @@ def _model_params(station_id: str) -> dict:
 
 
 def station_accuracy_stats() -> pd.DataFrame:
-    """Accuracy and count per station over the last ACCURACY_WINDOW_HOURS of data.
+    """Accuracy and count per station over each station's own last RECENT_CHECKS
+    predicted/actual pairs.
 
     Accuracy = max(0, 1 - WAPE), i.e. 1 - sum(|demand - prediction|) / sum(|demand|),
     the same formula as train_comparison_models.py's score() (there scaled by 100).
 
-    The window is anchored to the newest observed_at across both tables rather
-    than wall-clock now(): the competition runs on a virtual clock decoupled
-    from real time, so "now" has to mean "as of the freshest data we have."
+    A count-based window (not a time window) per station: a station that has
+    fallen behind or whose data is arriving irregularly still gets judged on
+    its own most recent real checks, rather than a fixed clock window that
+    could span very different amounts of real data station to station.
 
     A retrain empties "Temp" for the stations it just touched (their rows move
     into "Original Data" - see _promote_temp_to_original). Right after that, a
     just-retrained station's own "Temp" history can be shorter than the full
     window, even though the data itself still exists - it just moved. So this
-    reads both tables for the window and lets whichever one holds each point
-    fill it in; it's the same rows, just possibly in their new location.
+    reads both tables and lets whichever one holds each point fill it in;
+    it's the same rows, just possibly in their new location.
     """
     with connection() as conn:
         rows = conn.execute(
@@ -108,10 +112,14 @@ def station_accuracy_stats() -> pd.DataFrame:
                    UNION ALL
                    SELECT station_id, demand, prediction, observed_at FROM "Original Data"
                ),
-               cutoff AS (SELECT max(observed_at) - %s::interval AS ts FROM combined)
-               SELECT station_id, demand, prediction FROM combined, cutoff
-               WHERE prediction IS NOT NULL AND observed_at > cutoff.ts""",
-            (f"{ACCURACY_WINDOW_HOURS} hours",),
+               ranked AS (
+                   SELECT station_id, demand, prediction,
+                          row_number() OVER (PARTITION BY station_id ORDER BY observed_at DESC) AS rn
+                   FROM combined
+                   WHERE prediction IS NOT NULL
+               )
+               SELECT station_id, demand, prediction FROM ranked WHERE rn <= %s""",
+            (RECENT_CHECKS,),
         ).fetchall()
     columns = ["station_id", "accuracy", "count"]
     if not rows:
@@ -130,7 +138,7 @@ def stations_needing_retrain(stats: pd.DataFrame) -> list[str]:
     """Stations with enough recent data whose accuracy has dropped below the bar."""
     if stats.empty:
         return []
-    drifted = stats[(stats["count"] > MIN_DATAPOINTS) & (stats["accuracy"] < ACCURACY_THRESHOLD)]
+    drifted = stats[(stats["count"] >= MIN_DATAPOINTS) & (stats["accuracy"] < ACCURACY_THRESHOLD)]
     return sorted(drifted["station_id"].tolist())
 
 

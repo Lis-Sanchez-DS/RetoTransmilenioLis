@@ -74,12 +74,12 @@ def test_station_accuracy_stats_reads_both_tables(monkeypatch):
 def test_stations_needing_retrain_requires_enough_points_and_low_accuracy():
     stats = pd.DataFrame(
         [
-            # Bad accuracy with enough data: should retrain.
-            {"station_id": "drifted", "accuracy": 0.80, "count": 60},
-            # Bad accuracy but not enough datapoints yet.
-            {"station_id": "too_few", "accuracy": 0.80, "count": 10},
-            # Plenty of data, but accuracy is fine.
-            {"station_id": "healthy", "accuracy": 0.95, "count": 60},
+            # Bad accuracy with a full window of checks: should retrain.
+            {"station_id": "drifted", "accuracy": 0.80, "count": 4},
+            # Bad accuracy but the window isn't full yet.
+            {"station_id": "too_few", "accuracy": 0.80, "count": 2},
+            # Full window, but accuracy is fine.
+            {"station_id": "healthy", "accuracy": 0.95, "count": 4},
         ]
     )
 
@@ -113,7 +113,7 @@ class RoutedFakeConnection:
 
     def execute(self, query, params=None):
         self.executed.append((query, params))
-        if 'FROM combined, cutoff' in query:
+        if 'FROM ranked' in query:
             self._result = self.temp_accuracy_rows
         elif 'INSERT INTO "Original Data"' in query:
             self._result = None
