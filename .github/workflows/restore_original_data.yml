@@ -1,0 +1,25 @@
+name: Restaurar historico original
+
+on:
+  workflow_dispatch:
+
+jobs:
+  restore:
+    runs-on: ubuntu-latest
+    env:
+      DATABASE_URL: ${{ secrets.SUPABASE_DATABASE_URL }}
+      PULSO_API_URL: https://pulso-transmi.72-60-245-2.sslip.io
+    steps:
+      - name: Descargar código
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt
+
+      - name: Re-cargar historico original (ON CONFLICT DO NOTHING, seguro de repetir)
+        run: python -m app.load_original
