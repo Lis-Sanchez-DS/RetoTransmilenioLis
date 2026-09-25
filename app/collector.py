@@ -141,6 +141,7 @@ def collect_new_data(fetcher=None) -> dict:
     cursor = get_cursor()
     saved_cursor = cursor
     total = 0
+    inserted = 0
     pages = 0
     while True:
         payload = _fetch_page(fetcher, cursor)
@@ -157,12 +158,13 @@ def collect_new_data(fetcher=None) -> dict:
         with connection() as conn:
             with conn.transaction():
                 for item, prediction in predicted_records:
-                    conn.execute(
+                    result = conn.execute(
                         """INSERT INTO "Temp" (station_id, observed_at, demand, prediction)
                            VALUES (%s, %s, %s, %s)
                            ON CONFLICT (station_id, observed_at) DO NOTHING""",
                         (item["station_id"], item["observed_at"], item["demand"], prediction),
                     )
+                    inserted += result.rowcount
                 if resume_cursor != saved_cursor:
                     conn.execute(
                         """INSERT INTO collector_state (state_key, cursor_value, updated_at)
@@ -176,7 +178,7 @@ def collect_new_data(fetcher=None) -> dict:
         if next_cursor is None or next_cursor == cursor:
             break
         cursor = next_cursor
-    return {"collected": total, "pages": pages, "cursor": saved_cursor}
+    return {"collected": total, "inserted": inserted, "pages": pages, "cursor": saved_cursor}
 
 
 collect_last_15 = collect_new_data
@@ -189,12 +191,15 @@ def run() -> None:
     except UpstreamUnavailable as exc:
         print(f"AVISO: {exc}", flush=True)
         sys.exit(75)
-    print(f"Collected {result['collected']} observations in {result['pages']} pages; cursor={result['cursor']}", flush=True)
-    retrained = check_and_retrain()
-    if retrained:
-        print(f"Modelos reentrenados por drift: {', '.join(retrained)}", flush=True)
+    print(f"Collected {result['collected']} observations ({result['inserted']} new) in {result['pages']} pages; cursor={result['cursor']}", flush=True)
+    if result["inserted"] > 0:
+        retrained = check_and_retrain()
+        if retrained:
+            print(f"Modelos reentrenados por drift: {', '.join(retrained)}", flush=True)
+        else:
+            print("Sin drift detectado.", flush=True)
     else:
-        print("Sin drift detectado.", flush=True)
+        print("Sin observaciones nuevas; se omite la revisión de drift.", flush=True)
     # Heartbeat: submit_xgboost.py checks this to notice a collector that
     # went silent (disabled, cancelled, stuck failing) instead of quietly
     # submitting against an aging model forever.

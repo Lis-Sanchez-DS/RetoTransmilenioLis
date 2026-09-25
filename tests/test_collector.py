@@ -24,6 +24,8 @@ def test_collector_collects_all_pages_and_returns_cursor(monkeypatch):
             return None
 
     class FakeConnection:
+        rowcount = 1
+
         def __enter__(self):
             return self
 
@@ -64,7 +66,7 @@ def test_collector_collects_all_pages_and_returns_cursor(monkeypatch):
     # final) page hits next_cursor: null - the normal "caught up" case - so
     # the resume point falls back to a cursor built from its own last record.
     expected_final_cursor = _synthetic_cursor(records[-1])
-    assert result == {"collected": 16, "pages": 2, "cursor": expected_final_cursor}
+    assert result == {"collected": 16, "inserted": 16, "pages": 2, "cursor": expected_final_cursor}
     insert_queries = [q for q, _ in captured["queries"] if 'INSERT INTO "Temp"' in q]
     assert len(insert_queries) == 16
     cursor_saves = [params[0] for q, params in captured["queries"] if "INSERT INTO collector_state" in q]
@@ -96,7 +98,7 @@ def test_collector_stops_when_stream_is_drained(monkeypatch):
 
     result = collect_new_data(fetcher)
 
-    assert result == {"collected": 0, "pages": 1, "cursor": None}
+    assert result == {"collected": 0, "inserted": 0, "pages": 1, "cursor": None}
 
 
 def test_synthetic_cursor_matches_real_api_cursor():
