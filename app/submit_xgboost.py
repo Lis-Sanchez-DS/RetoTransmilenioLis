@@ -18,6 +18,7 @@ BASE_URL = os.getenv("PULSO_API_URL", "https://pulso-transmi.72-60-245-2.sslip.i
 API_KEY = os.getenv("PULSO_API_KEY") or os.getenv("API-KEY-PulsoTransmi")
 MODEL_DIR = os.getenv("MODEL_DIR", "models/xgboost")
 LAGS = (1, 2, 4, 96, 672)
+HORIZONS = (1, 2, 3, 4)
 
 
 def api_get(path: str) -> dict:
@@ -38,55 +39,57 @@ def _parse_utc(value) -> datetime:
     return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
 
 
-def predict_cycle_targets(targets: list[dict], history: dict, models: dict) -> list[dict]:
-    """Predict every target, recursing forward through each station's horizons.
+def predict_cycle_targets(targets: list[dict], history: dict, models: dict, data_cutoff) -> list[dict]:
+    """Predict every target directly - one model per horizon, no recursion.
 
-    Each station gets 4 targets (+15/+30/+45/+60 min from data_cutoff). The
-    model was trained so lag_k means "demand k*15 minutes before the exact
-    timestamp being predicted" - true only for the +15min target if lags are
-    read straight off data_cutoff, since the shorter lags for +30/+45/+60min
-    fall on timestamps that haven't been observed yet. So each station's
-    targets are predicted in chronological order, feeding each prediction
-    back into that station's local history as the stand-in value for the
-    not-yet-observed timestamp its own lags need next.
+    Each station gets 4 targets (+15/+30/+45/+60 min from data_cutoff), and
+    each horizon has its own model (see drift.py's _train_station_horizon_model).
+    Crucially, every horizon's lag_k feature is anchored to the same real,
+    already-observed point - data_cutoff - 15*(k-1) minutes - regardless of
+    which horizon is being predicted, so the lag features are identical
+    across all 4 targets for a station and never depend on another horizon's
+    own prediction the way the old recursive approach did.
 
     A station missing history for one of its lags (e.g. lag_672 needs a full
-    unbroken week of data) is skipped entirely rather than aborting the whole
-    cycle - one gap in one station's history shouldn't zero out every other
-    station's otherwise-valid submission.
+    unbroken week of data) is skipped entirely - every horizon needs the same
+    lag set, so one gap rules out all 4 targets for that station, not just
+    one. This shouldn't zero out every other station's otherwise-valid
+    submission.
     """
+    cutoff = _parse_utc(data_cutoff)
     by_station: dict[str, list[dict]] = {}
     for target in targets:
         by_station.setdefault(target["station_id"], []).append(target)
 
     predictions = []
     for station_id, station_targets in by_station.items():
-        local_history = dict(history)
-        model = models[station_id]
         try:
-            station_predictions = []
-            for target in sorted(station_targets, key=lambda t: t["target_at"]):
-                timestamp = _parse_utc(target["target_at"])
-                features = []
-                for lag in LAGS:
-                    key = (station_id, timestamp - timedelta(minutes=15 * lag))
-                    if key not in local_history:
-                        raise RuntimeError(f"No hay suficiente historia para {station_id} en lag {lag}")
-                    features.append(local_history[key])
-                features.extend(temporal_features(timestamp))
-                value = max(0.0, float(model.predict([features])[0]))
-                local_history[(station_id, timestamp)] = value
-                station_predictions.append(
-                    {
-                        "station_id": station_id,
-                        "target_at": target["target_at"],
-                        "value": round(value, 3),
-                    }
-                )
+            lag_features = []
+            for lag in LAGS:
+                key = (station_id, cutoff - timedelta(minutes=15 * (lag - 1)))
+                if key not in history:
+                    raise RuntimeError(f"No hay suficiente historia para {station_id} en lag {lag}")
+                lag_features.append(history[key])
         except RuntimeError as exc:
             print(f"AVISO: se omite estación {station_id} en este ciclo: {exc}", flush=True)
             continue
-        predictions.extend(station_predictions)
+
+        for target in station_targets:
+            timestamp = _parse_utc(target["target_at"])
+            horizon = round((timestamp - cutoff).total_seconds() / 900)
+            model = models.get((station_id, horizon))
+            if model is None:
+                print(f"AVISO: sin modelo para {station_id} horizonte {horizon}; se omite ese target.", flush=True)
+                continue
+            features = lag_features + temporal_features(timestamp)
+            value = max(0.0, float(model.predict([features])[0]))
+            predictions.append(
+                {
+                    "station_id": station_id,
+                    "target_at": target["target_at"],
+                    "value": round(value, 3),
+                }
+            )
     return predictions
 
 
@@ -126,10 +129,11 @@ def submit_current_cycle() -> dict | None:
 
     station_ids = sorted({target["station_id"] for target in cycle["targets"]})
     models = {
-        station_id: joblib.load(os.path.join(MODEL_DIR, f"xgboost_{station_id}.joblib"))
+        (station_id, horizon): joblib.load(os.path.join(MODEL_DIR, f"xgboost_{station_id}_h{horizon}.joblib"))
         for station_id in station_ids
+        for horizon in HORIZONS
     }
-    predictions = predict_cycle_targets(cycle["targets"], history, models)
+    predictions = predict_cycle_targets(cycle["targets"], history, models, cycle["data_cutoff"])
     if not predictions:
         raise RuntimeError("Ninguna estación tenía suficiente historia para este ciclo; no se envía submission.")
 
@@ -137,7 +141,7 @@ def submit_current_cycle() -> dict | None:
     model_info = {
         "version": "v1",
         "trained_at": datetime.fromtimestamp(
-            os.path.getmtime(os.path.join(MODEL_DIR, f"xgboost_{station_ids[0]}.joblib")),
+            os.path.getmtime(os.path.join(MODEL_DIR, f"xgboost_{station_ids[0]}_h1.joblib")),
             timezone.utc,
         ).isoformat(),
         "training_data_end": cycle["data_cutoff"],

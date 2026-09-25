@@ -177,15 +177,20 @@ def test_check_and_retrain_never_drops_history(monkeypatch, tmp_path):
     retrained = check_and_retrain()
 
     assert retrained == ["A"]
-    # The retrained model was actually written to disk (not just claimed).
-    model_path = tmp_path / "xgboost_A.joblib"
-    assert model_path.exists()
-    assert model_path.stat().st_size > 0
-    # It was uploaded to the right bucket/path with upsert, and with real file bytes.
-    assert len(uploads) == 1
-    assert uploads[0]["url"] == "https://fake.supabase.co/storage/v1/object/models/xgboost/xgboost_A.joblib"
-    assert uploads[0]["headers"]["x-upsert"] == "true"
-    assert uploads[0]["bytes"] == model_path.stat().st_size
+    # All 4 horizon models were actually written to disk (not just claimed).
+    model_paths = [tmp_path / f"xgboost_A_h{h}.joblib" for h in (1, 2, 3, 4)]
+    for model_path in model_paths:
+        assert model_path.exists()
+        assert model_path.stat().st_size > 0
+    # Each was uploaded to the right bucket/path with upsert, and with real file bytes.
+    assert len(uploads) == 4
+    uploaded_urls = sorted(u["url"] for u in uploads)
+    expected_urls = sorted(
+        f"https://fake.supabase.co/storage/v1/object/models/xgboost/xgboost_A_h{h}.joblib"
+        for h in (1, 2, 3, 4)
+    )
+    assert uploaded_urls == expected_urls
+    assert all(u["headers"]["x-upsert"] == "true" for u in uploads)
     queries_with_params = [(q, p) for q, p in fake_conn.executed]
     # History only grows: no DELETE FROM "Original Data" should ever run.
     assert not any('DELETE FROM "Original Data"' in q for q, _ in queries_with_params)

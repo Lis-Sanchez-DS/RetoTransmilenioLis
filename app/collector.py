@@ -55,8 +55,13 @@ def predict_records(records: list[dict]) -> list[tuple[dict, float]]:
         (station, observed_at): float(demand)
         for station, observed_at, demand in original_rows + temp_rows
     }
+    # The +15min (horizon 1) model: this is a real-time nowcast of the
+    # observation that just arrived, using only its own already-known lags -
+    # the same accuracy signal drift.py's station_accuracy_stats() reads to
+    # decide whether to retrain. The +30/+45/+60min models aren't involved
+    # here; they're only used for the actual forecast submissions.
     models = {
-        station_id: joblib.load(os.path.join(MODEL_DIR, f"xgboost_{station_id}.joblib"))
+        station_id: joblib.load(os.path.join(MODEL_DIR, f"xgboost_{station_id}_h1.joblib"))
         for station_id in station_ids
     }
     predictions = []

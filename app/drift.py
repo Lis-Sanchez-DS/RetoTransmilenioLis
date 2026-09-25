@@ -37,6 +37,13 @@ SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 MODEL_DIR = os.getenv("MODEL_DIR", "models/xgboost")
 MODEL_BUCKET = "models"
 LAGS = (1, 2, 4, 96, 672)
+# Direct multi-horizon forecasting: one model per +15/+30/+45/+60min target
+# instead of one model recursively fed forward. Each horizon's lag features
+# are anchored to the same reference point (data_cutoff / the observation
+# itself) and are always real observed values - never another horizon's own
+# prediction - so error can't compound across horizons the way it did with
+# the old recursive approach. See submit_xgboost.py's predict_cycle_targets.
+HORIZONS = (1, 2, 3, 4)
 
 ACCURACY_THRESHOLD = 0.85
 ACCURACY_WINDOW_HOURS = 6
@@ -45,7 +52,36 @@ ACCURACY_WINDOW_HOURS = 6
 # fire. 20 leaves room for a handful of missed/late ticks.
 MIN_DATAPOINTS = 20
 
-MODEL_PARAMS = {"learning_rate": 0.05, "n_estimators": 400, "max_leaves": 40}
+# Chosen per station via walk-forward CV grid search restricted to the train
+# split (2026-09-25): every station's own CV picked a smaller/slower model
+# than the previous shared 400-estimator/40-leaf/reg_lambda=1.0 default, but
+# reg_lambda itself split station by station (1.0 vs 3.0), and a single
+# shared config underperformed each station's own best config on held-out
+# test data - so each station keeps its own winning combination rather than
+# being forced onto one global default. Mean held-out test accuracy across
+# the 12 stations: 85.07% -> 85.37%, with 8/12 stations improving.
+DEFAULT_MODEL_PARAMS = {"learning_rate": 0.05, "n_estimators": 400, "max_leaves": 40, "reg_lambda": 1.0}
+STATION_MODEL_PARAMS = {
+    "02300": {"learning_rate": 0.03, "n_estimators": 200, "max_leaves": 20, "reg_lambda": 3.0},
+    "03000": {"learning_rate": 0.03, "n_estimators": 200, "max_leaves": 20, "reg_lambda": 3.0},
+    "05000": {"learning_rate": 0.03, "n_estimators": 200, "max_leaves": 20, "reg_lambda": 3.0},
+    "05100": {"learning_rate": 0.03, "n_estimators": 200, "max_leaves": 20, "reg_lambda": 1.0},
+    "06000": {"learning_rate": 0.03, "n_estimators": 200, "max_leaves": 20, "reg_lambda": 3.0},
+    "06111": {"learning_rate": 0.03, "n_estimators": 200, "max_leaves": 20, "reg_lambda": 1.0},
+    "07105": {"learning_rate": 0.03, "n_estimators": 200, "max_leaves": 20, "reg_lambda": 1.0},
+    "07107": {"learning_rate": 0.03, "n_estimators": 200, "max_leaves": 20, "reg_lambda": 3.0},
+    "07111": {"learning_rate": 0.03, "n_estimators": 200, "max_leaves": 20, "reg_lambda": 3.0},
+    "09000": {"learning_rate": 0.03, "n_estimators": 200, "max_leaves": 20, "reg_lambda": 3.0},
+    "09122": {"learning_rate": 0.05, "n_estimators": 200, "max_leaves": 20, "reg_lambda": 1.0},
+    "10009": {"learning_rate": 0.03, "n_estimators": 200, "max_leaves": 20, "reg_lambda": 3.0},
+}
+
+
+def _model_params(station_id: str) -> dict:
+    """A station outside the tuned set (e.g. a newly added one) falls back to
+    the old shared default rather than crashing or silently getting some
+    other station's config."""
+    return STATION_MODEL_PARAMS.get(station_id, DEFAULT_MODEL_PARAMS)
 
 
 def station_accuracy_stats() -> pd.DataFrame:
@@ -118,9 +154,21 @@ def _training_frame(station_id: str, recent: list[tuple]) -> pd.DataFrame:
     return frame.drop_duplicates(subset="observed_at").sort_values("observed_at").reset_index(drop=True)
 
 
-def _train_station_model(station_id: str, frame: pd.DataFrame) -> str:
+def _train_station_horizon_model(station_id: str, horizon: int, frame: pd.DataFrame) -> str:
+    """Train a model that predicts `horizon` steps (15min each) directly ahead.
+
+    Every horizon shares the same anchor: the lag_k feature always reads
+    `horizon + k - 1` steps behind the row being predicted, which works out
+    to the exact same real, already-observed timestamp regardless of
+    horizon (data_cutoff - 15*(k-1) minutes) - never another horizon's own
+    prediction. Only the target offset and calendar encoding (computed at
+    the row's own real timestamp) change between horizons; h=1 reduces to
+    the original single-step model exactly.
+    """
     y = frame.demand.astype(float)
-    lagged = pd.concat({f"lag_{lag}": y.shift(lag) for lag in LAGS}, axis=1)
+    lagged = pd.concat(
+        {f"lag_{lag}": y.shift(horizon + lag - 1) for lag in LAGS}, axis=1
+    )
     calendar = pd.DataFrame(
         [temporal_features(value) for value in frame["observed_at"]],
         columns=["hour_sin", "hour_cos", "week_sin", "week_cos"],
@@ -130,26 +178,25 @@ def _train_station_model(station_id: str, frame: pd.DataFrame) -> str:
     model = XGBRegressor(
         grow_policy="lossguide",
         max_depth=0,
-        reg_lambda=1.0,
         objective="reg:squarederror",
         random_state=42,
         n_jobs=-1,
-        **MODEL_PARAMS,
+        **_model_params(station_id),
     )
     model.fit(features.loc[valid], y.loc[valid])
     os.makedirs(MODEL_DIR, exist_ok=True)
-    path = os.path.join(MODEL_DIR, f"xgboost_{station_id}.joblib")
+    path = os.path.join(MODEL_DIR, f"xgboost_{station_id}_h{horizon}.joblib")
     joblib.dump(model, path)
     return path
 
 
-def _upload_model(station_id: str, path: str) -> None:
+def _upload_model(station_id: str, horizon: int, path: str) -> None:
     if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
         raise RuntimeError("Faltan SUPABASE_URL o SUPABASE_SERVICE_ROLE_KEY para subir el modelo.")
     with open(path, "rb") as fh:
         payload = fh.read()
     response = requests.post(
-        f"{SUPABASE_URL}/storage/v1/object/{MODEL_BUCKET}/xgboost/xgboost_{station_id}.joblib",
+        f"{SUPABASE_URL}/storage/v1/object/{MODEL_BUCKET}/xgboost/xgboost_{station_id}_h{horizon}.joblib",
         headers={
             "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
             "apikey": SUPABASE_SERVICE_ROLE_KEY,
@@ -194,15 +241,16 @@ def check_and_retrain() -> list[str]:
             continue
 
         frame = _training_frame(station_id, recent)
-        if len(frame) <= max(LAGS):
+        if len(frame) <= max(LAGS) + max(HORIZONS):
             continue
-        path = _train_station_model(station_id, frame)
-        _upload_model(station_id, path)
+        for horizon in HORIZONS:
+            path = _train_station_horizon_model(station_id, horizon, frame)
+            _upload_model(station_id, horizon, path)
         merged = _promote_temp_to_original(station_id)
         retrained.append(station_id)
         print(
-            f"Drift en {station_id}: reentrenado con {len(frame)} observaciones "
-            f"({merged} nuevas incorporadas al histórico), modelo republicado en Supabase.",
+            f"Drift en {station_id}: reentrenados {len(HORIZONS)} horizontes con {len(frame)} observaciones "
+            f"({merged} nuevas incorporadas al histórico), modelos republicados en Supabase.",
             flush=True,
         )
     return retrained

@@ -5,28 +5,33 @@ import requests
 from app.submit_xgboost import LAGS, predict_cycle_targets, submit_current_cycle
 
 
-class EchoPlusOneModel:
-    """predict() returns lag_1 (the first feature) plus 1, to trace recursion."""
+class EchoPlusHorizonModel:
+    """predict() returns lag_1 (the first feature) plus this model's own horizon,
+    so each horizon's model is distinguishable in assertions.
+    """
+
+    def __init__(self, horizon):
+        self.horizon = horizon
 
     def predict(self, features):
-        return [features[0][0] + 1]
+        return [features[0][0] + self.horizon]
 
 
-def test_predict_cycle_targets_recurses_lags_forward_per_horizon():
-    """Each of a station's 4 horizons must use lags relative to its OWN
-    target time, not all relative to data_cutoff. This is the bug fix: the
-    +30/+45/+60min horizons need lag_1/2/4 values that aren't observed yet,
-    so each prediction must feed back in as the stand-in for the next
-    horizon's missing lag. With EchoPlusOneModel, correct recursion produces
-    strictly increasing predictions (101, 102, 103, 104); the old bug (lag_1
-    always read from data_cutoff regardless of horizon) would produce the
-    same value (101) four times.
+def _models_for(station, horizons=(1, 2, 3, 4)):
+    return {(station, h): EchoPlusHorizonModel(h) for h in horizons}
+
+
+def test_predict_cycle_targets_uses_same_real_lags_for_every_horizon():
+    """All 4 horizons must read the SAME real, already-observed lags (anchored
+    to data_cutoff), never another horizon's own prediction. Each target uses
+    its own horizon's model, so with EchoPlusHorizonModel (lag_1 + horizon)
+    and lag_1 == 100 at cutoff, the predictions are 101, 102, 103, 104 - not
+    because of recursion, but because each is a different model called once
+    on the same real inputs.
     """
     station = "A"
     cutoff = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
 
-    # Populate history generously so every lag/horizon combination resolves;
-    # only the value exactly at cutoff matters for this test's assertion.
     history = {(station, cutoff - timedelta(minutes=m)): 0.0 for m in range(0, 20000, 15)}
     history[(station, cutoff)] = 100.0
 
@@ -34,15 +39,15 @@ def test_predict_cycle_targets_recurses_lags_forward_per_horizon():
         {"station_id": station, "target_at": (cutoff + timedelta(minutes=m)).isoformat()}
         for m in (15, 30, 45, 60)
     ]
-    models = {station: EchoPlusOneModel()}
+    models = _models_for(station)
 
-    predictions = predict_cycle_targets(targets, history, models)
+    predictions = predict_cycle_targets(targets, history, models, cutoff)
 
     assert [p["value"] for p in predictions] == [101.0, 102.0, 103.0, 104.0]
 
 
 def test_predict_cycle_targets_keeps_stations_independent():
-    """Station A's predictions must not leak into station B's local history."""
+    """Station A's predictions must not leak into station B's history reads."""
     cutoff = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
     history = {}
     for station, base in (("A", 100.0), ("B", 500.0)):
@@ -54,9 +59,9 @@ def test_predict_cycle_targets_keeps_stations_independent():
         for station in ("A", "B")
         for m in (15, 30, 45, 60)
     ]
-    models = {"A": EchoPlusOneModel(), "B": EchoPlusOneModel()}
+    models = {**_models_for("A"), **_models_for("B")}
 
-    predictions = predict_cycle_targets(targets, history, models)
+    predictions = predict_cycle_targets(targets, history, models, cutoff)
 
     a_values = [p["value"] for p in predictions if p["station_id"] == "A"]
     b_values = [p["value"] for p in predictions if p["station_id"] == "B"]
@@ -79,12 +84,12 @@ def test_predict_cycle_targets_skips_station_with_missing_history():
         {"station_id": healthy_station, "target_at": target_ts.isoformat()},
     ]
     history = {
-        (healthy_station, target_ts - timedelta(minutes=15 * lag)): 500.0 + lag
+        (healthy_station, cutoff - timedelta(minutes=15 * (lag - 1))): 500.0 + lag
         for lag in LAGS
     }
-    models = {incomplete_station: EchoPlusOneModel(), healthy_station: EchoPlusOneModel()}
+    models = {**_models_for(incomplete_station, (1,)), **_models_for(healthy_station, (1,))}
 
-    predictions = predict_cycle_targets(targets, history, models)
+    predictions = predict_cycle_targets(targets, history, models, cutoff)
 
     assert [p["station_id"] for p in predictions] == [healthy_station]
 
