@@ -9,6 +9,7 @@ import requests
 
 from app.collector import collect_new_data
 from app.db import connection
+from app.drift import station_ewma_bias
 from app.features import temporal_features
 from app.health import check_collector_heartbeat
 from app.net import with_retries, UpstreamUnavailable
@@ -136,6 +137,17 @@ def submit_current_cycle() -> dict | None:
     predictions = predict_cycle_targets(cycle["targets"], history, models, cycle["data_cutoff"])
     if not predictions:
         raise RuntimeError("Ninguna estación tenía suficiente historia para este ciclo; no se envía submission.")
+
+    # Bias correction on top of the raw model output - see station_ewma_bias's
+    # docstring. One DB read per station per submission (not per target), and
+    # never touches what collector.py stores as "prediction" for drift
+    # monitoring, which stays the model's own raw, uncorrected output.
+    bias_by_station = {}
+    for prediction in predictions:
+        station_id = prediction["station_id"]
+        if station_id not in bias_by_station:
+            bias_by_station[station_id] = station_ewma_bias(station_id)
+        prediction["value"] = round(max(0.0, prediction["value"] + bias_by_station[station_id]), 3)
 
     run_id = f"run-{cycle['cycle_id']}"
     model_info = {

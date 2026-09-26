@@ -146,7 +146,78 @@ def test_submit_current_cycle_treats_409_as_already_submitted(monkeypatch):
     monkeypatch.setattr("app.submit_xgboost.check_collector_heartbeat", lambda: None)
     monkeypatch.setattr("app.submit_xgboost.requests.post", lambda *a, **k: FakeResponse())
     monkeypatch.setattr("app.submit_xgboost.API_KEY", "test-key", raising=False)
+    monkeypatch.setattr("app.submit_xgboost.station_ewma_bias", lambda station_id: 0.0)
 
     result = submit_current_cycle()
 
     assert result is None
+
+
+def test_submit_current_cycle_applies_ewma_bias_correction(monkeypatch):
+    """The EWMA correction (station_ewma_bias) must land on the actual
+    submitted values, on top of the raw model output - not just be computed
+    and discarded."""
+    station = "A"
+    cutoff = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+    target_ts = cutoff + timedelta(minutes=15)
+    cycle = {
+        "cycle_id": "cycle-1",
+        "data_cutoff": cutoff.isoformat(),
+        "targets": [
+            {"station_id": station, "target_at": target_ts.isoformat()},
+        ],
+    }
+
+    class FakeConnection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def execute(self, query, params=None):
+            self._rows = [
+                (station, (target_ts - timedelta(minutes=15 * lag)).isoformat(), 500.0 + lag)
+                for lag in LAGS
+            ] if 'FROM "Original Data"' in query else []
+            return self
+
+        def fetchall(self):
+            return self._rows
+
+    class FakeModel:
+        def predict(self, features):
+            return [42.0]
+
+    captured_payload = {}
+
+    class FakeResponse:
+        status_code = 200
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"submission_id": "sub-1", "status": "accepted", "predictions_received": 1, "expected_predictions": 1}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        if "/submissions" in url:
+            captured_payload.update(json)
+        return FakeResponse()
+
+    monkeypatch.setattr("app.submit_xgboost.collect_new_data", lambda: None)
+    monkeypatch.setattr(
+        "app.submit_xgboost.api_get",
+        lambda path: cycle if "current" in path else {"display_name": "x"},
+    )
+    monkeypatch.setattr("app.submit_xgboost.connection", lambda: FakeConnection())
+    monkeypatch.setattr("app.submit_xgboost.joblib.load", lambda path: FakeModel())
+    monkeypatch.setattr("app.submit_xgboost.os.path.getmtime", lambda path: 0)
+    monkeypatch.setattr("app.submit_xgboost.check_collector_heartbeat", lambda: None)
+    monkeypatch.setattr("app.submit_xgboost.requests.post", fake_post)
+    monkeypatch.setattr("app.submit_xgboost.API_KEY", "test-key", raising=False)
+    monkeypatch.setattr("app.submit_xgboost.station_ewma_bias", lambda station_id: -10.0)
+
+    submit_current_cycle()
+
+    assert captured_payload["predictions"][0]["value"] == 32.0

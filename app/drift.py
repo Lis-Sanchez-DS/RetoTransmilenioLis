@@ -86,6 +86,70 @@ def _model_params(station_id: str) -> dict:
     return STATION_MODEL_PARAMS.get(station_id, DEFAULT_MODEL_PARAMS)
 
 
+# Inference-time bias correction, applied on top of a station's raw model
+# output at submission time - not a training change, and never touches what
+# gets stored as "prediction" in Temp/Original Data (that stays the raw
+# model's own output, so drift.py's accuracy signal and this correction's
+# own residual history never feed back into each other).
+#
+# Chosen via a per-station grid search over alpha (EWMA decay) x damping
+# (how much of the tracked bias to actually apply), picking whichever
+# config maximizes OVERALL held-out-style accuracy on that station's full
+# history (not just its most recent/noisiest stretch) - a config biased
+# toward only recent data reacts fast but chases noise on an ordinary day;
+# one biased toward all of history barely reacts at all. A candidate must
+# beat DEFAULT_EWMA_PARAMS by at least MIN_EWMA_IMPROVEMENT_PP before a
+# station gets its own override, for the same reason DEFAULT_MODEL_PARAMS
+# has one: on this search (2026-09-26, all 12 stations, including 05100's
+# real multi-hour demand collapse), every station's best candidate beat the
+# default by less than that margin - even 05100, whose collapse looked like
+# it needed a much more aggressive config when evaluated in isolation on
+# just that ~24-row window, but the gain nearly vanishes once judged against
+# the whole dataset instead. So every station uses the shared default for
+# now; STATION_EWMA_PARAMS exists so a future station-specific override is a
+# one-line addition once a real margin actually turns up.
+DEFAULT_EWMA_PARAMS = {"alpha": 0.2, "damping": 0.5}
+MIN_EWMA_IMPROVEMENT_PP = 0.5
+STATION_EWMA_PARAMS: dict[str, dict] = {}
+
+
+def _ewma_params(station_id: str) -> dict:
+    return STATION_EWMA_PARAMS.get(station_id, DEFAULT_EWMA_PARAMS)
+
+
+def station_ewma_bias(station_id: str) -> float:
+    """The correction to ADD to a station's raw model prediction right now.
+
+    Tracks a causal (no-lookahead) exponentially-weighted average of that
+    station's own (actual - predicted) residuals, using every real-time
+    prediction/actual pair on record across "Original Data" and "Temp" in
+    chronological order - the same source drift.py's own accuracy signal
+    reads. Reacts within one collector cycle to a real, sustained miss
+    (like 05100's collapse) instead of waiting for a full drift-triggered
+    retrain, which can take hours or - while the upstream feed is stalled -
+    may not be able to fire at all.
+    """
+    with connection() as conn:
+        rows = conn.execute(
+            """SELECT observed_at, demand, prediction FROM "Original Data"
+               WHERE station_id = %s AND prediction IS NOT NULL
+               UNION ALL
+               SELECT observed_at, demand, prediction FROM "Temp"
+               WHERE station_id = %s AND prediction IS NOT NULL
+               ORDER BY observed_at""",
+            (station_id, station_id),
+        ).fetchall()
+    if not rows:
+        return 0.0
+    params = _ewma_params(station_id)
+    alpha = params["alpha"]
+    bias = 0.0
+    for _, demand, prediction in rows:
+        residual = float(demand) - float(prediction)
+        bias = alpha * residual + (1 - alpha) * bias
+    return params["damping"] * bias
+
+
 def has_pending_data() -> bool:
     """Whether "Temp" currently holds any unpromoted observations at all.
 

@@ -5,6 +5,7 @@ import pandas as pd
 from app.drift import (
     check_and_retrain,
     station_accuracy_stats,
+    station_ewma_bias,
     stations_needing_retrain,
 )
 
@@ -201,3 +202,33 @@ def test_check_and_retrain_never_drops_history(monkeypatch, tmp_path):
     # prediction column there to keep scoring them within the 6h window.
     promote_query = next(q for q, _ in queries_with_params if 'INSERT INTO "Original Data"' in q)
     assert "prediction" in promote_query
+
+
+def test_station_ewma_bias_tracks_a_sustained_miss(monkeypatch):
+    """A station whose model has been consistently overpredicting should get
+    a negative correction, growing as the miss persists across more points -
+    mirroring 05100's real multi-hour demand collapse (predictions pinned
+    high while actual demand kept falling)."""
+    rows = [
+        ("2026-01-01T00:00:00Z", 100.0, 200.0),
+        ("2026-01-01T00:15:00Z", 100.0, 200.0),
+        ("2026-01-01T00:30:00Z", 100.0, 200.0),
+    ]
+    monkeypatch.setattr("app.drift.connection", lambda: FakeConnection(rows))
+
+    bias = station_ewma_bias("A")
+
+    # Every residual is -100 (actual - predicted); the EWMA should converge
+    # toward -100 * damping, and always stay on the "correct downward" side.
+    assert bias < 0
+    params = {"alpha": 0.2, "damping": 0.5}
+    expected_raw_bias = 0.0
+    for _, demand, prediction in rows:
+        expected_raw_bias = params["alpha"] * (demand - prediction) + (1 - params["alpha"]) * expected_raw_bias
+    assert bias == params["damping"] * expected_raw_bias
+
+
+def test_station_ewma_bias_zero_with_no_history(monkeypatch):
+    monkeypatch.setattr("app.drift.connection", lambda: FakeConnection([]))
+
+    assert station_ewma_bias("A") == 0.0
