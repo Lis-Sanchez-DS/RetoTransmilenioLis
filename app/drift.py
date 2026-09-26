@@ -86,6 +86,25 @@ def _model_params(station_id: str) -> dict:
     return STATION_MODEL_PARAMS.get(station_id, DEFAULT_MODEL_PARAMS)
 
 
+def has_pending_data() -> bool:
+    """Whether "Temp" currently holds any unpromoted observations at all.
+
+    Used as the gate before running drift checks, in place of "did this
+    exact collector run insert a new row". A stalled upstream feed can leave
+    a drifted station's data sitting in "Temp" indefinitely without any run
+    ever inserting a fresh row again - gating on "did this run insert
+    something new" then blocks drift/retrain forever even though the
+    station's already-known-bad data is sitting right there, unprocessed.
+    Gating on "is there anything in Temp at all" still skips redundant
+    checks once Temp is genuinely empty (e.g. every station was just
+    retrained and promoted), but keeps checking as long as there's
+    unprocessed data to evaluate, regardless of whether new rows arrived
+    this exact cycle.
+    """
+    with connection() as conn:
+        return conn.execute('SELECT 1 FROM "Temp" LIMIT 1').fetchone() is not None
+
+
 def station_accuracy_stats() -> pd.DataFrame:
     """Accuracy and count per station over each station's own last RECENT_CHECKS
     predicted/actual pairs.

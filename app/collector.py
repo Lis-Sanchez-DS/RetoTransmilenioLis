@@ -11,7 +11,7 @@ import joblib
 import numpy as np
 
 from app.db import connection
-from app.drift import check_and_retrain
+from app.drift import check_and_retrain, has_pending_data
 from app.features import temporal_features
 from app.health import record_job_run
 from app.net import with_retries, UpstreamUnavailable
@@ -197,14 +197,19 @@ def run() -> None:
         print(f"AVISO: {exc}", flush=True)
         sys.exit(75)
     print(f"Collected {result['collected']} observations ({result['inserted']} new) in {result['pages']} pages; cursor={result['cursor']}", flush=True)
-    if result["inserted"] > 0:
+    # Gate on whether "Temp" holds anything unprocessed at all, not on
+    # whether this exact run inserted something new - see has_pending_data's
+    # docstring for why: a stalled feed can leave a drifted station's data
+    # sitting in Temp forever without a single new row ever arriving again,
+    # and gating on "new this run" would then block retrain indefinitely.
+    if has_pending_data():
         retrained = check_and_retrain()
         if retrained:
             print(f"Modelos reentrenados por drift: {', '.join(retrained)}", flush=True)
         else:
             print("Sin drift detectado.", flush=True)
     else:
-        print("Sin observaciones nuevas; se omite la revisión de drift.", flush=True)
+        print("Temp está vacío; se omite la revisión de drift.", flush=True)
     # Heartbeat: submit_xgboost.py checks this to notice a collector that
     # went silent (disabled, cancelled, stuck failing) instead of quietly
     # submitting against an aging model forever.

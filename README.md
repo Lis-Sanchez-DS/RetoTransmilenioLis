@@ -289,11 +289,17 @@ cíclicas de calendario (seno/coseno diario y semanal, `app/features.py`).
   se ralentiza o se detiene, y reacciona a cómo está funcionando el modelo
   ahora mismo en vez de diluirse con historia larga) cae por debajo de
   `ACCURACY_THRESHOLD=0.85`.
-- **Gate previo**: el chequeo de drift solo corre si el collector insertó
-  observaciones genuinamente nuevas en esa vuelta (no simplemente si la API
-  devolvió registros, que pueden ser puramente duplicados durante un
-  estancamiento del feed upstream). Esto evita reentrenar 48 modelos cada 30
-  minutos sin necesidad cuando no hay datos nuevos.
+- **Gate previo**: el chequeo de drift solo corre si `"Temp"` tiene alguna
+  fila pendiente (`has_pending_data()`), no si el collector insertó algo
+  *en esa vuelta específica*. Con el gate anterior ("solo si esta vuelta
+  insertó algo nuevo"), un feed estancado dejaba los datos de una estación
+  ya drifteada esperando en `"Temp"` para siempre sin que ninguna vuelta
+  futura volviera a insertar nada - bloqueando el reentrenamiento
+  indefinidamente aunque los datos que lo dispararían ya estuvieran ahí.
+  Revisar "¿hay algo en Temp?" en vez de "¿llegó algo nuevo ahora?" sigue
+  evitando revisiones redundantes cuando Temp está genuinamente vacía (justo
+  después de que todas las estaciones se reentrenaron y promovieron), pero
+  ya no se queda ciego ante datos pendientes sin procesar.
 - **Reentrenamiento**: siempre conserva todo el histórico - los puntos
   nuevos de `"Temp"` se incorporan a `"Original Data"` y nunca se descarta
   nada (una comparación directa mostró que un modelo con todo el histórico
