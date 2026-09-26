@@ -101,7 +101,23 @@ def submit_current_cycle() -> dict | None:
     # (collect, then check the cycle). Without this, a station's history can
     # lag the cycle's data_cutoff by up to a collector cycle whenever
     # collection and submission run as separate, independently-scheduled jobs.
-    collect_new_data()
+    #
+    # This call shares the same "collector_state" cursor with collector.py's
+    # own collect_new_data() call, and this one runs 6x more often (every
+    # ~5min here vs ~30min there) - so it routinely wins the race and drains
+    # each new batch before collector.yml's own check ever sees it, making
+    # collector.yml legitimately log "0 new" even while data keeps flowing.
+    # Logging the count here (never logged before) makes that race visible
+    # instead of something that has to be inferred from timing after the
+    # fact - see has_pending_data's docstring for why collector.py's drift
+    # check no longer depends on seeing "new" data in its own call.
+    collect_result = collect_new_data()
+    print(
+        f"Collected {collect_result['collected']} observations "
+        f"({collect_result['inserted']} new) in {collect_result['pages']} pages; "
+        f"cursor={collect_result['cursor']}",
+        flush=True,
+    )
     identity = api_get("/v1/me")
     try:
         cycle = api_get("/v1/forecast-cycles/current")

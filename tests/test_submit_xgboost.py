@@ -138,7 +138,7 @@ def test_submit_current_cycle_treats_409_as_already_submitted(monkeypatch):
         def raise_for_status(self):
             raise requests.HTTPError("409 Client Error: Conflict", response=self)
 
-    monkeypatch.setattr("app.submit_xgboost.collect_new_data", lambda: None)
+    monkeypatch.setattr("app.submit_xgboost.collect_new_data", lambda: {"collected": 0, "inserted": 0, "pages": 1, "cursor": None})
     monkeypatch.setattr("app.submit_xgboost.api_get", lambda path: cycle if "current" in path else {"display_name": "x"})
     monkeypatch.setattr("app.submit_xgboost.connection", lambda: FakeConnection())
     monkeypatch.setattr("app.submit_xgboost.joblib.load", lambda path: FakeModel())
@@ -205,7 +205,7 @@ def test_submit_current_cycle_applies_ewma_bias_correction(monkeypatch):
             captured_payload.update(json)
         return FakeResponse()
 
-    monkeypatch.setattr("app.submit_xgboost.collect_new_data", lambda: None)
+    monkeypatch.setattr("app.submit_xgboost.collect_new_data", lambda: {"collected": 0, "inserted": 0, "pages": 1, "cursor": None})
     monkeypatch.setattr(
         "app.submit_xgboost.api_get",
         lambda path: cycle if "current" in path else {"display_name": "x"},
