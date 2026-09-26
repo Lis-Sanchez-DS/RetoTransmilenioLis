@@ -63,11 +63,19 @@ MIN_DATAPOINTS = RECENT_CHECKS
 # being forced onto one global default. Mean held-out test accuracy across
 # the 12 stations: 85.07% -> 85.37%, with 8/12 stations improving.
 DEFAULT_MODEL_PARAMS = {"learning_rate": 0.05, "n_estimators": 400, "max_leaves": 40, "reg_lambda": 1.0}
+# 05100 intentionally has no entry here (falls back to DEFAULT_MODEL_PARAMS):
+# on a held-out chronological test its own tuned config predicted ~2x the
+# actual demand right at the tail end of available history (2026-09-14,
+# right where the upstream feed died); the shared default scored closer.
+# Caveat before re-tuning this station: that tail data (the last ~hour of
+# readings before the feed died) may itself be a corrupted/glitched final
+# read rather than real demand - every other station's last readings look
+# normal, only 05100's collapse right at the cutoff. Verify against clean
+# data once the feed resumes before trusting either config's score here.
 STATION_MODEL_PARAMS = {
     "02300": {"learning_rate": 0.03, "n_estimators": 200, "max_leaves": 20, "reg_lambda": 3.0},
     "03000": {"learning_rate": 0.03, "n_estimators": 200, "max_leaves": 20, "reg_lambda": 3.0},
     "05000": {"learning_rate": 0.03, "n_estimators": 200, "max_leaves": 20, "reg_lambda": 3.0},
-    "05100": {"learning_rate": 0.03, "n_estimators": 200, "max_leaves": 20, "reg_lambda": 1.0},
     "06000": {"learning_rate": 0.03, "n_estimators": 200, "max_leaves": 20, "reg_lambda": 3.0},
     "06111": {"learning_rate": 0.03, "n_estimators": 200, "max_leaves": 20, "reg_lambda": 1.0},
     "07105": {"learning_rate": 0.03, "n_estimators": 200, "max_leaves": 20, "reg_lambda": 1.0},
