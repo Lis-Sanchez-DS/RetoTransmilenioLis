@@ -279,7 +279,86 @@ reg_lambda=1.0`).
 Features de cada modelo: 5 rezagos de demanda (`lag_1`, `lag_2`, `lag_4`,
 `lag_96`, `lag_672` - 15 min, 30 min, 1h, 1 día y 1 semana antes, ajustados
 por el horizonte según la fórmula de anclaje de arriba) + 4 variables
-cíclicas de calendario (seno/coseno diario y semanal, `app/features.py`).
+cíclicas de calendario (seno/coseno diario y semanal, `app/features.py`) -
+**salvo un pequeño grupo de pares estación/horizonte que ya no usan
+`lag_672` de esta forma, ver más abajo**.
+
+### 7. Peso de `lag_672` por estación y horizonte
+
+`lag_672` (una semana atrás) ancla cada modelo a "qué pasó a esta misma hora
+la semana pasada" - un buen default, pero activamente contraproducente
+mientras el patrón de demanda de una estación está genuinamente cambiando
+(los colapsos de varias horas de 05100 son el caso más claro). Se evaluó
+(2026-09-26) sobre **dos folds cronológicos independientes** (la región
+70-85% del histórico, y el split habitual del último 15%), por estación y
+por horizonte, comparando el baseline de 9 features contra (a) quitar
+`lag_672` del todo y (b) restarle peso suavemente (`feature_weights` del
+constructor de `XGBRegressor`, peso 0.2, con `colsample_bynode=0.8` -
+`feature_weights` no hace nada con el `colsample` por defecto de 1.0, ya que
+sin submuestreo de columnas cada feature se usa en cada split sin importar
+su peso). Un candidato solo se adoptó si superaba al baseline por **>= 0,3
+pp en AMBOS folds de forma independiente, no solo en uno** - la misma
+disciplina usada en el resto del proyecto, porque muchos pares
+estación/horizonte se veían como una mejora clara en un solo split y
+simplemente no se repetían en el segundo (la *dirección* del efecto -
+bajarle peso o quitar `lag_672` ayuda - fue robusta casi en todas partes,
+pero el peso *exacto* óptimo saltaba de un fold a otro para la mayoría de
+estaciones, por eso se prefirió quitar la feature del todo en vez de afinar
+un peso a mano donde alguna de las dos opciones sí superaba la barra).
+
+Configuración final (`NO_LAG672_MODELS`/`SOFT_DEEMPHASIZE_LAG672_MODELS` en
+`app/drift.py`):
+
+| estación | horizonte(s) | tratamiento |
+|---|---|---|
+| 05100 | h3 | `lag_672` eliminado (8 features) |
+| 06111 | h2, h3 | `lag_672` eliminado |
+| 07111 | h2 | `lag_672` eliminado |
+| 09122 | h1, h2, h4 | `lag_672` eliminado |
+| 05000 | h2 | peso suave (0.2, `colsample_bynode=0.8`, sigue con 9 features) |
+| resto | todos | baseline de 9 features sin cambios |
+
+`lags_for(station_id, horizon)` en `app/drift.py` es la única fuente de
+verdad sobre qué rezagos espera un modelo guardado dado - tanto el
+entrenamiento (`_train_station_horizon_model`) como la predicción
+(`predict_cycle_targets` en `app/submit_xgboost.py`) la consultan, así el
+vector de features de inferencia siempre coincide con lo que ese `.joblib`
+específico aprendió. Un cambio de arquitectura como este no está completo
+solo con el cambio de código: el modelo ya desplegado para cada par
+afectado sigue teniendo el conteo de features viejo hasta que se reentrena
+y se vuelve a subir - se hizo así el mismo día (`_train_station_horizon_model`
++ `_upload_model` sobre el histórico completo, para los 8 pares afectados).
+
+### 8. Corrección de sesgo por EWMA en inferencia (no reentrenamiento)
+
+Separado del reentrenamiento: un promedio móvil exponencial causal (sin
+mirar al futuro) del residuo `(real - predicho)` propio de cada estación,
+calculado en cada submission sobre todo el historial real de pares
+predicción/real (`"Original Data"` + `"Temp"`) y sumado sobre la predicción
+cruda justo antes de enviarla (`app/submit_xgboost.py`). Existe porque un
+sesgo real y sostenido (el colapso de varias horas de 05100) puede tardar
+horas en corregirse vía un reentrenamiento por drift - el EWMA reacciona
+dentro de un solo ciclo del collector, sin necesitar reentrenar. Nunca toca
+lo que se guarda como `prediction` en `"Temp"`/`"Original Data"` - eso sigue
+siendo la salida cruda del modelo, para que la señal de drift y el propio
+historial de residuos del EWMA no se retroalimenten entre sí.
+
+`bias_t = alpha * residuo_t + (1 - alpha) * bias_{t-1}`, luego
+`corrección = damping * bias_t`, sumada a la predicción cruda (con piso en
+0). La configuración (`DEFAULT_EWMA_PARAMS = {alpha: 0.2, damping: 0.5}`) se
+eligió igual que `STATION_MODEL_PARAMS`: una búsqueda de grid por estación
+sobre `alpha x damping`, maximizando accuracy sobre **todo** el historial de
+esa estación, no solo su tramo más reciente/ruidoso. Un candidato necesita
+superar al default compartido por `MIN_EWMA_IMPROVEMENT_PP = 0.5` pp para
+que una estación se quede con su propia configuración. En la búsqueda de
+2026-09-26 (repetida dos veces, con datasets distintos y más grandes,
+incluyendo el colapso real de 05100), **ninguna estación superó ese
+margen** - ni siquiera 05100, cuyo colapso parecía necesitar una
+configuración mucho más agresiva visto de forma aislada sobre esa ventana de
+~24 filas, pero la ganancia casi desaparecía al juzgarla contra todo el
+dataset. Por ahora las 12 estaciones usan el default compartido;
+`STATION_EWMA_PARAMS` (vacío hoy) existe para que una futura excepción por
+estación sea un cambio de una línea en cuanto aparezca un margen real.
 
 ## Detección de drift y reentrenamiento (`app/drift.py`)
 

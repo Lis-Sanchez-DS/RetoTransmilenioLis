@@ -9,7 +9,7 @@ import requests
 
 from app.collector import collect_new_data
 from app.db import connection
-from app.drift import station_ewma_bias
+from app.drift import lags_for, station_ewma_bias
 from app.features import temporal_features
 from app.health import check_collector_heartbeat
 from app.net import with_retries, UpstreamUnavailable
@@ -51,11 +51,15 @@ def predict_cycle_targets(targets: list[dict], history: dict, models: dict, data
     across all 4 targets for a station and never depend on another horizon's
     own prediction the way the old recursive approach did.
 
-    A station missing history for one of its lags (e.g. lag_672 needs a full
-    unbroken week of data) is skipped entirely - every horizon needs the same
-    lag set, so one gap rules out all 4 targets for that station, not just
-    one. This shouldn't zero out every other station's otherwise-valid
-    submission.
+    Most horizons use the same 5-lag feature set, but a few proven
+    station/horizon pairs were retrained WITHOUT lag_672 (see drift.py's
+    NO_LAG672_MODELS) - lags_for() reports exactly which lags that pair's
+    saved model expects, so the feature vector built here always matches
+    what the model was actually trained on. A station missing history for
+    one of ITS OWN needed lags is skipped only for that horizon's target,
+    not the whole station - a gap that only affects one horizon's lag set
+    (e.g. lag_672) shouldn't zero out that station's other 3 targets, let
+    alone every other station's submission.
     """
     cutoff = _parse_utc(data_cutoff)
     by_station: dict[str, list[dict]] = {}
@@ -64,16 +68,11 @@ def predict_cycle_targets(targets: list[dict], history: dict, models: dict, data
 
     predictions = []
     for station_id, station_targets in by_station.items():
-        try:
-            lag_features = []
-            for lag in LAGS:
-                key = (station_id, cutoff - timedelta(minutes=15 * (lag - 1)))
-                if key not in history:
-                    raise RuntimeError(f"No hay suficiente historia para {station_id} en lag {lag}")
-                lag_features.append(history[key])
-        except RuntimeError as exc:
-            print(f"AVISO: se omite estación {station_id} en este ciclo: {exc}", flush=True)
-            continue
+        lag_values = {}
+        for lag in LAGS:
+            key = (station_id, cutoff - timedelta(minutes=15 * (lag - 1)))
+            if key in history:
+                lag_values[lag] = history[key]
 
         for target in station_targets:
             timestamp = _parse_utc(target["target_at"])
@@ -82,7 +81,16 @@ def predict_cycle_targets(targets: list[dict], history: dict, models: dict, data
             if model is None:
                 print(f"AVISO: sin modelo para {station_id} horizonte {horizon}; se omite ese target.", flush=True)
                 continue
-            features = lag_features + temporal_features(timestamp)
+            lags = lags_for(station_id, horizon)
+            missing = [lag for lag in lags if lag not in lag_values]
+            if missing:
+                print(
+                    f"AVISO: se omite {station_id} horizonte {horizon} en este ciclo: "
+                    f"no hay suficiente historia en lag {missing[0]}",
+                    flush=True,
+                )
+                continue
+            features = [lag_values[lag] for lag in lags] + temporal_features(timestamp)
             value = max(0.0, float(model.predict([features])[0]))
             predictions.append(
                 {
