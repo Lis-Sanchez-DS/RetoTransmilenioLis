@@ -240,6 +240,26 @@ same change (see "Deploying a feature-set change" below) - leaving the code
 change unaccompanied by a retrain corrupts inference immediately, since the
 currently-deployed model file still has the old feature count.
 
+**`week_sin`/`week_cos` were tested the same way (2026-09-26) and found NOT
+to have the same problem - don't retest this without new evidence.**
+`app/features.py`'s `week_sin`/`week_cos` also encode a one-week period,
+so it's a fair question whether they suffer the same staleness issue as
+`lag_672`. They don't, structurally: `lag_672` is a raw demand *value* from
+one specific week-old timestamp (a single anomalous point leaks straight
+into the prediction), while `week_sin`/`week_cos` carry no demand value at
+all - they just say "it's Tuesday 8:15am," so the model learns an
+*aggregated* pattern across every historical Tuesday-8:15am, not one point.
+Running the identical two-fold methodology (baseline vs. dropping both
+`week_sin`+`week_cos` vs. softly down-weighting them, per station per
+horizon) confirmed this: **zero station/horizon pairs were robust** - not
+one cleared the 0.3pp margin on both folds with the same candidate; wins
+were small and randomly flipped between "drop," "soft-weight," and
+"baseline wins" depending on the fold, the same noise signature as every
+other null result in this file (recency weighting, per-station EWMA). No
+change was made. If revisited, use the same two-fold test - a single-fold
+result here would be exactly the kind of noise this project has repeatedly
+mistaken for a real signal.
+
 ### Deploying an architecture change to specific (station, horizon) models
 
 Adding a station/horizon to `NO_LAG672_MODELS` (or any future per-model
@@ -350,21 +370,47 @@ any more - see `lags_for()` above; always build the prediction feature
 vector via `lags_for(station_id, horizon)`, never by assuming every
 horizon of every station uses all 5 lags.
 
-## Data feed stalled (ongoing, not a pipeline bug)
+## Data feed: a slow virtual clock, not a permanent stall
 
-Since 2026-09-13 the Pulso API's observation stream has been stuck -
-`observed_at` stopped advancing while `released_at`/`server_time` keep
-moving normally. This is upstream/server-side, not something to "fix" in
-this repo. This stall is what originally motivated the `has_pending_data()`
-gate above - a stalled feed that still returns duplicate records every 30
-min would otherwise re-run drift checks across all 12 stations for no
-reason - but it also directly caused the gate's original ("did this run
-insert something new") version to permanently jam retrain for any station
-whose data was already sitting in `Temp` when the feed died (see above). If
-accuracy or drift behavior looks strange, check whether `observed_at` in
-fresh `Temp` rows is actually advancing before assuming the model or the
-drift logic is at fault - and check whether `"Temp"` already holds
-unpromoted, unretrained data for the station in question.
+**Correction (2026-09-26): an earlier version of this doc said the feed was
+"stuck since 2026-09-13" - that framing is wrong and was corrected live
+after the user pushed back on it ("how can new data be arriving if the API
+is not sending new data?").** Rechecking the live API over several hours
+showed `data_cutoff` genuinely advancing (e.g. 03:00 -> 08:00 across one
+afternoon) - the upstream stream is a **virtual clock replaying historical
+data at roughly real-time pace, chronically ~12 days behind the real
+"now"**, not a feed that died on a fixed date. As of the last live check
+(2026-09-26), every station's most recent real `(demand, prediction)` point
+on record was `2026-09-14 11:30:00 UTC` - confirming the ~12-day lag is
+still the right mental model, not a permanent halt.
+
+Practical implications:
+
+- **A code/model change deployed "today" won't show up in real revealed
+  outcomes for a while** - the virtual clock has to crawl forward past the
+  deployment moment before any genuinely-new `(demand, prediction)` pair
+  exists to judge it by. Don't mistake "no new real data yet" for "the
+  change didn't work."
+- `has_pending_data()` (see above) still matters independently of this -
+  it exists for the cross-process race between `collector.yml` and
+  `submissions.yml` (see its own docstring), not because of this clock lag.
+- If accuracy or drift behavior looks strange, check the most recent
+  `observed_at` across stations before assuming the model or drift logic is
+  at fault - if it hasn't moved since your last check, you're looking at
+  the same already-explained window, not new evidence.
+- **Estimating "the accuracy of the last submission"**: there's no stored
+  record of what was actually sent for h2/h3/h4 (only `submit_xgboost.py`'s
+  raw, uncorrected h1-equivalent one-step prediction gets persisted, via
+  `collector.py`'s `predict_records`, purely for drift monitoring). To
+  honestly reconstruct a "what did the last submission likely look like"
+  estimate: take the most recent real `(demand, prediction)` pair per
+  station, and add the EWMA correction **computed only from the history
+  strictly before that point** (causal, no lookahead - mirrors
+  `station_ewma_bias`'s own logic) to approximate what was actually sent,
+  since the correction itself is never stored. This is still h1-only and a
+  single-timestamp sample (noisy, one or two stations can swing the pooled
+  number a lot) - always say so rather than presenting it as a clean
+  aggregate.
 
 ## Pulso TransMi API quirks worth remembering
 

@@ -360,6 +360,41 @@ dataset. Por ahora las 12 estaciones usan el default compartido;
 `STATION_EWMA_PARAMS` (vacío hoy) existe para que una futura excepción por
 estación sea un cambio de una línea en cuanto aparezca un margen real.
 
+### 9. `week_sin`/`week_cos`: misma pregunta que `lag_672`, resultado distinto
+
+`week_sin`/`week_cos` (`app/features.py`) también codifican una periodicidad
+de una semana, así que cabía preguntarse si sufrían el mismo problema que
+`lag_672`. Estructuralmente no: `lag_672` es un **valor** de demanda de un
+timestamp específico de hace una semana (un solo punto anómalo se filtra
+directo a la predicción), mientras que `week_sin`/`week_cos` no cargan
+ningún valor de demanda - solo dicen "es martes 8:15am", así que el modelo
+aprende un patrón **agregado** sobre todos los martes 8:15am del histórico,
+no un punto aislado. Se corrió la misma metodología de dos folds
+independientes (baseline vs. quitar `week_sin`+`week_cos` del todo vs.
+bajarles el peso suavemente, por estación y por horizonte): **ningún par
+estación/horizonte fue robusto** - ninguno superó el margen de 0,3 pp en
+ambos folds con el mismo candidato; las mejoras eran pequeñas y cambiaban
+de fold a fold, la misma firma de ruido que el resto de resultados nulos de
+este proyecto (peso por recencia, EWMA por estación). No se hizo ningún
+cambio.
+
+### 10. Incidente: `predict_records` no se actualizó junto con `lags_for`
+
+Al desplegar el cambio del punto 7, `app/collector.py`'s `predict_records()`
+(el nowcast de un paso usado para monitorear drift, no las submissions) se
+quedó armando el vector de features con el tupla fija `LAGS` (9 rezagos) en
+vez de consultar `lags_for(station_id, 1)`. En cuanto el modelo h1 de 09122
+(uno de los que ahora usan 8 features) se redesplegó, cada llamada fallaba
+con `ValueError: Feature shape mismatch, expected: 8, got 9` - y como 09122
+aparece en cada tanda de registros, esto tumbó `submissions.yml` tras sus 3
+fallos consecutivos permitidos. Corregido usando `lags_for()` también ahí;
+confirmado en producción vía la tabla de heartbeat del collector
+(`ops.job_runs`), que mostró una corrida exitosa después del fix. Lección:
+`lags_for()` tiene más de un punto de uso (`submit_xgboost.py` Y
+`collector.py`) - al agregar una arquitectura por `(estación, horizonte)`,
+buscar con `grep -rn "\.predict(" app/` cada lugar donde se llama a un
+modelo guardado, no solo el que ya se estaba editando.
+
 ## Detección de drift y reentrenamiento (`app/drift.py`)
 
 - **Disparador**: la accuracy de una estación sobre sus últimos
@@ -409,11 +444,21 @@ Toda la suite de pruebas simula el acceso a la base de datos (sin conexión
 real a Supabase) - ver `tests/test_drift.py`, `tests/test_collector.py`,
 `tests/test_submit_xgboost.py`, `tests/test_health.py`.
 
-## Estado del feed de datos
+## Estado del feed de datos: un reloj virtual lento, no un estancamiento permanente
 
-Desde 2026-09-13 el stream de observaciones de la API de Pulso está
-estancado (`observed_at` no avanza) aunque `released_at`/`server_time` sí lo
-hacen con normalidad - un problema del lado del servidor de la competencia,
-no del pipeline. El gate de "solo revisar drift si hay datos nuevos" existe
-en parte para que este estancamiento no dispare reentrenamientos
-innecesarios mientras persista.
+**Corrección (2026-09-26):** una versión anterior de este documento decía
+que el feed estaba "estancado desde el 2026-09-13" - esa idea era
+incorrecta. Al revisar la API en vivo durante varias horas, `data_cutoff`
+sí avanzaba (por ejemplo, de 03:00 a 08:00 en una tarde) - el stream de la
+competencia es un **reloj virtual que reproduce datos históricos a un ritmo
+cercano al tiempo real, pero crónicamente ~12 días detrás del "ahora"
+real**, no un feed que murió en una fecha fija. En la última revisión en
+vivo (2026-09-26), el punto real más reciente `(demanda, predicción)` de
+cada una de las 12 estaciones era `2026-09-14 11:30:00 UTC` - confirmando
+que el desfase de ~12 días sigue siendo el modelo mental correcto.
+
+Implicación práctica: un cambio de código o de modelo desplegado "hoy" no
+se puede validar contra resultados reales revelados hasta que el reloj
+virtual avance más allá de ese momento - no hay forma de comprobar en vivo
+que un fix funcionó el mismo día que se despliega, solo mediante
+reentrenamiento/pruebas offline como las de este documento.
