@@ -447,7 +447,23 @@ Keep it this way when touching `submit_current_cycle()`.
    step's own `ON CONFLICT DO NOTHING`. This is a one-time artifact of the
    pre-fix duplication, not a bug in the KS-test/promotion logic itself,
    and it stops recurring now that the cursor actually persists.
-7. **Schema drift between `database/init/001_schema.sql` and the live
+7. **`app/collector.py`'s `predict_records()` was missed when `lags_for()`
+   was introduced (2026-09-26).** It builds the h1 feature vector for
+   *every* station's drift-monitoring nowcast, but kept iterating the fixed
+   `LAGS` tuple directly instead of calling `lags_for(station_id, 1)`. The
+   moment 09122's h1 model (one of the `NO_LAG672_MODELS` overrides, 8
+   features) got redeployed, every single call sent it 9 features instead -
+   `ValueError: Feature shape mismatch, expected: 8, got 9`, unrecoverable
+   (it hits on every record in every batch), which then failed the whole
+   `submissions.yml` job after its 3-strikes limit. **Lesson: `lags_for()`
+   has more than one call site** - `submit_xgboost.py`'s
+   `predict_cycle_targets` AND `collector.py`'s `predict_records` both build
+   feature vectors for a saved model, and both must go through it. When
+   adding a new per-`(station, horizon)` architecture override, grep for
+   every place a `.joblib` model's `.predict()` gets called
+   (`grep -rn "\.predict(" app/`) and check each one, not just the one you
+   were already editing.
+8. **Schema drift between `database/init/001_schema.sql` and the live
    Supabase DB.** The init file is aspirational/only used for fresh
    installs; the real DB is built incrementally via
    `database/migrations/*.sql`, and a migration can silently fail to keep
