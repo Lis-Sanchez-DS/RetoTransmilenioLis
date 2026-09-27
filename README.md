@@ -282,58 +282,66 @@ y `reg_lambda`, elegidos por la búsqueda walk-forward del punto 5
 al default `learning_rate=0.05, n_estimators=400, max_leaves=40,
 reg_lambda=1.0`).
 
-Features de cada modelo: 5 rezagos de demanda (`lag_1`, `lag_2`, `lag_4`,
-`lag_96`, `lag_672` - 15 min, 30 min, 1h, 1 día y 1 semana antes, ajustados
-por el horizonte según la fórmula de anclaje de arriba) + 4 variables
-cíclicas de calendario (seno/coseno diario y semanal, `app/features.py`) -
-**salvo un pequeño grupo de pares estación/horizonte que ya no usan
-`lag_672` de esta forma, ver más abajo**.
+Features de cada modelo: 4 rezagos de demanda (`lag_1`, `lag_2`, `lag_4`,
+`lag_96` - 15 min, 30 min, 1h y 1 día antes, ajustados por el horizonte
+según la fórmula de anclaje de arriba) + 4 variables cíclicas de calendario
+(seno/coseno diario y semanal, `app/features.py`) = **8 features, iguales
+para las 12 estaciones y los 4 horizontes, sin excepciones** (ver punto 7).
 
-### 7. Peso de `lag_672` por estación y horizonte
+### 7. `lag_672` (una semana atrás): de una excepción por estación a eliminado en todas partes
 
-`lag_672` (una semana atrás) ancla cada modelo a "qué pasó a esta misma hora
-la semana pasada" - un buen default, pero activamente contraproducente
-mientras el patrón de demanda de una estación está genuinamente cambiando
-(los colapsos de varias horas de 05100 son el caso más claro). Se evaluó
-(2026-09-26) sobre **dos folds cronológicos independientes** (la región
-70-85% del histórico, y el split habitual del último 15%), por estación y
-por horizonte, comparando el baseline de 9 features contra (a) quitar
-`lag_672` del todo y (b) restarle peso suavemente (`feature_weights` del
-constructor de `XGBRegressor`, peso 0.2, con `colsample_bynode=0.8` -
-`feature_weights` no hace nada con el `colsample` por defecto de 1.0, ya que
-sin submuestreo de columnas cada feature se usa en cada split sin importar
-su peso). Un candidato solo se adoptó si superaba al baseline por **>= 0,3
-pp en AMBOS folds de forma independiente, no solo en uno** - la misma
-disciplina usada en el resto del proyecto, porque muchos pares
-estación/horizonte se veían como una mejora clara en un solo split y
-simplemente no se repetían en el segundo (la *dirección* del efecto -
-bajarle peso o quitar `lag_672` ayuda - fue robusta casi en todas partes,
-pero el peso *exacto* óptimo saltaba de un fold a otro para la mayoría de
-estaciones, por eso se prefirió quitar la feature del todo en vez de afinar
-un peso a mano donde alguna de las dos opciones sí superaba la barra).
+`lag_672` ancla cada modelo a "qué pasó a esta misma hora la semana
+pasada" - un buen default, pero activamente contraproducente mientras el
+patrón de demanda de una estación está genuinamente cambiando (los colapsos
+de varias horas de 05100 son el caso más claro). Se evaluó primero
+(2026-09-26) sobre dos folds cronológicos independientes (70-85% del
+histórico, y el último 15%), por estación y horizonte, comparando el
+baseline de 9 features contra (a) quitar `lag_672` del todo y (b) restarle
+peso suavemente (`feature_weights`, peso 0.2, con `colsample_bynode=0.8`).
+Un candidato solo se adoptaba si superaba al baseline por >= 0,3 pp en
+AMBOS folds - esa primera pasada dejó solo 7 pares estación/horizonte con
+`lag_672` eliminado y 1 con peso suave, y el resto sin cambios.
 
-Configuración final (`NO_LAG672_MODELS`/`SOFT_DEEMPHASIZE_LAG672_MODELS` en
-`app/drift.py`):
+**Re-test con más datos acumulados (2026-09-27):** repetir exactamente la
+misma prueba de dos folds, ahora con más historia, mostró dos cosas:
 
-| estación | horizonte(s) | tratamiento |
-|---|---|---|
-| 05100 | h3 | `lag_672` eliminado (8 features) |
-| 06111 | h2, h3 | `lag_672` eliminado |
-| 07111 | h2 | `lag_672` eliminado |
-| 09122 | h1, h2, h4 | `lag_672` eliminado |
-| 05000 | h2 | peso suave (0.2, `colsample_bynode=0.8`, sigue con 9 features) |
-| resto | todos | baseline de 9 features sin cambios |
+1. El peso suave (probado con varios pesos: 0.2, 0.4, 0.6) **nunca superó a
+   la eliminación total** en ningún par donde ambos se probaron - siempre
+   quedaba por debajo, a veces por más de 1-2 pp (ej. 05100 h1: peso suave
+   80,3-84,9% vs eliminación total 82,4-85,7%).
+2. Con la historia más grande, **eliminar `lag_672` del todo ahora superaba
+   el baseline en ~15 pares adicionales** a los 7 ya desplegados - no solo
+   en el pequeño grupo original.
 
-`lags_for(station_id, horizon)` en `app/drift.py` es la única fuente de
-verdad sobre qué rezagos espera un modelo guardado dado - tanto el
-entrenamiento (`_train_station_horizon_model`) como la predicción
-(`predict_cycle_targets` en `app/submit_xgboost.py`) la consultan, así el
-vector de features de inferencia siempre coincide con lo que ese `.joblib`
-específico aprendió. Un cambio de arquitectura como este no está completo
-solo con el cambio de código: el modelo ya desplegado para cada par
-afectado sigue teniendo el conteo de features viejo hasta que se reentrena
-y se vuelve a subir - se hizo así el mismo día (`_train_station_horizon_model`
-+ `_upload_model` sobre el histórico completo, para los 8 pares afectados).
+Dado que (a) el peso suave no ganó en ningún caso probado y (b) la lista de
+pares que se benefician de eliminar `lag_672` seguía creciendo con más
+datos, se simplificó la arquitectura del todo: **`lag_672` se quitó de
+`LAGS` para las 12 estaciones y los 4 horizontes**, en vez de mantener una
+lista de excepciones cada vez más larga. Verificado con un split held-out
+del último 15% (el estándar del proyecto, no solo los dos folds del
+re-test): **83,77% -> 84,37% (+0,60 pp), 11/12 estaciones mejoran** - 05100
+es la que más gana (+2,62 pp promedio, hasta +2,93 pp en h2), reflejando su
+colapso de demanda ya conocido; solo `09000` retrocede levemente (-0,11 pp
+promedio) como costo aceptable de una sola arquitectura uniforme.
+
+Esto también elimina una clase entera de bug de raíz: antes, `LAGS` variaba
+por par estación/horizonte (`lags_for()` en `app/drift.py` decidía cuántas
+features esperaba cada `.joblib` guardado), y ese código de inferencia tenía
+que consultarse en cada lugar donde se llamaba a `.predict()`
+(`collector.py` Y `submit_xgboost.py`) - olvidar uno de los dos es
+exactamente lo que causó el incidente del punto 10. Con un solo `LAGS`
+compartido por todos, `lags_for()` y toda la maquinaria de excepciones por
+par (`NO_LAG672_MODELS`, `SOFT_DEEMPHASIZE_LAG672_MODELS`,
+`_feature_weight_kwargs`) se eliminaron de `app/drift.py`; `collector.py` y
+`submit_xgboost.py` ahora importan `LAGS` directamente de `app.drift` (una
+sola fuente de verdad) en vez de mantener su propia copia local del tuple.
+
+Antes de desplegar, se verificó localmente (no solo con la suite de tests
+mockeados): los 48 modelos reentrenados con el nuevo `LAGS` de 4 rezagos se
+confirmaron uno por uno en `n_features_in_ == 8`, y tanto
+`predict_records()` como `predict_cycle_targets()` se corrieron de punta a
+punta contra datos reales de la base de datos (sin mocks) antes de subir
+ningún modelo a Supabase Storage.
 
 ### 8. Corrección de sesgo por EWMA en inferencia (no reentrenamiento)
 
@@ -400,6 +408,44 @@ confirmado en producción vía la tabla de heartbeat del collector
 `collector.py`) - al agregar una arquitectura por `(estación, horizonte)`,
 buscar con `grep -rn "\.predict(" app/` cada lugar donde se llama a un
 modelo guardado, no solo el que ya se estaba editando.
+
+**Actualización (2026-09-27):** con `lag_672` eliminado de `LAGS` para
+absolutamente todos los pares (punto 7), esta clase de bug ya no puede
+volver a ocurrir - no hay `lags_for()` ni ninguna otra fuente de un conteo
+de features distinto entre modelos; los 48 comparten el mismo `LAGS`.
+
+## Reducción de tráfico a Supabase (2026-09-27)
+
+Varias consultas traían muchísimos más datos de los que en realidad usaban,
+generando un consumo de egress muy por encima de lo necesario:
+
+- `submit_current_cycle()` traía **toda** `"Original Data"` (~59.000 filas y
+  creciendo) más toda `"Temp"`, cada ~5 min mientras hay un ciclo abierto,
+  solo para resolver los rezagos de cada estación. Ahora filtra por
+  `station_id = ANY(...) AND observed_at = ANY(...)` con los timestamps
+  exactos que puede necesitar - verificado en vivo: 54 filas en vez de
+  58.992 para el mismo cutoff real.
+- `predict_records()` (`app/collector.py`) hacía lo mismo por estación -
+  traía su historial completo para leer un puñado de rezagos. Mismo fix.
+- `station_ewma_bias()` traía el historial completo de cada estación para
+  una media móvil exponencial cuyo peso decae geométricamente - con
+  `alpha=0.2` cualquier punto más allá de ~93 filas atrás no cambia el
+  resultado en ninguna cifra significativa (`_ewma_lookback_rows()` deriva
+  ese límite del propio `alpha` de la estación, no un número fijo).
+  Verificado en vivo: coincide con el cálculo sobre el historial completo
+  hasta ~9 cifras significativas.
+
+Las tres consultas ahora escalan con el tamaño de la respuesta (una
+estación, un puñado de timestamps), no con el tamaño del histórico
+acumulado, que seguirá creciendo mientras dure la competencia.
+
+Por separado, `check_and_retrain()` ahora exige `MIN_NEW_FOR_RETRAIN=20`
+filas nuevas pendientes en `"Temp"` por estación antes de reentrenarla (ver
+la sección de drift más abajo) - antes de este cambio, `has_pending_data()`
+(un chequeo global) combinado con una estación ya por debajo del umbral
+significaba que 1-2 filas nuevas bastaban para disparar un reentrenamiento
+completo (4 horizontes, 4 subidas a Supabase) en casi cada vuelta del
+collector, la causa directa del pico de egress que motivó esta sección.
 
 ## Detección de drift y reentrenamiento (`app/drift.py`)
 

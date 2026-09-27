@@ -72,7 +72,7 @@ def test_predict_cycle_targets_keeps_stations_independent():
 def test_predict_cycle_targets_skips_station_with_missing_history():
     """A station missing lag history is skipped, not fatal to the whole cycle.
 
-    One station's incomplete history (e.g. a gap in the week lag_672 needs)
+    One station's incomplete history (e.g. a gap in the day-ago lag_96 needs)
     shouldn't zero out every other station's otherwise-valid submission.
     """
     incomplete_station = "A"

@@ -150,6 +150,20 @@ folds smaller than the final training set) and a minimum-improvement
 margin before switching away from the known-good default, or it will
 reproduce the 2026-09-24 failure mode.
 
+**`MIN_NEW_FOR_RETRAIN = 20` (added 2026-09-27): a drifted station only
+actually retrains once >= 20 new rows have piled up in `Temp` for it, not
+merely "more than zero".** `has_pending_data()` (above) deliberately keeps
+re-running the drift check as long as `Temp` has anything at all in it, for
+*any* station - without this second, per-station gate, that meant a station
+already below `ACCURACY_THRESHOLD` got fully retrained (4 horizons, 4
+Supabase uploads) on almost every ~30min collector cycle off as few as 1-2
+new rows against a ~5000-row history: real cost, no real change to the
+model, and the actual root cause of the Supabase egress spike investigated
+below. This doesn't reintroduce the "blocked forever" failure mode
+`has_pending_data()` itself was built to fix - as long as new data keeps
+trickling in at all, the count keeps growing and eventually clears the bar,
+it just stops spending a full retrain on every single trickle.
+
 **One model per station per horizon, not one recursive model.** Since the
 direct multi-horizon change (see "Multi-horizon prediction" below), a
 drifted station retrains and republishes all 4 horizon models
@@ -195,52 +209,52 @@ repeating this margin-checked, full-history search - reacting to an
 isolated bad window is exactly the anti-pattern the 2026-09-24 revert (see
 above) exists to prevent.
 
-### Per-(station, horizon) feature set overrides (`lags_for`)
+### `lag_672` was removed entirely, for every station and horizon (2026-09-27)
 
 `lag_672` (a full week back) anchors every model to "what happened at this
 same time last week" - a good default normally, but actively counterproductive
 while a station's demand pattern is genuinely shifting (05100's collapses
-are the clearest case). Tested 2026-09-26 via **two independent
-chronological folds** (the 70-85% region, and the standard last-15% test
-split), per station per horizon, comparing the untouched 9-feature baseline
-against (a) dropping `lag_672` from the feature set entirely and (b)
-softly down-weighting it (`feature_weights` in the `XGBRegressor`
-constructor, weight 0.2, with `colsample_bynode=0.8` - `feature_weights` is
-a silent no-op at the default `colsample=1.0`, since with no column
-subsampling every feature is used at every split regardless of its
-weight). A candidate only earns a spot in production if it beat the
-baseline by **>= 0.3 pp on BOTH folds independently, not just one** - the
-same discipline used everywhere else in this project, because plenty of
-station/horizon pairs looked like a clear win on a single split and simply
-didn't repeat on the second one (the *direction* - down-weighting or
-dropping `lag_672` helps - was robust almost everywhere, but the *exact*
-optimal weight value bounced around between folds for most stations,
-which is why a full drop, not a hand-tuned weight, was preferred wherever
-it cleared the bar). Final production config
-(`NO_LAG672_MODELS`/`SOFT_DEEMPHASIZE_LAG672_MODELS` in `app/drift.py`):
+are the clearest case). This went through two rounds of testing:
 
-| station | horizon(s) | treatment |
-|---|---|---|
-| 05100 | h3 | `lag_672` dropped entirely (8 features) |
-| 06111 | h2, h3 | `lag_672` dropped entirely |
-| 07111 | h2 | `lag_672` dropped entirely |
-| 09122 | h1, h2, h4 | `lag_672` dropped entirely |
-| 05000 | h2 | soft down-weight (weight 0.2, `colsample_bynode=0.8`, still 9 features) |
-| everyone else | all horizons | untouched 9-feature baseline |
+1. **2026-09-26**: two independent chronological folds (70-85% region, and
+   the standard last-15% test split), per station per horizon, comparing
+   the untouched 9-feature baseline against (a) dropping `lag_672` entirely
+   and (b) softly down-weighting it (`feature_weights`, weight 0.2, with
+   `colsample_bynode=0.8` - `feature_weights` is a silent no-op at the
+   default `colsample=1.0`). A candidate needed to beat baseline by
+   **>= 0.3pp on BOTH folds independently**. Result: only 7 (station,
+   horizon) pairs qualified for full removal and 1 for the soft weight;
+   everyone else kept the untouched baseline. This produced a per-pair
+   override table and a `lags_for(station_id, horizon)` function that both
+   `_train_station_horizon_model` and `predict_cycle_targets` had to call
+   to know which lag set a given saved model expected.
+2. **2026-09-27 re-test with more accumulated data**, same two-fold
+   methodology: the soft-weighted variant **never once beat full removal**
+   anywhere it was tried (tried weights 0.2/0.4/0.6), and with more history,
+   full removal now cleared the bar for **~15 more pairs** beyond the
+   original 7 - not a small correction, a clear trend that removal keeps
+   winning as more data accumulates.
 
-`lags_for(station_id, horizon)` is the single source of truth for which
-lags a given saved model expects - both `_train_station_horizon_model` (at
-train time) and `predict_cycle_targets` (at inference time) call it, so the
-feature vector built for prediction always matches what that specific
-`.joblib` file was actually trained on. **Never train or predict for one of
-the overridden pairs using the full `LAGS` tuple directly** - a dimension
-mismatch there doesn't raise a friendly error, it just silently corrupts
-predictions or crashes deep inside XGBoost. If this set is ever revisited,
-repeat the two-independent-fold methodology above rather than trusting a
-single split, and retrain + re-upload every affected `.joblib` file in the
-same change (see "Deploying a feature-set change" below) - leaving the code
-change unaccompanied by a retrain corrupts inference immediately, since the
-currently-deployed model file still has the old feature count.
+Given that, `lag_672` was dropped from `LAGS` **for all 12 stations and all
+4 horizons** in `app/drift.py`, rather than maintaining an ever-growing
+per-pair exception list. `lags_for()`, `NO_LAG672_MODELS`,
+`SOFT_DEEMPHASIZE_LAG672_MODELS`, and `_feature_weight_kwargs` were all
+**deleted** from `app/drift.py` - there is now exactly one `LAGS =
+(1, 2, 4, 96)` tuple (4 lags + 4 calendar features = 8 features), shared by
+every model, imported directly by `collector.py` and `submit_xgboost.py`
+(`from app.drift import LAGS`) instead of each keeping its own local copy.
+Held-out (last-15%) accuracy: 83.77% -> 84.37% (+0.60pp), 11/12 stations
+improve (05100 the most, +2.62pp average); only `09000` regresses slightly
+(-0.11pp) - accepted as the cost of one uniform feature set.
+
+**This also structurally eliminates known past bug #7 below** (the
+feature-shape-mismatch outage) - there is no more per-pair lag set for a
+call site to forget to look up, so that whole class of bug can't recur here.
+If a future feature-set change ever needs to vary by (station, horizon)
+again, treat it as reintroducing exactly the fragility this removal
+eliminated, and expect to rebuild something like `lags_for()` deliberately,
+with the "grep every `.predict()` call site" discipline from bug #7's
+lesson.
 
 **`week_sin`/`week_cos` were tested the same way (2026-09-26) and found NOT
 to have the same problem - don't retest this without new evidence.**
@@ -262,27 +276,34 @@ change was made. If revisited, use the same two-fold test - a single-fold
 result here would be exactly the kind of noise this project has repeatedly
 mistaken for a real signal.
 
-### Deploying an architecture change to specific (station, horizon) models
+### Deploying a feature-set/architecture change (any change to what a model's `.joblib` expects)
 
-Adding a station/horizon to `NO_LAG672_MODELS` (or any future per-model
-architecture change) only changes what a *newly trained* model looks like -
-the already-deployed `.joblib` file for that pair is untouched and still has
-the old feature count/schema. Since `predict_cycle_targets` now builds its
-feature vector via `lags_for()` (the *new* logic), pushing the code change
-alone, without retraining, creates an immediate mismatch between what the
-code sends and what the old file expects - this fails loudly inside
-XGBoost's C++ layer, not as a friendly Python exception. A change like this
-is not complete until both steps happen together:
+A change to `LAGS` (or any other change to the feature vector shape) only
+changes what a *newly trained* model looks like - every already-deployed
+`.joblib` file is untouched and still has the old feature count/schema.
+Pushing the code change alone, without retraining, creates an immediate
+mismatch between what the inference code sends and what the old file
+expects - this fails loudly inside XGBoost's C++ layer
+(`ValueError: Feature shape mismatch`), not as a friendly Python exception,
+and it hits on every single prediction for that model, not intermittently.
+A change like this is not complete until all of these happen together,
+**in this order, verified before deploying** (this is exactly what the
+2026-09-27 `lag_672` removal did):
 
-1. Ship the code change (`NO_LAG672_MODELS`/`SOFT_DEEMPHASIZE_LAG672_MODELS`
-   in `app/drift.py`, and anywhere else that reads `lags_for()`).
-2. Immediately retrain and re-upload every affected `(station, horizon)`
-   pair's model on current full history, using the exact same
-   `_train_station_horizon_model` / `_upload_model` functions a real drift
-   retrain would call (not a hand-rolled equivalent) - loading `.env` into
-   `os.environ` first (note: the DB URL there is `SUPABASE_DATABASE_URL`,
-   but `app/db.py` reads `os.environ["DATABASE_URL"]`, so it must be copied
-   across or the connection call raises `KeyError`).
+1. Change the code (e.g. `LAGS` in `app/drift.py`).
+2. Retrain and re-upload **every** affected model on current full history,
+   using the exact same `_train_station_horizon_model` / `_upload_model`
+   functions a real drift retrain would call (not a hand-rolled
+   equivalent) - loading `.env` into `os.environ` first (note: the DB URL
+   there is `SUPABASE_DATABASE_URL`, but `app/db.py` reads
+   `os.environ["DATABASE_URL"]`, so it must be copied across or the
+   connection call raises `KeyError`).
+3. **Before uploading/deploying**, verify locally: load every retrained
+   `.joblib` and check `model.n_features_in_` matches expectation, and run
+   the actual `predict_records()` and `predict_cycle_targets()` functions
+   (not a reimplementation) against real DB data end-to-end with no mocks -
+   this is what would have caught the 2026-09-26 outage before it shipped.
+4. Only then upload to Supabase Storage and push/restart the workflows.
 
 Don't wait for the next natural drift trigger to pick up an architecture
 change this way - an untriggered station keeps serving the old, now
@@ -336,6 +357,36 @@ revisiting (e.g. a different model storage backend), preserve the
 "only fetch what actually changed" property, since that's what the whole
 fix is protecting.
 
+### Database query egress (2026-09-27): stop pulling entire tables to read a handful of rows
+
+Separate from the Storage-download incident above, three DB queries were
+each pulling far more than they used: `submit_current_cycle()` was
+`SELECT`ing **all** of `"Original Data"` (~59,000 rows and growing) plus all
+of `"Temp"` every ~5min while a cycle is open, just to resolve each
+station's lag features; `collector.py`'s `predict_records()` did the same
+per-station; and `station_ewma_bias()` pulled a station's entire
+prediction/actual history for an EWMA whose weight decays geometrically
+(alpha=0.2 makes anything past ~93 rows back numerically irrelevant).
+Fixed:
+
+- `submit_current_cycle()` / `predict_records()`: filter by
+  `station_id = ANY(%s) AND observed_at = ANY(%s)` with the exact
+  timestamps `LAGS` can need, instead of an unfiltered/station-only
+  `WHERE`. Verified live: 54 rows instead of 58,992 for the same cutoff.
+- `station_ewma_bias()`: `ORDER BY observed_at DESC LIMIT
+  _ewma_lookback_rows(alpha)` instead of the full history, then reversed
+  back to chronological order for the recursion. `_ewma_lookback_rows()`
+  derives the row count from that station's own `alpha` (not a hardcoded
+  number) so it stays correct even if a future `STATION_EWMA_PARAMS`
+  override picks a much slower-decaying alpha. Verified live: matches the
+  full-history computation to ~9 significant figures.
+
+All three queries now scale with the size of one response (one station, a
+handful of timestamps), not with the size of the ever-growing accumulated
+history - keep it that way; re-adding an unfiltered `SELECT * FROM
+"Original Data"`-style query anywhere in the hot path (called every
+collector/submission cycle) reintroduces exactly this problem.
+
 ### Network resilience (`app/net.py`)
 
 `with_retries()` wraps outbound HTTP calls (both to the Pulso API and, via
@@ -385,25 +436,25 @@ uses the correct pattern for its own (single-step) predictions - mirror it
 rather than reinventing.
 
 If a station is missing history for a lag its target horizon actually needs
-(most likely `lag_672` = one week back, which needs an unbroken week of
-data), `predict_cycle_targets` **skips only that target/horizon** and logs
-a warning - it does not abort the whole station or cycle. (Before
+(most likely `lag_96` = one day back, the longest lag now that `lag_672` is
+gone - see below), `predict_cycle_targets` **skips only that target/horizon**
+and logs a warning - it does not abort the whole station or cycle. (Before
 2026-09-26 this checked all of `LAGS` up front per station and skipped the
-*entire station* on any single missing lag; that granularity broke once
-some horizons stopped needing `lag_672` at all - see "Per-(station,
-horizon) feature set overrides" above - since a station could easily have
-full history for the lags one horizon needs but not another's. Preserve the
-per-target granularity; don't revert to the coarser per-station check.)
+*entire station* on any single missing lag; that granularity briefly
+mattered while different (station, horizon) pairs used different lag sets,
+since a station could have full history for one horizon's lags but not
+another's. Preserve the per-target granularity regardless; don't revert to
+the coarser per-station check.)
 
 Each horizon is a **separate model file**, loaded as
 `models[(station_id, horizon)]` from
 `{MODEL_DIR}/xgboost_{station_id}_h{horizon}.joblib` - not one shared model
-called four times. `download_models.sh` and `drift.py`'s upload step must
-stay in sync with this per-`(station, horizon)` naming. Which lags go into
-that file's feature vector is **not** always the same fixed `LAGS` tuple
-any more - see `lags_for()` above; always build the prediction feature
-vector via `lags_for(station_id, horizon)`, never by assuming every
-horizon of every station uses all 5 lags.
+called four times. `download_models.py` and `drift.py`'s upload step must
+stay in sync with this per-`(station, horizon)` naming. As of 2026-09-27,
+every model (all stations, all horizons) shares the exact same `LAGS =
+(1, 2, 4, 96)` feature set - `collector.py` and `submit_xgboost.py` both
+import `LAGS` directly from `app.drift`, there is no more per-pair
+variation to look up (see "`lag_672` was removed entirely" above).
 
 ## Data feed: a slow virtual clock, not a permanent stall
 

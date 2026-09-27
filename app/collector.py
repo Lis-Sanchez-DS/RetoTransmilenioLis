@@ -11,7 +11,7 @@ import joblib
 import numpy as np
 
 from app.db import connection
-from app.drift import check_and_retrain, has_pending_data, lags_for
+from app.drift import LAGS, check_and_retrain, has_pending_data
 from app.features import temporal_features
 from app.health import record_job_run
 from app.net import with_retries, UpstreamUnavailable
@@ -19,11 +19,6 @@ from app.net import with_retries, UpstreamUnavailable
 API_URL = os.getenv("PULSO_API_URL", "https://pulso-transmi.72-60-245-2.sslip.io")
 PAGE_SIZE = min(max(int(os.getenv("COLLECTOR_PAGE_SIZE", "5000")), 1), 5000)
 MODEL_DIR = os.getenv("MODEL_DIR", "models/xgboost")
-# The full/default lag set - most stations' h1 model uses exactly this, but
-# a few (see drift.py's NO_LAG672_MODELS) don't. predict_records() below
-# must always go through lags_for(station_id, 1), never this constant
-# directly, or it silently sends the wrong feature count to those models.
-LAGS = (1, 2, 4, 96, 672)
 
 
 def get_cursor() -> str | None:
@@ -45,17 +40,19 @@ def predict_records(records: list[dict]) -> list[tuple[dict, float]]:
         return []
     parsed = [(item, _parse_ts(item["observed_at"])) for item in records]
     station_ids = sorted({item["station_id"] for item, _ in parsed})
+    # Every model (all stations, all horizons) shares the same LAGS now - see
+    # drift.py's comment on why lag_672 was dropped entirely on 2026-09-27.
     # Each record's lag features only ever look up ts - 15*lag minutes for
-    # lag in lags_for(station, 1) - a small, known set of timestamps, never
-    # anything else. Pulling each station's ENTIRE history here instead (as
-    # before) to resolve a handful of lag points was one of the two largest
-    # sources of Supabase DB egress (see submit_xgboost.py's matching fix,
-    # same root cause) - a station's history can be tens of thousands of
-    # rows and growing, transferred in full just to read ~5 of them.
+    # lag in LAGS - a small, known set of timestamps, never anything else.
+    # Pulling each station's ENTIRE history here instead (as before) to
+    # resolve a handful of lag points was one of the two largest sources of
+    # Supabase DB egress (see submit_xgboost.py's matching fix, same root
+    # cause) - a station's history can be tens of thousands of rows and
+    # growing, transferred in full just to read ~4 of them.
     needed_timestamps = sorted({
         ts - timedelta(minutes=15 * lag)
         for item, ts in parsed
-        for lag in lags_for(item["station_id"], 1)
+        for lag in LAGS
     })
     with connection() as conn:
         # "Temp" holds every observation collected since a station's last
@@ -89,7 +86,7 @@ def predict_records(records: list[dict]) -> list[tuple[dict, float]]:
     predictions = []
     for item, ts in parsed:
         features = []
-        for lag in lags_for(item["station_id"], 1):
+        for lag in LAGS:
             key = (item["station_id"], ts - timedelta(minutes=15 * lag))
             if key not in history:
                 raise RuntimeError(f"Missing lag {lag} for station {item['station_id']} at {ts.isoformat()}")

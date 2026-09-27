@@ -158,7 +158,7 @@ def test_check_and_retrain_never_drops_history(monkeypatch, tmp_path):
     station = "A"
     start = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
-    # 700 historical points: enough to clear every lag (max lag is 672).
+    # 700 historical points: enough to clear every lag (max lag is 96).
     historical_rows = [
         (start + timedelta(minutes=15 * i), 100 + (i % 20)) for i in range(700)
     ]

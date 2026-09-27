@@ -9,7 +9,7 @@ import requests
 
 from app.collector import collect_new_data
 from app.db import connection
-from app.drift import lags_for, station_ewma_bias
+from app.drift import LAGS, station_ewma_bias
 from app.features import temporal_features
 from app.health import check_collector_heartbeat
 from app.net import with_retries, UpstreamUnavailable
@@ -18,7 +18,6 @@ from app.net import with_retries, UpstreamUnavailable
 BASE_URL = os.getenv("PULSO_API_URL", "https://pulso-transmi.72-60-245-2.sslip.io").rstrip("/")
 API_KEY = os.getenv("PULSO_API_KEY") or os.getenv("API-KEY-PulsoTransmi")
 MODEL_DIR = os.getenv("MODEL_DIR", "models/xgboost")
-LAGS = (1, 2, 4, 96, 672)
 HORIZONS = (1, 2, 3, 4)
 
 
@@ -51,15 +50,13 @@ def predict_cycle_targets(targets: list[dict], history: dict, models: dict, data
     across all 4 targets for a station and never depend on another horizon's
     own prediction the way the old recursive approach did.
 
-    Most horizons use the same 5-lag feature set, but a few proven
-    station/horizon pairs were retrained WITHOUT lag_672 (see drift.py's
-    NO_LAG672_MODELS) - lags_for() reports exactly which lags that pair's
-    saved model expects, so the feature vector built here always matches
-    what the model was actually trained on. A station missing history for
-    one of ITS OWN needed lags is skipped only for that horizon's target,
-    not the whole station - a gap that only affects one horizon's lag set
-    (e.g. lag_672) shouldn't zero out that station's other 3 targets, let
-    alone every other station's submission.
+    Every station/horizon model shares the same LAGS feature set (see
+    drift.py's comment on why lag_672 was dropped for all of them on
+    2026-09-27), so the feature vector built here always matches what every
+    model was actually trained on - no more per-pair lag sets to track. A
+    station missing history for one of its lags is skipped only for that
+    horizon's target, not the whole station - a gap shouldn't zero out that
+    station's other 3 targets, let alone every other station's submission.
     """
     cutoff = _parse_utc(data_cutoff)
     by_station: dict[str, list[dict]] = {}
@@ -81,8 +78,7 @@ def predict_cycle_targets(targets: list[dict], history: dict, models: dict, data
             if model is None:
                 print(f"AVISO: sin modelo para {station_id} horizonte {horizon}; se omite ese target.", flush=True)
                 continue
-            lags = lags_for(station_id, horizon)
-            missing = [lag for lag in lags if lag not in lag_values]
+            missing = [lag for lag in LAGS if lag not in lag_values]
             if missing:
                 print(
                     f"AVISO: se omite {station_id} horizonte {horizon} en este ciclo: "
@@ -90,7 +86,7 @@ def predict_cycle_targets(targets: list[dict], history: dict, models: dict, data
                     flush=True,
                 )
                 continue
-            features = [lag_values[lag] for lag in lags] + temporal_features(timestamp)
+            features = [lag_values[lag] for lag in LAGS] + temporal_features(timestamp)
             value = max(0.0, float(model.predict([features])[0]))
             predictions.append(
                 {

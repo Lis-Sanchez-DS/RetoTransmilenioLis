@@ -37,7 +37,7 @@ SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 MODEL_DIR = os.getenv("MODEL_DIR", "models/xgboost")
 MODEL_BUCKET = "models"
-LAGS = (1, 2, 4, 96, 672)
+LAGS = (1, 2, 4, 96)
 # Direct multi-horizon forecasting: one model per +15/+30/+45/+60min target
 # instead of one model recursively fed forward. Each horizon's lag features
 # are anchored to the same reference point (data_cutoff / the observation
@@ -102,64 +102,25 @@ def _model_params(station_id: str) -> dict:
     return STATION_MODEL_PARAMS.get(station_id, DEFAULT_MODEL_PARAMS)
 
 
-# lag_672 (a full week back) anchors every model to "what happened at this
-# same time last week" - a good default, but actively wrong while a
-# station's demand pattern is genuinely shifting (05100's multi-hour
-# collapses are the clearest case). Tested 2026-09-26 via two INDEPENDENT
-# chronological folds (70-85% and the standard last-15%), each per station
-# per horizon: comparing the untouched baseline against (a) fully dropping
-# lag_672 from the feature set and (b) softly down-weighting it (weight 0.2,
-# with colsample_bynode=0.8 so the weight has any effect at all - XGBoost's
-# feature_weights is a no-op at the default colsample=1.0). A candidate only
-# earns a spot below if it beat the baseline by >= MIN_LAG672_IMPROVEMENT_PP
-# on BOTH folds independently, not just one - the same discipline used
-# everywhere else in this file, because plenty of station/horizon pairs
-# looked like a big win on a single split and then didn't repeat on the
-# second one. Full removal was tried first (it's simpler and usually at
-# least as good as the soft weight); the soft weight only got used where
-# removal itself didn't clear the bar on both folds but down-weighting did.
-# Most stations cleared neither test on any horizon and keep the untouched
-# 9-feature baseline.
-MIN_LAG672_IMPROVEMENT_PP = 0.3
-LAGS_WITHOUT_672 = tuple(lag for lag in LAGS if lag != 672)
-NO_LAG672_MODELS: set[tuple[str, int]] = {
-    ("05100", 3),
-    ("06111", 2),
-    ("06111", 3),
-    ("07111", 2),
-    ("09122", 1),
-    ("09122", 2),
-    ("09122", 4),
-}
-SOFT_DEEMPHASIZE_LAG672_MODELS: set[tuple[str, int]] = {
-    ("05000", 2),
-}
-SOFT_DEEMPHASIZE_LAG672_PARAMS = {"colsample_bynode": 0.8, "lag_672_weight": 0.2}
-
-
-def lags_for(station_id: str, horizon: int) -> tuple:
-    """Which lag features this station's model for this horizon was (or will
-    be) trained on - lag_672 dropped entirely for the pairs proven to need
-    it, unchanged for everyone else. Soft-deemphasized pairs still use every
-    lag; only their training weights differ, not their feature count, so
-    they aren't listed here."""
-    return LAGS_WITHOUT_672 if (station_id, horizon) in NO_LAG672_MODELS else LAGS
-
-
-def _feature_weight_kwargs(station_id: str, horizon: int, lags: tuple) -> dict:
-    """Extra XGBRegressor kwargs for the soft lag_672 down-weight, empty for
-    every other station/horizon (including the ones that drop lag_672
-    entirely - they need no weighting, it's just not in their feature set)."""
-    if (station_id, horizon) not in SOFT_DEEMPHASIZE_LAG672_MODELS:
-        return {}
-    weight = SOFT_DEEMPHASIZE_LAG672_PARAMS["lag_672_weight"]
-    weights = [weight if lag == 672 else 1.0 for lag in lags] + [1.0, 1.0, 1.0, 1.0]
-    return {
-        "colsample_bynode": SOFT_DEEMPHASIZE_LAG672_PARAMS["colsample_bynode"],
-        "feature_weights": weights,
-    }
-
-
+# lag_672 (a full week back) was dropped from LAGS entirely on 2026-09-27,
+# for every station and horizon. It had already been removed or down-
+# weighted for a handful of pairs (a per-pair NO_LAG672_MODELS/
+# SOFT_DEEMPHASIZE_LAG672_MODELS set, tested 2026-09-26 via two independent
+# chronological folds), but re-running that same two-fold test with the data
+# accumulated since then showed full removal now clears the improvement bar
+# (>=0.3pp on both folds) for far more pairs than the original 7 - roughly
+# 15 more, including most of 05100 (whose known multi-hour demand collapses
+# make "what happened this same time last week" actively misleading) - and
+# a down-weighted lag_672 never once beat full removal head-to-head anywhere
+# it was tried. Rather than maintain an ever-growing per-pair exception
+# list, lag_672 is now simply out of the shared LAGS tuple for every model.
+# A few pairs (e.g. 09000, 07105 h4) individually preferred keeping it, but
+# the loss there is small and a single consistent feature set for every
+# model removes an entire class of bug: the feature-shape mismatches from
+# some models expecting 8 features and others 9 caused a real ~48min
+# submissions outage on 2026-09-26 (see submit_xgboost.py/collector.py -
+# they used to need lags_for() specifically to avoid this).
+#
 # Inference-time bias correction, applied on top of a station's raw model
 # output at submission time - not a training change, and never touches what
 # gets stored as "prediction" in Temp/Original Data (that stays the raw
@@ -363,9 +324,8 @@ def _train_station_horizon_model(station_id: str, horizon: int, frame: pd.DataFr
     the original single-step model exactly.
     """
     y = frame.demand.astype(float)
-    lags = lags_for(station_id, horizon)
     lagged = pd.concat(
-        {f"lag_{lag}": y.shift(horizon + lag - 1) for lag in lags}, axis=1
+        {f"lag_{lag}": y.shift(horizon + lag - 1) for lag in LAGS}, axis=1
     )
     calendar = pd.DataFrame(
         [temporal_features(value) for value in frame["observed_at"]],
@@ -380,7 +340,6 @@ def _train_station_horizon_model(station_id: str, horizon: int, frame: pd.DataFr
         random_state=42,
         n_jobs=-1,
         **_model_params(station_id),
-        **_feature_weight_kwargs(station_id, horizon, lags),
     )
     model.fit(features.loc[valid], y.loc[valid])
     os.makedirs(MODEL_DIR, exist_ok=True)
