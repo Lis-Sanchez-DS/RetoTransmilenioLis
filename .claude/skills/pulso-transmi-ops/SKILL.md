@@ -28,10 +28,12 @@ Two long-lived GitHub Actions workflows, each self-looping internally
   every ~5 min. Discovers the current open forecast cycle and submits
   4-horizon predictions per station.
 
-Both download models fresh from Supabase Storage on every loop iteration
+Both check for fresh models from Supabase Storage on every loop iteration
 via `scripts/download_models.sh` (not just once at job start) - this matters
 because a drift retrain mid-run needs to reach the *other* long-running job
-quickly, not after it happens to restart hours later.
+quickly, not after it happens to restart hours later. As of 2026-09-26 this
+check is incremental (see "Egress bandwidth incident" below) - it only
+actually downloads a model file when it changed, not all 48 every time.
 
 ### Data model (Supabase Postgres, via `app/db.py`)
 
@@ -301,10 +303,43 @@ last successful collector run is older than `HEARTBEAT_STALE_AFTER_MINUTES`
 `main()` so it exits non-zero and the workflow's fail-counter picks it up,
 surfacing in the Actions tab.
 
+### Egress bandwidth incident (2026-09-26) and incremental model sync
+
+Supabase emailed a Fair Use Policy warning: the project's egress bandwidth
+had blown well past the free tier's quota. The cause was
+`scripts/download_models.sh`, which used to unconditionally re-download all
+48 model files (~19MB total) via `curl` on **every single loop iteration**
+of both workflows - not just at job start. With collector looping every 30
+min (48 times/day) and submissions every 5 min (288 times/day), that's 336
+full re-downloads/day - about 6.1GB/day, ~184GB/month, roughly 35x a typical
+5GB/month free-tier egress cap, even though most of those downloads fetched
+byte-identical files.
+
+Fixed by making the sync incremental (`scripts/download_models.py`, called
+by the still-named `scripts/download_models.sh` wrapper so the workflows
+didn't need to change): one Storage `list` call per loop iteration fetches
+just the metadata (name + `updated_at`) for all 48 files - practically free,
+no model bytes transferred - and it's compared against a local manifest
+(`models/xgboost/.manifest.json`) of what was downloaded last. Only files
+whose `updated_at` actually changed (or that are missing locally) get a real
+`GET` and count against egress. A drift retrain still propagates to the
+other job within one loop iteration, same as before - only now that
+iteration downloads the ~4 files that changed (one station's 4 horizons),
+not all 48. The manifest lives alongside the models in the same job's
+filesystem, so it persists across loop iterations within a single ~5.75h
+job run and is naturally rebuilt from scratch (one full download) whenever
+`actions/checkout` resets the workspace on the next job restart - same
+cadence as before, just no longer on every 5-minute tick.
+
+Don't reintroduce an unconditional re-download loop here - if this needs
+revisiting (e.g. a different model storage backend), preserve the
+"only fetch what actually changed" property, since that's what the whole
+fix is protecting.
+
 ### Network resilience (`app/net.py`)
 
 `with_retries()` wraps outbound HTTP calls (both to the Pulso API and, via
-`curl --retry` in `scripts/download_models.sh`, to Supabase Storage).
+`scripts/download_models.py`, to Supabase Storage).
 It retries only **transient** failures (DNS, timeout, connection refused) -
 3 attempts, exponential backoff 5s/10s/20s - and raises `UpstreamUnavailable`
 if still failing. Real application errors (HTTP 4xx/5xx, bad auth,

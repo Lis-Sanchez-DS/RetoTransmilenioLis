@@ -21,10 +21,15 @@ loop interno:
   cada ~5 min: descubre el ciclo de pronóstico abierto y envía las 4
   predicciones por estación.
 
-Ambos workflows re-descargan los modelos desde Supabase Storage en cada
+Ambos workflows verifican si hay modelos nuevos en Supabase Storage en cada
 vuelta de su loop interno (`scripts/download_models.sh`), no solo al inicio
 del job - así un reentrenamiento por drift llega al otro job en minutos, sin
-esperar a que ese job se reinicie horas después.
+esperar a que ese job se reinicie horas después. Esta verificación es
+incremental: solo descarga los archivos cuyo `updated_at` cambió desde la
+última vuelta (comparando contra un manifiesto local), no los 48 archivos
+completos cada vez - antes sí lo hacía, lo que generaba ~184GB/mes de
+egress y disparó un aviso de Fair Use Policy de Supabase (ver
+`.claude/skills/pulso-transmi-ops/SKILL.md`).
 
 `GET /v1/forecast-cycles/current` con 404 (`no_open_cycle`) es un estado
 normal de "entre ventanas", no un error. Un modelo faltante o sin historia
@@ -88,7 +93,8 @@ database/
   migrations/*.sql            migraciones aplicadas incrementalmente sobre la base real en Supabase
 
 scripts/
-  download_models.sh         descarga los 48 archivos de modelo (12 estaciones x 4 horizontes) desde Supabase Storage
+  download_models.sh         wrapper que llama a download_models.py
+  download_models.py         sincroniza (de forma incremental) los 48 archivos de modelo (12 estaciones x 4 horizontes) desde Supabase Storage - solo descarga los que cambiaron desde la última vuelta, comparando contra un manifiesto local
 
 models/xgboost/               modelos entrenados, excluidos de Git por tamaño; viven en Supabase Storage
 docs/figures/                  gráficas del análisis exploratorio
