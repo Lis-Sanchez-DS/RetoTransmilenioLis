@@ -204,6 +204,48 @@ def test_check_and_retrain_never_drops_history(monkeypatch, tmp_path):
     assert "prediction" in promote_query
 
 
+def test_check_and_retrain_skips_station_below_min_new_points(monkeypatch, tmp_path):
+    """A station that's below ACCURACY_THRESHOLD but has only a small trickle
+    of new "Temp" rows (fewer than MIN_NEW_FOR_RETRAIN) should NOT retrain.
+
+    This is the fix for the 2026-09-27 incident: has_pending_data() gates
+    the drift check on "Temp has anything at all, for any station" so a
+    stalled feed never blocks retraining forever, but without this
+    per-station minimum, that meant a handful of new rows (as few as 1-2)
+    was enough to trigger a full 4-horizon retrain + 4 Supabase uploads for
+    a chronically-drifted station on almost every ~30min collector cycle.
+    """
+    station = "A"
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    historical_rows = [
+        (start + timedelta(minutes=15 * i), 100 + (i % 20)) for i in range(700)
+    ]
+    # Below MIN_NEW_FOR_RETRAIN (20): a real trickle, but not enough to
+    # justify spending a retrain on it yet.
+    temp_recent_rows = [
+        (start + timedelta(minutes=15 * (700 + i)), 100 + (i % 20)) for i in range(5)
+    ]
+    temp_accuracy_rows = [(station, demand, demand * 0.7) for _, demand in temp_recent_rows]
+
+    fake_conn = RoutedFakeConnection(temp_accuracy_rows, historical_rows, temp_recent_rows)
+    monkeypatch.setattr("app.drift.connection", lambda: fake_conn)
+    monkeypatch.setattr("app.drift.MODEL_DIR", str(tmp_path))
+    monkeypatch.setattr("app.drift.SUPABASE_URL", "https://fake.supabase.co")
+    monkeypatch.setattr("app.drift.SUPABASE_SERVICE_ROLE_KEY", "fake-service-role-key")
+    uploads = []
+    _fake_upload(monkeypatch, uploads)
+
+    retrained = check_and_retrain()
+
+    assert retrained == []
+    assert uploads == []
+    assert list(tmp_path.iterdir()) == []
+    queries_with_params = [(q, p) for q, p in fake_conn.executed]
+    assert not any('INSERT INTO "Original Data"' in q for q, _ in queries_with_params)
+    assert not any('DELETE FROM "Temp"' in q for q, _ in queries_with_params)
+
+
 def test_station_ewma_bias_tracks_a_sustained_miss(monkeypatch):
     """A station whose model has been consistently overpredicting should get
     a negative correction, growing as the miss persists across more points -

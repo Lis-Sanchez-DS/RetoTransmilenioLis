@@ -54,6 +54,21 @@ ACCURACY_THRESHOLD = 0.85
 RECENT_CHECKS = 4
 MIN_DATAPOINTS = RECENT_CHECKS
 
+# A drifted station only actually retrains once at least this many new rows
+# have piled up in "Temp" - not merely "more than zero". has_pending_data()
+# (below) deliberately keeps re-running the drift check as long as Temp has
+# anything at all in it, for any station, so a stalled feed never blocks
+# retraining forever (see its docstring) - but without this second gate,
+# that meant a station already below ACCURACY_THRESHOLD got fully retrained
+# (4 horizons, 4 Supabase uploads) on almost every ~30min collector cycle
+# off as few as 1-2 new rows against a ~5000-row history: real cost, no
+# real change to the model, and the actual cause of the Supabase egress
+# spike from 2026-09-26. This does not reintroduce the old "blocked
+# forever" bug: as long as new data keeps trickling in at all, the count
+# keeps growing and eventually clears this bar - it just stops spending a
+# full retrain on every single trickle.
+MIN_NEW_FOR_RETRAIN = 20
+
 # Chosen per station via walk-forward CV grid search restricted to the train
 # split (2026-09-25): every station's own CV picked a smaller/slower model
 # than the previous shared 400-estimator/40-leaf/reg_lambda=1.0 default, but
@@ -222,6 +237,12 @@ def has_pending_data() -> bool:
     retrained and promoted), but keeps checking as long as there's
     unprocessed data to evaluate, regardless of whether new rows arrived
     this exact cycle.
+
+    This is a cheap, global (not per-station) short-circuit only - it does
+    not by itself decide which stations actually get retrained. That
+    decision still runs per station inside check_and_retrain(), which
+    additionally requires MIN_NEW_FOR_RETRAIN new rows for that specific
+    station before spending a real retrain on it.
     """
     with connection() as conn:
         return conn.execute('SELECT 1 FROM "Temp" LIMIT 1').fetchone() is not None
@@ -388,7 +409,7 @@ def check_and_retrain() -> list[str]:
     retrained = []
     for station_id in drifted:
         recent = _fetch_recent(station_id)
-        if not recent:
+        if len(recent) < MIN_NEW_FOR_RETRAIN:
             continue
 
         frame = _training_frame(station_id, recent)
