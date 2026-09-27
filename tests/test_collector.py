@@ -210,3 +210,51 @@ def test_predict_records_reads_history_from_both_tables(monkeypatch):
     assert len(result) == 1
     _, prediction = result[0]
     assert prediction == 42.0
+
+
+def test_predict_records_only_queries_needed_lag_timestamps(monkeypatch):
+    """predict_records() must ask the DB for exactly the (station, timestamp)
+    points its lag features can need, not "give me this station's entire
+    history" - fetching everything just to read ~5 points was one of the two
+    largest sources of Supabase DB egress (see the matching fix in
+    submit_xgboost.py). Locks in the query params actually sent.
+    """
+    station = "A"
+    ts = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+    captured = []
+
+    class FakeConnection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def execute(self, query, params=None):
+            captured.append((query, params))
+            self._result = []
+            return self
+
+        def fetchall(self):
+            return self._result
+
+    class FakeModel:
+        def predict(self, features):
+            return [0.0]
+
+    monkeypatch.setattr("app.collector.connection", lambda: FakeConnection())
+    monkeypatch.setattr("app.collector.joblib.load", lambda path: FakeModel())
+
+    record = {"station_id": station, "observed_at": ts.isoformat(), "demand": 10}
+    try:
+        predict_records([record])
+    except RuntimeError:
+        pass  # expected: FakeConnection returns no rows, so every lag is "missing"
+
+    queries = [(q, p) for q, p in captured if "station_id = ANY" in q]
+    assert len(queries) == 2  # "Original Data" + "Temp"
+    expected_timestamps = sorted(ts - timedelta(minutes=15 * lag) for lag in LAGS)
+    for _, params in queries:
+        station_ids, timestamps = params
+        assert station_ids == [station]
+        assert sorted(timestamps) == expected_timestamps

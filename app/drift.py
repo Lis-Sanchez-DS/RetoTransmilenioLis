@@ -22,6 +22,7 @@ uno entrenado solo con una ventana reciente, en 12/12 estaciones. No
 reintroducir un recorte de historia sin repetir esa comparación.)
 """
 
+import math
 import os
 
 import joblib
@@ -190,32 +191,58 @@ def _ewma_params(station_id: str) -> dict:
     return STATION_EWMA_PARAMS.get(station_id, DEFAULT_EWMA_PARAMS)
 
 
+# An EWMA's weight on a residual n steps back decays geometrically as
+# (1-alpha)^n, so a station's FULL history (tens of thousands of rows and
+# growing) contributes essentially nothing beyond its most recent ~100-150
+# points at alpha=0.2 - fetching all of it anyway (as station_ewma_bias used
+# to, once per station per submission cycle, every ~5min) was one of the
+# largest sources of Supabase DB egress. _ewma_lookback_rows() picks a row
+# count small enough to matter for egress but large enough that the result
+# is numerically indistinguishable (within EWMA_TRUNCATION_EPSILON) from
+# using the complete, unbounded history - derived from that station's own
+# alpha rather than hardcoded, so it stays correct even if a future
+# STATION_EWMA_PARAMS override ever picks a much slower-decaying alpha.
+EWMA_TRUNCATION_EPSILON = 1e-9
+
+
+def _ewma_lookback_rows(alpha: float) -> int:
+    return max(50, math.ceil(math.log(EWMA_TRUNCATION_EPSILON) / math.log(1 - alpha)))
+
+
 def station_ewma_bias(station_id: str) -> float:
     """The correction to ADD to a station's raw model prediction right now.
 
     Tracks a causal (no-lookahead) exponentially-weighted average of that
-    station's own (actual - predicted) residuals, using every real-time
-    prediction/actual pair on record across "Original Data" and "Temp" in
-    chronological order - the same source drift.py's own accuracy signal
-    reads. Reacts within one collector cycle to a real, sustained miss
+    station's own (actual - predicted) residuals, using that station's most
+    recent prediction/actual pairs across "Original Data" and "Temp" - the
+    same source drift.py's own accuracy signal reads - in chronological
+    order. Reacts within one collector cycle to a real, sustained miss
     (like 05100's collapse) instead of waiting for a full drift-triggered
     retrain, which can take hours or - while the upstream feed is stalled -
     may not be able to fire at all.
+
+    Only the last _ewma_lookback_rows(alpha) rows are fetched (DESC, then
+    reversed back to chronological order below) - see that function for why
+    this doesn't change the result in any way that matters.
     """
+    params = _ewma_params(station_id)
+    alpha = params["alpha"]
     with connection() as conn:
         rows = conn.execute(
-            """SELECT observed_at, demand, prediction FROM "Original Data"
-               WHERE station_id = %s AND prediction IS NOT NULL
-               UNION ALL
-               SELECT observed_at, demand, prediction FROM "Temp"
-               WHERE station_id = %s AND prediction IS NOT NULL
-               ORDER BY observed_at""",
-            (station_id, station_id),
+            """SELECT observed_at, demand, prediction FROM (
+                   SELECT observed_at, demand, prediction FROM "Original Data"
+                   WHERE station_id = %s AND prediction IS NOT NULL
+                   UNION ALL
+                   SELECT observed_at, demand, prediction FROM "Temp"
+                   WHERE station_id = %s AND prediction IS NOT NULL
+               ) recent
+               ORDER BY observed_at DESC
+               LIMIT %s""",
+            (station_id, station_id, _ewma_lookback_rows(alpha)),
         ).fetchall()
     if not rows:
         return 0.0
-    params = _ewma_params(station_id)
-    alpha = params["alpha"]
+    rows.reverse()  # DESC from the query -> chronological, oldest first
     bias = 0.0
     for _, demand, prediction in rows:
         residual = float(demand) - float(prediction)

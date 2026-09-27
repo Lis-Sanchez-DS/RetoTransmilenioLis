@@ -274,3 +274,69 @@ def test_station_ewma_bias_zero_with_no_history(monkeypatch):
     monkeypatch.setattr("app.drift.connection", lambda: FakeConnection([]))
 
     assert station_ewma_bias("A") == 0.0
+
+
+def test_station_ewma_bias_processes_rows_in_chronological_order(monkeypatch):
+    """The query now asks for the most recent rows in DESCENDING order (so a
+    LIMIT can bound how much history gets pulled), but the EWMA recursion is
+    order-sensitive and must run oldest-to-newest. Uses distinct (non-
+    constant) residuals, where getting the reversal wrong would produce a
+    different number - a fixture where all residuals are equal (as in the
+    other tests here) can't actually catch a broken reversal.
+    """
+    # Rows exactly as the DB would return them under the new query: newest first.
+    rows_desc = [
+        ("2026-01-01T00:30:00Z", 100.0, 150.0),  # residual -50, newest
+        ("2026-01-01T00:15:00Z", 100.0, 120.0),  # residual -20
+        ("2026-01-01T00:00:00Z", 100.0, 100.0),  # residual 0, oldest
+    ]
+    monkeypatch.setattr("app.drift.connection", lambda: FakeConnection(list(rows_desc)))
+
+    bias = station_ewma_bias("A")
+
+    alpha, damping = 0.2, 0.5
+    expected_raw = 0.0
+    for _, demand, prediction in reversed(rows_desc):  # oldest to newest
+        expected_raw = alpha * (demand - prediction) + (1 - alpha) * expected_raw
+    assert bias == damping * expected_raw
+
+    # Pin down that processing DB order (newest-first) without reversing
+    # really would give a different number for this fixture, so this test
+    # would actually fail if the reversal were ever removed by mistake.
+    wrong_order_raw = 0.0
+    for _, demand, prediction in rows_desc:
+        wrong_order_raw = alpha * (demand - prediction) + (1 - alpha) * wrong_order_raw
+    assert damping * wrong_order_raw != bias
+
+
+def test_ewma_lookback_rows_bounds_query_and_stays_accurate(monkeypatch):
+    """station_ewma_bias() must ask the DB for a bounded number of rows (via
+    LIMIT), not a station's entire history - fetching everything just to
+    feed a fast-decaying EWMA (alpha=0.2 makes anything past ~100 rows back
+    numerically irrelevant) was one of the two largest sources of Supabase
+    DB egress. Also checks the derived lookback is sane for a slower-decaying
+    alpha, in case a future per-station override ever picks one.
+    """
+    from app.drift import _ewma_lookback_rows, EWMA_TRUNCATION_EPSILON
+
+    captured = {}
+
+    class CapturingConnection(FakeConnection):
+        def execute(self, query, params=None):
+            captured["query"] = query
+            captured["params"] = params
+            return super().execute(query, params)
+
+    monkeypatch.setattr("app.drift.connection", lambda: CapturingConnection([]))
+
+    station_ewma_bias("A")
+
+    assert "LIMIT" in captured["query"]
+    default_alpha = 0.2
+    assert captured["params"][-1] == _ewma_lookback_rows(default_alpha)
+    # Sanity on the math itself: truncating at the derived lookback really
+    # does leave less than EWMA_TRUNCATION_EPSILON of the total weight
+    # unaccounted for, regardless of which alpha is plugged in.
+    for alpha in (0.2, 0.05, 0.5):
+        lookback = _ewma_lookback_rows(alpha)
+        assert (1 - alpha) ** lookback < EWMA_TRUNCATION_EPSILON

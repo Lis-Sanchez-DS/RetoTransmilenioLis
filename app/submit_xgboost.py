@@ -133,6 +133,18 @@ def submit_current_cycle() -> dict | None:
         if exc.response is not None and exc.response.status_code == 404:
             return None
         raise
+    cutoff = _parse_utc(cycle["data_cutoff"])
+    station_ids = sorted({target["station_id"] for target in cycle["targets"]})
+    # Every target's lag features only ever look up cutoff - 15*(lag-1)
+    # minutes for lag in LAGS (predict_cycle_targets, same anchor for every
+    # horizon) - a handful of specific timestamps shared by every station in
+    # the cycle, never anything else. Pulling the two full tables here
+    # instead (as before) meant re-transferring ALL of "Original Data" -
+    # tens of thousands of rows and growing - on every ~5min submissions
+    # tick, by far the largest source of Supabase DB egress. Filtering by
+    # the exact points needed cuts that to at most len(station_ids)*len(LAGS)
+    # rows per table.
+    needed_timestamps = [cutoff - timedelta(minutes=15 * (lag - 1)) for lag in LAGS]
     with connection() as conn:
         # "Temp" holds every observation collected since the last drift
         # retrain for a station (see drift.py); only drifted stations ever
@@ -140,19 +152,20 @@ def submit_current_cycle() -> dict | None:
         # any non-drifted station's history goes stale the moment new data
         # stops landing in "Original Data".
         original = conn.execute(
-            'SELECT station_id, observed_at, demand FROM "Original Data" WHERE observed_at <= %s',
-            (cycle["data_cutoff"],),
+            'SELECT station_id, observed_at, demand FROM "Original Data" '
+            'WHERE station_id = ANY(%s) AND observed_at = ANY(%s)',
+            (station_ids, needed_timestamps),
         ).fetchall()
         recent = conn.execute(
-            'SELECT station_id, observed_at, demand FROM "Temp" WHERE observed_at <= %s',
-            (cycle["data_cutoff"],),
+            'SELECT station_id, observed_at, demand FROM "Temp" '
+            'WHERE station_id = ANY(%s) AND observed_at = ANY(%s)',
+            (station_ids, needed_timestamps),
         ).fetchall()
     history = {
         (station_id, _parse_utc(observed_at)): float(demand)
         for station_id, observed_at, demand in original + recent
     }
 
-    station_ids = sorted({target["station_id"] for target in cycle["targets"]})
     models = {
         (station_id, horizon): joblib.load(os.path.join(MODEL_DIR, f"xgboost_{station_id}_h{horizon}.joblib"))
         for station_id in station_ids

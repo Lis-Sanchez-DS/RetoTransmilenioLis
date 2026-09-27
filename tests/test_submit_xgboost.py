@@ -221,3 +221,55 @@ def test_submit_current_cycle_applies_ewma_bias_correction(monkeypatch):
     submit_current_cycle()
 
     assert captured_payload["predictions"][0]["value"] == 32.0
+
+
+def test_submit_current_cycle_queries_only_needed_lag_timestamps(monkeypatch):
+    """submit_current_cycle() must ask the DB for exactly the lag timestamps
+    this cycle's targets can need, not the entire "Original Data"/"Temp"
+    tables - that unbounded read (tens of thousands of rows, every ~5min)
+    was the single largest source of Supabase DB egress. Locks in the query
+    params actually sent.
+    """
+    station = "A"
+    cutoff = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+    target_ts = cutoff + timedelta(minutes=15)
+    cycle = {
+        "cycle_id": "cycle-1",
+        "data_cutoff": cutoff.isoformat(),
+        "targets": [{"station_id": station, "target_at": target_ts.isoformat()}],
+    }
+    captured = []
+
+    class FakeConnection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def execute(self, query, params=None):
+            captured.append((query, params))
+            self._rows = []
+            return self
+
+        def fetchall(self):
+            return self._rows
+
+    monkeypatch.setattr("app.submit_xgboost.collect_new_data", lambda: {"collected": 0, "inserted": 0, "pages": 1, "cursor": None})
+    monkeypatch.setattr("app.submit_xgboost.api_get", lambda path: cycle if "current" in path else {"display_name": "x"})
+    monkeypatch.setattr("app.submit_xgboost.connection", lambda: FakeConnection())
+    monkeypatch.setattr("app.submit_xgboost.API_KEY", "test-key", raising=False)
+    monkeypatch.setattr("app.submit_xgboost.joblib.load", lambda path: object())
+
+    try:
+        submit_current_cycle()
+    except RuntimeError:
+        pass  # expected: FakeConnection returns no rows, so no station has enough history
+
+    queries = [(q, p) for q, p in captured if "station_id = ANY" in q]
+    assert len(queries) == 2  # "Original Data" + "Temp"
+    expected_timestamps = sorted(cutoff - timedelta(minutes=15 * (lag - 1)) for lag in LAGS)
+    for _, params in queries:
+        station_ids, timestamps = params
+        assert station_ids == [station]
+        assert sorted(timestamps) == expected_timestamps

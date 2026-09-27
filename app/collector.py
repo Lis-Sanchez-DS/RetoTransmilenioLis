@@ -34,11 +34,29 @@ def get_cursor() -> str | None:
     return row[0] if row else None
 
 
+def _parse_ts(observed_at) -> datetime:
+    ts = observed_at if isinstance(observed_at, datetime) else datetime.fromisoformat(observed_at.replace("Z", "+00:00"))
+    return ts if ts.tzinfo is not None else ts.replace(tzinfo=timezone.utc)
+
+
 def predict_records(records: list[dict]) -> list[tuple[dict, float]]:
     """Predict each new observation using its station's saved XGBoost model."""
     if not records:
         return []
-    station_ids = sorted({item["station_id"] for item in records})
+    parsed = [(item, _parse_ts(item["observed_at"])) for item in records]
+    station_ids = sorted({item["station_id"] for item, _ in parsed})
+    # Each record's lag features only ever look up ts - 15*lag minutes for
+    # lag in lags_for(station, 1) - a small, known set of timestamps, never
+    # anything else. Pulling each station's ENTIRE history here instead (as
+    # before) to resolve a handful of lag points was one of the two largest
+    # sources of Supabase DB egress (see submit_xgboost.py's matching fix,
+    # same root cause) - a station's history can be tens of thousands of
+    # rows and growing, transferred in full just to read ~5 of them.
+    needed_timestamps = sorted({
+        ts - timedelta(minutes=15 * lag)
+        for item, ts in parsed
+        for lag in lags_for(item["station_id"], 1)
+    })
     with connection() as conn:
         # "Temp" holds every observation collected since a station's last
         # drift retrain (see drift.py); only drifted stations ever get
@@ -47,13 +65,13 @@ def predict_records(records: list[dict]) -> list[tuple[dict, float]]:
         # once a run's own batch is too small to bridge the gap itself.
         original_rows = conn.execute(
             'SELECT station_id, observed_at, demand FROM "Original Data" '
-            'WHERE station_id = ANY(%s)',
-            (station_ids,),
+            'WHERE station_id = ANY(%s) AND observed_at = ANY(%s)',
+            (station_ids, needed_timestamps),
         ).fetchall()
         temp_rows = conn.execute(
             'SELECT station_id, observed_at, demand FROM "Temp" '
-            'WHERE station_id = ANY(%s)',
-            (station_ids,),
+            'WHERE station_id = ANY(%s) AND observed_at = ANY(%s)',
+            (station_ids, needed_timestamps),
         ).fetchall()
     history = {
         (station, observed_at): float(demand)
@@ -69,11 +87,7 @@ def predict_records(records: list[dict]) -> list[tuple[dict, float]]:
         for station_id in station_ids
     }
     predictions = []
-    for item in records:
-        observed_at = item["observed_at"]
-        ts = observed_at if isinstance(observed_at, datetime) else datetime.fromisoformat(observed_at.replace("Z", "+00:00"))
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=timezone.utc)
+    for item, ts in parsed:
         features = []
         for lag in lags_for(item["station_id"], 1):
             key = (item["station_id"], ts - timedelta(minutes=15 * lag))
