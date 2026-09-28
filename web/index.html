@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Pulso TransMi — Panel de desempeño</title>
+<meta name="description" content="Panel de solo lectura sobre Supabase para el pipeline Pulso TransMi." />
+<link rel="stylesheet" href="style.css" />
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+</head>
+<body>
+  <header>
+    <h1>Pulso TransMi — Panel de desempeño</h1>
+    <p class="caption">
+      Panel estático de solo lectura: este sitio no tiene servidor propio, consulta
+      Supabase directamente desde el navegador con una llave pública de solo lectura.
+      No afecta el pipeline de collector/submissions que corre en GitHub Actions.
+      Las métricas de accuracy se calculan sobre el nowcast h1 registrado para
+      monitoreo de drift, no sobre las 4 predicciones reales de cada submission.
+    </p>
+  </header>
+
+  <nav class="tabs" id="tabs">
+    <button class="tab-btn active" data-tab="overview">Resumen general</button>
+    <button class="tab-btn" data-tab="station">Detalle por estación</button>
+    <button class="tab-btn" data-tab="health">Drift y salud del pipeline</button>
+  </nav>
+
+  <main id="loading" class="loading">Cargando datos desde Supabase…</main>
+  <main id="error" class="error" hidden></main>
+
+  <main id="content" hidden>
+    <section id="tab-overview" class="tab-panel active">
+      <div class="kpi-row">
+        <div class="kpi"><span class="kpi-label">Accuracy promedio (todas las estaciones)</span><span class="kpi-value" id="kpi-accuracy">—</span></div>
+        <div class="kpi"><span class="kpi-label">Estaciones con datos</span><span class="kpi-value" id="kpi-stations">—</span></div>
+        <div class="kpi"><span class="kpi-label">Observaciones con predicción</span><span class="kpi-value" id="kpi-observations">—</span></div>
+        <div class="kpi"><span class="kpi-label">Collector</span><span class="kpi-value" id="kpi-heartbeat">—</span></div>
+      </div>
+      <p class="caption" id="feed-caption"></p>
+
+      <h2>Accuracy por estación (histórico completo)</h2>
+      <div id="chart-bar" class="chart"></div>
+
+      <h2>Tabla completa por estación</h2>
+      <div class="table-wrap"><table id="table-overview"><thead></thead><tbody></tbody></table></div>
+    </section>
+
+    <section id="tab-station" class="tab-panel">
+      <h2>Mapa de estaciones (Bogotá)</h2>
+      <p class="caption">Haz clic en una estación del mapa para seleccionarla — el color indica su accuracy reciente (últimos 4 puntos).</p>
+      <div id="map" class="map"></div>
+
+      <div class="station-select-row">
+        <label for="station-select">Estación (o elige aquí en vez del mapa)</label>
+        <select id="station-select"></select>
+      </div>
+
+      <div class="kpi-row">
+        <div class="kpi"><span class="kpi-label">Accuracy histórica</span><span class="kpi-value" id="st-accuracy-all">—</span></div>
+        <div class="kpi"><span class="kpi-label">Accuracy últimos 20</span><span class="kpi-value" id="st-accuracy-20">—</span></div>
+        <div class="kpi"><span class="kpi-label">Accuracy últimos 4 (gate de drift)</span><span class="kpi-value" id="st-accuracy-4">—</span></div>
+        <div class="kpi"><span class="kpi-label">Puntos observados</span><span class="kpi-value" id="st-npoints">—</span></div>
+      </div>
+      <p class="warning" id="st-drift-warning" hidden></p>
+
+      <label for="window-slider">Ventana de puntos recientes a graficar: <span id="window-value"></span></label>
+      <input type="range" id="window-slider" min="50" max="2000" step="10" />
+
+      <div id="chart-series" class="chart"></div>
+      <div id="chart-rolling" class="chart"></div>
+    </section>
+
+    <section id="tab-health" class="tab-panel">
+      <h2>Heartbeat del collector</h2>
+      <div id="health-heartbeat"></div>
+      <div class="table-wrap"><table id="table-jobs"><thead></thead><tbody></tbody></table></div>
+
+      <h2>Estaciones elegibles para reentrenamiento por drift</h2>
+      <div class="table-wrap"><table id="table-drift"><thead></thead><tbody></tbody></table></div>
+      <p class="caption">
+        El gate real de reentrenamiento en producción también exige que "Temp" tenga
+        datos pendientes (has_pending_data()); esta tabla solo muestra el criterio de
+        accuracy, no el gate completo.
+      </p>
+    </section>
+  </main>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/plotly.js-dist-min@2.35.2/plotly.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <script src="config.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
