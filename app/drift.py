@@ -185,10 +185,16 @@ def station_ewma_bias(station_id: str) -> float:
 
     Only the last _ewma_lookback_rows(alpha) rows are fetched (DESC, then
     reversed back to chronological order below) - see that function for why
-    this doesn't change the result in any way that matters.
+    this doesn't change the result in any way that matters. A station with
+    the CUSUM boost currently on (see _is_cusum_enabled) needs a longer
+    lookback than that - CUSUM_LOOKBACK_ROWS - since it also has to cover the
+    rolling std window and the longest cooldown an alarm could still be
+    "inside" of.
     """
     params = _ewma_params(station_id)
     alpha = params["alpha"]
+    cusum_enabled = _is_cusum_enabled(station_id)
+    lookback = max(_ewma_lookback_rows(alpha), CUSUM_LOOKBACK_ROWS) if cusum_enabled else _ewma_lookback_rows(alpha)
     with connection() as conn:
         rows = conn.execute(
             """SELECT observed_at, demand, prediction FROM (
@@ -200,12 +206,12 @@ def station_ewma_bias(station_id: str) -> float:
                ) recent
                ORDER BY observed_at DESC
                LIMIT %s""",
-            (station_id, station_id, _ewma_lookback_rows(alpha)),
+            (station_id, station_id, lookback),
         ).fetchall()
     if not rows:
         return 0.0
     rows.reverse()  # DESC from the query -> chronological, oldest first
-    if station_id in CUSUM_ENABLED_STATIONS:
+    if cusum_enabled:
         return _cusum_adaptive_bias(rows, params, CUSUM_ADAPTIVE_PARAMS)
     bias = 0.0
     for _, demand, prediction in rows:
@@ -214,10 +220,11 @@ def station_ewma_bias(station_id: str) -> float:
     return params["damping"] * bias
 
 
-# --- CUSUM-adaptive EWMA (regime-shift boost), NOT deployed -----------------
+# --- CUSUM-adaptive EWMA (regime-shift boost) -------------------------------
 #
-# On top of the fixed EWMA above, a station in CUSUM_ENABLED_STATIONS also
-# runs a two-sided CUSUM change-point detector on its standardized residuals.
+# On top of the fixed EWMA above, a station with the boost currently on (per
+# _is_cusum_enabled) also runs a two-sided CUSUM change-point detector on its
+# standardized residuals.
 # While no change point has fired, its behavior is identical to the plain
 # fixed EWMA above. Once CUSUM fires (a real, sustained deviation - not
 # routine noise), the station switches to a more reactive (alpha, damping)
@@ -238,21 +245,26 @@ def station_ewma_bias(station_id: str) -> float:
 # Re-pooling the search on just those two regressors, to try to fix them
 # specifically, made both WORSE, not better - shrinking the pool to just the
 # problem stations removes the regularizing effect that made pooling work in
-# the first place. So rather than force this config onto stations that
-# structurally don't benefit from it, CUSUM_ENABLED_STATIONS opts in only
-# the stations with a real, fold-consistent gain: 05100 (large), plus 06000
-# and 07111 (small but never meaningfully negative in any fold). The other
-# 9 stations - including the two confirmed regressors - keep using the
-# plain fixed EWMA above, completely untouched by this mechanism.
+# the first place. So the boost config itself stays a single SHARED constant,
+# never re-tuned per station (that's what overfit in the first place) - the
+# only thing that varies per station is whether it's turned on at all.
 #
-# NOT PUSHED TO PRODUCTION as of 2026-09-27: implemented and tested here at
-# the user's request, but deliberately kept off origin/master so nothing
-# about the live pipeline changes until there's an explicit go-ahead to
-# deploy it.
+# CUSUM_ENABLED_STATIONS below is only the bootstrap default (the 3 stations
+# with a real, fold-consistent gain in that first backtest: 05100 large,
+# 06000/07111 small but never negative). Which stations actually have it on
+# is re-decided every time that station retrains, by _update_cusum_enabled_state
+# below - so a station that starts showing 05100-like behavior later earns
+# the boost the next time it retrains, without needing a code change, and one
+# that stops benefiting loses it just as automatically.
 CUSUM_K = 0.5  # standard slack: detect a shift of >= 1 std
 CUSUM_STD_WINDOW = 96  # ~1 day at 15min cadence, causal rolling std for standardizing residuals
 CUSUM_ADAPTIVE_PARAMS = {"boost_alpha": 0.4, "boost_damping": 0.7, "cooldown": 80, "cusum_h": 20.0}
 CUSUM_ENABLED_STATIONS: frozenset[str] = frozenset({"05100", "06000", "07111"})
+# A candidate must beat the plain fixed EWMA by at least this much (on that
+# station's own full recorded prediction history) before retraining flips it
+# on - same margin and rationale as MIN_EWMA_IMPROVEMENT_PP above: a result
+# under a real margin is noise, not a genuine, actionable difference.
+MIN_CUSUM_IMPROVEMENT_PP = 0.5
 # Long enough for the rolling std window plus the longest cooldown a CUSUM
 # alarm could still be "inside" of, plus slack - independent of (and much
 # larger than) the plain-EWMA lookback above, which decays away almost all
@@ -260,42 +272,56 @@ CUSUM_ENABLED_STATIONS: frozenset[str] = frozenset({"05100", "06000", "07111"})
 CUSUM_LOOKBACK_ROWS = CUSUM_STD_WINDOW + CUSUM_ADAPTIVE_PARAMS["cooldown"] + 50
 
 
+def _cusum_step(residual: float, state: dict, boost_params: dict) -> bool:
+    """One causal CUSUM update, mutating `state` (keys: s_pos, s_neg,
+    cooldown_left, window) in place. Returns True the instant an alarm fires
+    on this exact step. Shared by every function below that needs the CUSUM
+    state machine, so the fiddly two-sided-test bookkeeping exists in exactly
+    one place instead of being retyped (and able to drift out of sync) in
+    each caller."""
+    window = state["window"]
+    std = statistics.pstdev(window) if len(window) >= 10 else None
+    alarmed = False
+    if std and std > 1e-6:
+        z = residual / std
+        state["s_pos"] = max(0.0, state["s_pos"] + z - CUSUM_K)
+        state["s_neg"] = max(0.0, state["s_neg"] - z - CUSUM_K)
+        if state["s_pos"] > boost_params["cusum_h"] or state["s_neg"] > boost_params["cusum_h"]:
+            state["cooldown_left"] = boost_params["cooldown"]
+            state["s_pos"] = state["s_neg"] = 0.0
+            alarmed = True
+        elif state["cooldown_left"] > 0:
+            state["cooldown_left"] -= 1
+    elif state["cooldown_left"] > 0:
+        state["cooldown_left"] -= 1
+    window.append(residual)
+    if len(window) > CUSUM_STD_WINDOW:
+        window.pop(0)
+    return alarmed
+
+
+def _new_cusum_state() -> dict:
+    return {"s_pos": 0.0, "s_neg": 0.0, "cooldown_left": 0, "window": []}
+
+
 def _cusum_adaptive_bias(rows: list[tuple], normal_params: dict, boost_params: dict) -> float:
     """Causal (no-lookahead) walk over `rows` (chronological), returning the
     damped bias correction as of the LAST row - same idea as the plain EWMA
     loop above, but with a CUSUM-triggered boosted regime layered on top."""
-    residuals = [float(demand) - float(prediction) for _, demand, prediction in rows]
     normal_alpha, normal_damping = normal_params["alpha"], normal_params["damping"]
     boost_alpha, boost_damping = boost_params["boost_alpha"], boost_params["boost_damping"]
-    cooldown, cusum_h = boost_params["cooldown"], boost_params["cusum_h"]
 
     raw_bias = 0.0
-    s_pos = s_neg = 0.0
-    cooldown_left = 0
     damping = normal_damping
-    window: list[float] = []
+    state = _new_cusum_state()
 
-    for residual in residuals:
-        boosted = cooldown_left > 0
+    for _, demand, prediction in rows:
+        residual = float(demand) - float(prediction)
+        boosted = state["cooldown_left"] > 0
         alpha = boost_alpha if boosted else normal_alpha
         damping = boost_damping if boosted else normal_damping
         raw_bias = alpha * residual + (1 - alpha) * raw_bias
-
-        std = statistics.pstdev(window) if len(window) >= 10 else None
-        if std and std > 1e-6:
-            z = residual / std
-            s_pos = max(0.0, s_pos + z - CUSUM_K)
-            s_neg = max(0.0, s_neg - z - CUSUM_K)
-            if s_pos > cusum_h or s_neg > cusum_h:
-                cooldown_left = cooldown
-                s_pos = s_neg = 0.0
-            elif cooldown_left > 0:
-                cooldown_left -= 1
-        elif cooldown_left > 0:
-            cooldown_left -= 1
-        window.append(residual)
-        if len(window) > CUSUM_STD_WINDOW:
-            window.pop(0)
+        _cusum_step(residual, state, boost_params)
 
     return damping * raw_bias
 
@@ -311,29 +337,11 @@ def _cusum_recently_alarmed(rows: list[tuple]) -> bool:
     rows before they fire, while a real regime shift shows up in CUSUM's
     statistical test point by point, well before either gate would trip on
     its own."""
-    residuals = [float(demand) - float(prediction) for _, demand, prediction in rows]
-    k, h = CUSUM_K, CUSUM_ADAPTIVE_PARAMS["cusum_h"]
-    cooldown = CUSUM_ADAPTIVE_PARAMS["cooldown"]
-    s_pos = s_neg = 0.0
-    cooldown_left = 0
-    window: list[float] = []
-    for residual in residuals:
-        std = statistics.pstdev(window) if len(window) >= 10 else None
-        if std and std > 1e-6:
-            z = residual / std
-            s_pos = max(0.0, s_pos + z - k)
-            s_neg = max(0.0, s_neg - z - k)
-            if s_pos > h or s_neg > h:
-                cooldown_left = cooldown
-                s_pos = s_neg = 0.0
-            elif cooldown_left > 0:
-                cooldown_left -= 1
-        elif cooldown_left > 0:
-            cooldown_left -= 1
-        window.append(residual)
-        if len(window) > CUSUM_STD_WINDOW:
-            window.pop(0)
-    return cooldown_left > 0
+    state = _new_cusum_state()
+    for _, demand, prediction in rows:
+        residual = float(demand) - float(prediction)
+        _cusum_step(residual, state, CUSUM_ADAPTIVE_PARAMS)
+    return state["cooldown_left"] > 0
 
 
 def _station_has_fresh_cusum_alarm(station_id: str) -> bool:
@@ -359,6 +367,125 @@ def _station_has_fresh_cusum_alarm(station_id: str) -> bool:
         return False
     rows.reverse()
     return _cusum_recently_alarmed(rows)
+
+
+def _accuracy_score(abs_err: float, abs_dem: float) -> float:
+    return max(0.0, 1 - abs_err / max(abs_dem, 1.0))
+
+
+def _fixed_ewma_accuracy(rows: list[tuple], normal_params: dict) -> float:
+    """WAPE-based accuracy (matches station_accuracy_stats's own formula) of
+    the plain fixed EWMA over `rows` (chronological) - the baseline that
+    _cusum_would_help compares the CUSUM-boosted regime against."""
+    alpha, damping = normal_params["alpha"], normal_params["damping"]
+    raw_bias = 0.0
+    abs_err = abs_dem = 0.0
+    for _, demand, prediction in rows:
+        demand, prediction = float(demand), float(prediction)
+        corrected = max(0.0, prediction + damping * raw_bias)
+        abs_err += abs(demand - corrected)
+        abs_dem += abs(demand)
+        raw_bias = alpha * (demand - prediction) + (1 - alpha) * raw_bias
+    return _accuracy_score(abs_err, abs_dem)
+
+
+def _cusum_adaptive_accuracy(rows: list[tuple], normal_params: dict, boost_params: dict) -> float:
+    """Same idea as _fixed_ewma_accuracy, but with the CUSUM-boosted regime
+    layered on top - the number _cusum_would_help compares against it."""
+    normal_alpha, normal_damping = normal_params["alpha"], normal_params["damping"]
+    boost_alpha, boost_damping = boost_params["boost_alpha"], boost_params["boost_damping"]
+    raw_bias = 0.0
+    abs_err = abs_dem = 0.0
+    state = _new_cusum_state()
+    for _, demand, prediction in rows:
+        demand, prediction = float(demand), float(prediction)
+        boosted = state["cooldown_left"] > 0
+        alpha = boost_alpha if boosted else normal_alpha
+        damping = boost_damping if boosted else normal_damping
+        corrected = max(0.0, prediction + damping * raw_bias)
+        abs_err += abs(demand - corrected)
+        abs_dem += abs(demand)
+        residual = demand - prediction
+        raw_bias = alpha * residual + (1 - alpha) * raw_bias
+        _cusum_step(residual, state, boost_params)
+    return _accuracy_score(abs_err, abs_dem)
+
+
+def _cusum_would_help(station_id: str) -> bool | None:
+    """Whether the single SHARED CUSUM_ADAPTIVE_PARAMS config would beat the
+    plain fixed EWMA by at least MIN_CUSUM_IMPROVEMENT_PP on this station's
+    own full recorded (demand, prediction) history - never re-tuning the
+    boost's own numbers per station (that's what overfit in the 2026-09-27
+    per-station backtest), only ever asking a yes/no question about the
+    fixed config. Returns None (meaning "don't change anything") when there
+    isn't enough history yet to trust the comparison.
+
+    Reads the station's COMPLETE history, deliberately unbounded: this only
+    runs once per retrain (see _update_cusum_enabled_state), and a retrain
+    already reads this station's entire history anyway to build the training
+    frame, so this adds no new class of cost - unlike station_ewma_bias
+    above, which runs every ~5min submission cycle and is bounded for
+    exactly that reason.
+    """
+    with connection() as conn:
+        rows = conn.execute(
+            """SELECT observed_at, demand, prediction FROM "Original Data"
+               WHERE station_id = %s AND prediction IS NOT NULL
+               UNION ALL
+               SELECT observed_at, demand, prediction FROM "Temp"
+               WHERE station_id = %s AND prediction IS NOT NULL
+               ORDER BY observed_at""",
+            (station_id, station_id),
+        ).fetchall()
+    if len(rows) < CUSUM_LOOKBACK_ROWS:
+        return None
+    fixed_acc = _fixed_ewma_accuracy(rows, DEFAULT_EWMA_PARAMS)
+    adaptive_acc = _cusum_adaptive_accuracy(rows, DEFAULT_EWMA_PARAMS, CUSUM_ADAPTIVE_PARAMS)
+    return (adaptive_acc - fixed_acc) >= (MIN_CUSUM_IMPROVEMENT_PP / 100)
+
+
+def _update_cusum_enabled_state(station_id: str) -> None:
+    """Re-decides whether station_id gets the CUSUM-adaptive EWMA boost,
+    called once per retrain (see check_and_retrain), and persists the
+    decision in "collector_state" (the same generic key/value table
+    collector.py already uses for its own cursor) under the key
+    "cusum_enabled:{station_id}" - each GitHub Actions run is a fresh
+    process, so the decision has to live in the DB to survive between
+    retrains, not in memory.
+
+    Leaves the stored value untouched when _cusum_would_help can't yet form
+    an opinion (not enough history) - a station keeps whatever its last real
+    decision was (or the CUSUM_ENABLED_STATIONS bootstrap default, if it's
+    never had one) rather than being silently switched off for lack of data.
+    """
+    would_help = _cusum_would_help(station_id)
+    if would_help is None:
+        return
+    with connection() as conn:
+        conn.execute(
+            """INSERT INTO collector_state (state_key, cursor_value, updated_at)
+               VALUES (%s, %s, now())
+               ON CONFLICT (state_key) DO UPDATE
+               SET cursor_value = EXCLUDED.cursor_value, updated_at = now()""",
+            (f"cusum_enabled:{station_id}", "true" if would_help else "false"),
+        )
+
+
+def _is_cusum_enabled(station_id: str) -> bool:
+    """Whether station_id has the CUSUM-adaptive EWMA boost on right now.
+    Reads collector_state's stored per-station decision (a single indexed
+    row lookup - cheap, unlike the unbounded scans this file's egress fixes
+    were about) and falls back to the CUSUM_ENABLED_STATIONS bootstrap
+    default for a station that hasn't retrained since this mechanism was
+    added and so has no stored decision yet."""
+    with connection() as conn:
+        row = conn.execute(
+            "SELECT cursor_value FROM collector_state WHERE state_key = %s",
+            (f"cusum_enabled:{station_id}",),
+        ).fetchone()
+    if row is None:
+        return station_id in CUSUM_ENABLED_STATIONS
+    return row[0] == "true"
 
 
 def has_pending_data() -> bool:
@@ -563,9 +690,18 @@ def check_and_retrain() -> list[str]:
             _upload_model(station_id, horizon, path)
         merged = _promote_temp_to_original(station_id)
         retrained.append(station_id)
+        was_enabled = _is_cusum_enabled(station_id)
+        _update_cusum_enabled_state(station_id)
+        now_enabled = _is_cusum_enabled(station_id)
         print(
             f"Drift en {station_id}: reentrenados {len(HORIZONS)} horizontes con {len(frame)} observaciones "
             f"({merged} nuevas incorporadas al histórico), modelos republicados en Supabase.",
             flush=True,
         )
+        if now_enabled != was_enabled:
+            print(
+                f"CUSUM-adaptive EWMA para {station_id}: "
+                f"{'activado' if now_enabled else 'desactivado'} tras este reentrenamiento.",
+                flush=True,
+            )
     return retrained

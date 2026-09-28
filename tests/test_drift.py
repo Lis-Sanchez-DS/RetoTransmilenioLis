@@ -13,6 +13,7 @@ from app.drift import (
 class FakeConnection:
     def __init__(self, rows):
         self.rows = rows
+        self._query = ""
 
     def __enter__(self):
         return self
@@ -21,10 +22,19 @@ class FakeConnection:
         pass
 
     def execute(self, query, params=None):
+        self._query = query
         return self
 
     def fetchall(self):
         return self.rows
+
+    def fetchone(self):
+        # _is_cusum_enabled's collector_state lookup: no stored decision in
+        # this fixture, so it falls back to the CUSUM_ENABLED_STATIONS
+        # bootstrap default, same as a station that's never retrained yet.
+        if "collector_state" in self._query:
+            return None
+        return self.rows[0] if self.rows else None
 
 
 def test_station_accuracy_stats_computes_wape_accuracy_and_count(monkeypatch):
@@ -96,10 +106,15 @@ def test_stations_needing_retrain_empty_stats():
 class RoutedFakeConnection:
     """Dispatches each query to canned rows based on the table/params it touches."""
 
-    def __init__(self, temp_accuracy_rows, historical_rows, temp_recent_rows):
+    def __init__(self, temp_accuracy_rows, historical_rows, temp_recent_rows, cusum_history_rows=None):
         self.temp_accuracy_rows = temp_accuracy_rows
         self.historical_rows = historical_rows
         self.temp_recent_rows = temp_recent_rows
+        # _cusum_would_help's full-history query, keyed by state_key suffix
+        # (default: not enough rows to form an opinion, i.e. _update_cusum_
+        # enabled_state should no-op). Override per test via this dict.
+        self.cusum_history_rows = cusum_history_rows if cusum_history_rows is not None else []
+        self.collector_state: dict[str, str] = {}
         self.executed = []
         self._last_rowcount = 0
 
@@ -122,11 +137,24 @@ class RoutedFakeConnection:
         elif 'DELETE FROM "Temp"' in query:
             self._result = None
             self._last_rowcount = len(self.temp_recent_rows)
+        elif 'INSERT INTO collector_state' in query:
+            # _update_cusum_enabled_state's upsert: params = (state_key, value).
+            self.collector_state[params[0]] = params[1]
+            self._result = None
+        elif 'FROM collector_state' in query:
+            # _is_cusum_enabled's lookup: params = (state_key,).
+            value = self.collector_state.get(params[0])
+            self._result = (value,) if value is not None else None
         elif ') recent' in query:
-            # _station_has_fresh_cusum_alarm's combined-history query. None of
-            # this fixture's rows carry a `prediction` column, so there's
-            # nothing to evaluate a CUSUM alarm from - no alarm either way.
+            # station_ewma_bias / _station_has_fresh_cusum_alarm's bounded
+            # combined-history query. None of this fixture's rows carry a
+            # `prediction` column, so there's nothing to evaluate - no alarm,
+            # and the CUSUM path (if enabled) sees no rows either.
             self._result = []
+        elif 'UNION ALL' in query and 'ORDER BY observed_at' in query:
+            # _cusum_would_help's unbounded full-history query (no DESC, no
+            # ") recent" wrapper - distinct from the two branches above).
+            self._result = self.cusum_history_rows
         elif 'FROM "Original Data" WHERE station_id' in query:
             self._result = self.historical_rows
         elif 'FROM "Temp" WHERE station_id' in query:
@@ -136,6 +164,9 @@ class RoutedFakeConnection:
         return self
 
     def fetchall(self):
+        return self._result
+
+    def fetchone(self):
         return self._result
 
     @property
@@ -417,8 +448,8 @@ def test_check_and_retrain_bypasses_min_new_points_on_fresh_cusum_alarm(monkeypa
 
     class AlarmRoutedConnection(RoutedFakeConnection):
         def execute(self, query, params=None):
-            self.executed.append((query, params))
             if ') recent' in query:
+                self.executed.append((query, params))
                 self._result = cusum_history_rows
                 return self
             return super().execute(query, params)
@@ -435,3 +466,105 @@ def test_check_and_retrain_bypasses_min_new_points_on_fresh_cusum_alarm(monkeypa
 
     assert retrained == ["A"]
     assert len(uploads) == 4
+
+
+def _quiet_then_shifted_rows(quiet_n: int, shift_n: int, shift_mag: float = 60.0) -> list[tuple]:
+    """(observed_at, demand, prediction) triples, chronological: quiet_n
+    rows of ordinary alternating noise, then shift_n rows where the
+    prediction stays pinned `shift_mag` above demand - a sustained regime
+    shift like 05100's real collapse (predictions pinned high while actual
+    demand fell and stayed down)."""
+    quiet = [(f"t{i}", 100.0, 100.0 + (5 if i % 2 == 0 else -5)) for i in range(quiet_n)]
+    shifted = [
+        (f"t{quiet_n + i}", 100.0, 100.0 + shift_mag + (5 if i % 2 == 0 else -5))
+        for i in range(shift_n)
+    ]
+    return quiet + shifted
+
+
+def test_cusum_would_help_none_when_too_little_history(monkeypatch):
+    """_update_cusum_enabled_state must not flip a station on or off off the
+    back of too little data - a station with fewer than CUSUM_LOOKBACK_ROWS
+    recorded prediction/actual pairs should get None (i.e. "leave the
+    existing decision alone"), not a guess."""
+    from app.drift import _cusum_would_help, CUSUM_LOOKBACK_ROWS
+
+    rows = _quiet_then_shifted_rows(50, 10)
+    assert len(rows) < CUSUM_LOOKBACK_ROWS
+    monkeypatch.setattr("app.drift.connection", lambda: FakeConnection(rows))
+
+    assert _cusum_would_help("A") is None
+
+
+def test_cusum_would_help_true_for_sustained_shift_false_for_pure_noise(monkeypatch):
+    """The yes/no question _update_cusum_enabled_state actually asks: would
+    the single SHARED CUSUM_ADAPTIVE_PARAMS config (never re-tuned per
+    station) beat the plain fixed EWMA by a real margin on this station's
+    own history? A station with a real, sustained collapse should clear the
+    bar; a station that's just ordinary noise the whole time should not -
+    this is what keeps 09000/09122 (which never showed this pattern) from
+    getting the boost even after future retrains."""
+    from app.drift import _cusum_would_help
+
+    shifted_rows = _quiet_then_shifted_rows(200, 100)
+    monkeypatch.setattr("app.drift.connection", lambda: FakeConnection(shifted_rows))
+    assert _cusum_would_help("A") is True
+
+    quiet_rows = _quiet_then_shifted_rows(300, 0)
+    monkeypatch.setattr("app.drift.connection", lambda: FakeConnection(quiet_rows))
+    assert _cusum_would_help("A") is False
+
+
+def test_update_and_read_back_cusum_enabled_state(monkeypatch):
+    """_update_cusum_enabled_state's decision must round-trip through
+    _is_cusum_enabled via collector_state - the persistence a fresh
+    GitHub Actions process needs to remember a decision made by a previous
+    retrain."""
+    from app.drift import _is_cusum_enabled, _update_cusum_enabled_state, CUSUM_ENABLED_STATIONS
+
+    conn = RoutedFakeConnection([], [], [], cusum_history_rows=_quiet_then_shifted_rows(200, 100))
+    monkeypatch.setattr("app.drift.connection", lambda: conn)
+
+    # A station outside the bootstrap default starts falling back to it.
+    station = "never-seen-before"
+    assert station not in CUSUM_ENABLED_STATIONS
+    assert _is_cusum_enabled(station) is False
+
+    _update_cusum_enabled_state(station)
+
+    assert _is_cusum_enabled(station) is True
+    assert conn.collector_state[f"cusum_enabled:{station}"] == "true"
+
+
+def test_check_and_retrain_updates_cusum_state_for_newly_justified_station(monkeypatch, tmp_path):
+    """The actual behavior the user asked for: when a station retrains, it
+    should also get checked for whether the shared CUSUM config is now
+    justified for it - not just the fixed 05100/06000/07111 set decided
+    once on 2026-09-27. A station outside that set whose full history now
+    shows a real, sustained shift should come out of this retrain with the
+    boost turned on."""
+    station = "Z"
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    historical_rows = [
+        (start + timedelta(minutes=15 * i), 100 + (i % 20)) for i in range(700)
+    ]
+    temp_recent_rows = [
+        (start + timedelta(minutes=15 * (700 + i)), 100 + (i % 20)) for i in range(60)
+    ]
+    temp_accuracy_rows = [(station, demand, demand * 0.7) for _, demand in temp_recent_rows]
+    cusum_history_rows = _quiet_then_shifted_rows(200, 100)
+
+    fake_conn = RoutedFakeConnection(
+        temp_accuracy_rows, historical_rows, temp_recent_rows, cusum_history_rows=cusum_history_rows
+    )
+    monkeypatch.setattr("app.drift.connection", lambda: fake_conn)
+    monkeypatch.setattr("app.drift.MODEL_DIR", str(tmp_path))
+    monkeypatch.setattr("app.drift.SUPABASE_URL", "https://fake.supabase.co")
+    monkeypatch.setattr("app.drift.SUPABASE_SERVICE_ROLE_KEY", "fake-service-role-key")
+    _fake_upload(monkeypatch, [])
+
+    retrained = check_and_retrain()
+
+    assert retrained == [station]
+    assert fake_conn.collector_state[f"cusum_enabled:{station}"] == "true"
