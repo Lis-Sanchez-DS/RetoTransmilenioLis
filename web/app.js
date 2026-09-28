@@ -15,7 +15,7 @@ const COLOR_GOOD = "#FFD100";
 const COLOR_WARNING = "#F7A50C";
 const COLOR_CRITICAL = "#B90000";
 
-const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY);
+const supabaseClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY);
 
 let stations = [];
 let summary = [];
@@ -47,9 +47,9 @@ function stationName(id) {
 
 async function loadAll() {
   const [stationsRes, summaryRes, jobsRes] = await Promise.all([
-    supabase.rpc("api_station_list"),
-    supabase.rpc("api_station_summary"),
-    supabase.rpc("api_job_runs", { p_limit: 20 }),
+    supabaseClient.rpc("api_station_list"),
+    supabaseClient.rpc("api_station_summary"),
+    supabaseClient.rpc("api_job_runs", { p_limit: 20 }),
   ]);
   for (const [name, res] of [["api_station_list", stationsRes], ["api_station_summary", summaryRes], ["api_job_runs", jobsRes]]) {
     if (res.error) throw new Error(`${name}: ${res.error.message}`);
@@ -60,7 +60,7 @@ async function loadAll() {
 }
 
 async function loadSeries(stationId, limit) {
-  const { data, error } = await supabase.rpc("api_station_series", {
+  const { data, error } = await supabaseClient.rpc("api_station_series", {
     p_station_id: stationId,
     p_limit: limit,
   });
