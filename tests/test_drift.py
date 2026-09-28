@@ -122,6 +122,11 @@ class RoutedFakeConnection:
         elif 'DELETE FROM "Temp"' in query:
             self._result = None
             self._last_rowcount = len(self.temp_recent_rows)
+        elif ') recent' in query:
+            # _station_has_fresh_cusum_alarm's combined-history query. None of
+            # this fixture's rows carry a `prediction` column, so there's
+            # nothing to evaluate a CUSUM alarm from - no alarm either way.
+            self._result = []
         elif 'FROM "Original Data" WHERE station_id' in query:
             self._result = self.historical_rows
         elif 'FROM "Temp" WHERE station_id' in query:
@@ -340,3 +345,93 @@ def test_ewma_lookback_rows_bounds_query_and_stays_accurate(monkeypatch):
     for alpha in (0.2, 0.05, 0.5):
         lookback = _ewma_lookback_rows(alpha)
         assert (1 - alpha) ** lookback < EWMA_TRUNCATION_EPSILON
+
+
+def test_cusum_enabled_station_matches_plain_ewma_when_no_alarm_fires(monkeypatch):
+    """For a CUSUM-enabled station whose residuals never trip the CUSUM
+    threshold, station_ewma_bias() must produce the exact same number as the
+    plain fixed EWMA - the boosted regime should be provably a no-op absent
+    a real, sustained shift, not just "close"."""
+    from app.drift import CUSUM_ENABLED_STATIONS, DEFAULT_EWMA_PARAMS
+
+    assert "05100" in CUSUM_ENABLED_STATIONS
+    rows_desc = [
+        ("2026-01-01T00:30:00Z", 100.0, 102.0),
+        ("2026-01-01T00:15:00Z", 100.0, 98.0),
+        ("2026-01-01T00:00:00Z", 100.0, 101.0),
+    ]
+    monkeypatch.setattr("app.drift.connection", lambda: FakeConnection(list(rows_desc)))
+
+    bias = station_ewma_bias("05100")
+
+    alpha, damping = DEFAULT_EWMA_PARAMS["alpha"], DEFAULT_EWMA_PARAMS["damping"]
+    expected_raw = 0.0
+    for _, demand, prediction in reversed(rows_desc):
+        expected_raw = alpha * (demand - prediction) + (1 - alpha) * expected_raw
+    assert bias == damping * expected_raw
+
+
+def test_cusum_alarm_fires_on_sustained_shift_not_on_routine_noise():
+    """The CUSUM detector (used both for the boosted-EWMA regime and for the
+    fast retrain path) must stay quiet through ordinary alternating noise,
+    but fire once residuals shift hard and stay shifted - mirroring 05100's
+    real collapse (predictions pinned high while actual demand kept
+    falling)."""
+    from app.drift import _cusum_recently_alarmed
+
+    quiet_rows = [
+        ("t", 100.0, 100.0 + (5 if i % 2 == 0 else -5)) for i in range(150)
+    ]
+    assert _cusum_recently_alarmed(quiet_rows) is False
+
+    shifted_rows = list(quiet_rows) + [
+        ("t", 100.0, 100.0 + 60 + (5 if i % 2 == 0 else -5)) for i in range(20)
+    ]
+    assert _cusum_recently_alarmed(shifted_rows) is True
+
+
+def test_check_and_retrain_bypasses_min_new_points_on_fresh_cusum_alarm(monkeypatch, tmp_path):
+    """A station below ACCURACY_THRESHOLD with only a small trickle of new
+    "Temp" rows normally waits (see
+    test_check_and_retrain_skips_station_below_min_new_points), but a
+    confirmed CUSUM alarm - a real, sustained regime shift - should let it
+    retrain immediately instead of waiting for MIN_NEW_FOR_RETRAIN to pile
+    up, since that's exactly the "behaving unpredictably, catch it fast"
+    case this bypass exists for."""
+    station = "A"
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    historical_rows = [
+        (start + timedelta(minutes=15 * i), 100 + (i % 20)) for i in range(700)
+    ]
+    temp_recent_rows = [
+        (start + timedelta(minutes=15 * (700 + i)), 100 + (i % 20)) for i in range(5)
+    ]
+    temp_accuracy_rows = [(station, demand, demand * 0.7) for _, demand in temp_recent_rows]
+    # A long, sharply-shifted residual history for the CUSUM alarm query:
+    # predictions pinned near 100 while demand suddenly drops hard and stays
+    # there, exactly like 05100's real collapse.
+    quiet = [(f"t{i}", 100.0, 100.0 + (5 if i % 2 == 0 else -5)) for i in range(150)]
+    shifted = [(f"t{150+i}", 100.0, 160.0 + (5 if i % 2 == 0 else -5)) for i in range(20)]
+    cusum_history_rows = shifted[::-1] + quiet[::-1]  # DESC order, as the real query returns
+
+    class AlarmRoutedConnection(RoutedFakeConnection):
+        def execute(self, query, params=None):
+            self.executed.append((query, params))
+            if ') recent' in query:
+                self._result = cusum_history_rows
+                return self
+            return super().execute(query, params)
+
+    fake_conn = AlarmRoutedConnection(temp_accuracy_rows, historical_rows, temp_recent_rows)
+    monkeypatch.setattr("app.drift.connection", lambda: fake_conn)
+    monkeypatch.setattr("app.drift.MODEL_DIR", str(tmp_path))
+    monkeypatch.setattr("app.drift.SUPABASE_URL", "https://fake.supabase.co")
+    monkeypatch.setattr("app.drift.SUPABASE_SERVICE_ROLE_KEY", "fake-service-role-key")
+    uploads = []
+    _fake_upload(monkeypatch, uploads)
+
+    retrained = check_and_retrain()
+
+    assert retrained == ["A"]
+    assert len(uploads) == 4

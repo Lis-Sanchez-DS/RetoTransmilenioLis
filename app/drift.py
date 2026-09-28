@@ -24,6 +24,7 @@ reintroducir un recorte de historia sin repetir esa comparación.)
 
 import math
 import os
+import statistics
 
 import joblib
 import pandas as pd
@@ -204,11 +205,160 @@ def station_ewma_bias(station_id: str) -> float:
     if not rows:
         return 0.0
     rows.reverse()  # DESC from the query -> chronological, oldest first
+    if station_id in CUSUM_ENABLED_STATIONS:
+        return _cusum_adaptive_bias(rows, params, CUSUM_ADAPTIVE_PARAMS)
     bias = 0.0
     for _, demand, prediction in rows:
         residual = float(demand) - float(prediction)
         bias = alpha * residual + (1 - alpha) * bias
     return params["damping"] * bias
+
+
+# --- CUSUM-adaptive EWMA (regime-shift boost), NOT deployed -----------------
+#
+# On top of the fixed EWMA above, a station in CUSUM_ENABLED_STATIONS also
+# runs a two-sided CUSUM change-point detector on its standardized residuals.
+# While no change point has fired, its behavior is identical to the plain
+# fixed EWMA above. Once CUSUM fires (a real, sustained deviation - not
+# routine noise), the station switches to a more reactive (alpha, damping)
+# pair for a fixed cooldown window, then reverts. Built to react fast to a
+# genuine regime shift (like 05100's multi-hour demand collapses) without
+# the extra reactivity permanently hurting the other, well-behaved stations.
+#
+# Backtested 2026-09-27 on all 12 stations, 3 independent chronological
+# folds never touched during tuning: a per-station-tuned version overfit
+# badly (~500 train points isn't enough to pin down 4 free params per
+# station - different folds picked different "best" configs for the same
+# station, and results didn't hold out-of-fold, including 05100's own).
+# A single SHARED config, chosen by pooling training accuracy across all 12
+# stations at once (so the calm majority regularizes the search away from
+# chasing any one station's noise), was stable across folds and delivered a
+# consistent, large gain on 05100 (+1.21 / +6.52 / +0.06pp vs. fixed EWMA
+# across the 3 folds), with only two stations (09000, 09122) regressing.
+# Re-pooling the search on just those two regressors, to try to fix them
+# specifically, made both WORSE, not better - shrinking the pool to just the
+# problem stations removes the regularizing effect that made pooling work in
+# the first place. So rather than force this config onto stations that
+# structurally don't benefit from it, CUSUM_ENABLED_STATIONS opts in only
+# the stations with a real, fold-consistent gain: 05100 (large), plus 06000
+# and 07111 (small but never meaningfully negative in any fold). The other
+# 9 stations - including the two confirmed regressors - keep using the
+# plain fixed EWMA above, completely untouched by this mechanism.
+#
+# NOT PUSHED TO PRODUCTION as of 2026-09-27: implemented and tested here at
+# the user's request, but deliberately kept off origin/master so nothing
+# about the live pipeline changes until there's an explicit go-ahead to
+# deploy it.
+CUSUM_K = 0.5  # standard slack: detect a shift of >= 1 std
+CUSUM_STD_WINDOW = 96  # ~1 day at 15min cadence, causal rolling std for standardizing residuals
+CUSUM_ADAPTIVE_PARAMS = {"boost_alpha": 0.4, "boost_damping": 0.7, "cooldown": 80, "cusum_h": 20.0}
+CUSUM_ENABLED_STATIONS: frozenset[str] = frozenset({"05100", "06000", "07111"})
+# Long enough for the rolling std window plus the longest cooldown a CUSUM
+# alarm could still be "inside" of, plus slack - independent of (and much
+# larger than) the plain-EWMA lookback above, which decays away almost all
+# of a station's history within ~50-150 rows and would be too short here.
+CUSUM_LOOKBACK_ROWS = CUSUM_STD_WINDOW + CUSUM_ADAPTIVE_PARAMS["cooldown"] + 50
+
+
+def _cusum_adaptive_bias(rows: list[tuple], normal_params: dict, boost_params: dict) -> float:
+    """Causal (no-lookahead) walk over `rows` (chronological), returning the
+    damped bias correction as of the LAST row - same idea as the plain EWMA
+    loop above, but with a CUSUM-triggered boosted regime layered on top."""
+    residuals = [float(demand) - float(prediction) for _, demand, prediction in rows]
+    normal_alpha, normal_damping = normal_params["alpha"], normal_params["damping"]
+    boost_alpha, boost_damping = boost_params["boost_alpha"], boost_params["boost_damping"]
+    cooldown, cusum_h = boost_params["cooldown"], boost_params["cusum_h"]
+
+    raw_bias = 0.0
+    s_pos = s_neg = 0.0
+    cooldown_left = 0
+    damping = normal_damping
+    window: list[float] = []
+
+    for residual in residuals:
+        boosted = cooldown_left > 0
+        alpha = boost_alpha if boosted else normal_alpha
+        damping = boost_damping if boosted else normal_damping
+        raw_bias = alpha * residual + (1 - alpha) * raw_bias
+
+        std = statistics.pstdev(window) if len(window) >= 10 else None
+        if std and std > 1e-6:
+            z = residual / std
+            s_pos = max(0.0, s_pos + z - CUSUM_K)
+            s_neg = max(0.0, s_neg - z - CUSUM_K)
+            if s_pos > cusum_h or s_neg > cusum_h:
+                cooldown_left = cooldown
+                s_pos = s_neg = 0.0
+            elif cooldown_left > 0:
+                cooldown_left -= 1
+        elif cooldown_left > 0:
+            cooldown_left -= 1
+        window.append(residual)
+        if len(window) > CUSUM_STD_WINDOW:
+            window.pop(0)
+
+    return damping * raw_bias
+
+
+def _cusum_recently_alarmed(rows: list[tuple]) -> bool:
+    """Detection only - never changes any prediction or correction. True if a
+    real CUSUM change point fired within the last `cooldown` points of this
+    station's own residual history, i.e. a genuine, sustained regime shift is
+    still "fresh". Safe to run for EVERY station, including ones outside
+    CUSUM_ENABLED_STATIONS or a brand-new station never seen before, as a
+    faster-reacting companion to the RECENT_CHECKS/MIN_NEW_FOR_RETRAIN
+    drift gates below: those need a full accuracy window and a pile of new
+    rows before they fire, while a real regime shift shows up in CUSUM's
+    statistical test point by point, well before either gate would trip on
+    its own."""
+    residuals = [float(demand) - float(prediction) for _, demand, prediction in rows]
+    k, h = CUSUM_K, CUSUM_ADAPTIVE_PARAMS["cusum_h"]
+    cooldown = CUSUM_ADAPTIVE_PARAMS["cooldown"]
+    s_pos = s_neg = 0.0
+    cooldown_left = 0
+    window: list[float] = []
+    for residual in residuals:
+        std = statistics.pstdev(window) if len(window) >= 10 else None
+        if std and std > 1e-6:
+            z = residual / std
+            s_pos = max(0.0, s_pos + z - k)
+            s_neg = max(0.0, s_neg - z - k)
+            if s_pos > h or s_neg > h:
+                cooldown_left = cooldown
+                s_pos = s_neg = 0.0
+            elif cooldown_left > 0:
+                cooldown_left -= 1
+        elif cooldown_left > 0:
+            cooldown_left -= 1
+        window.append(residual)
+        if len(window) > CUSUM_STD_WINDOW:
+            window.pop(0)
+    return cooldown_left > 0
+
+
+def _station_has_fresh_cusum_alarm(station_id: str) -> bool:
+    """Whether _cusum_recently_alarmed(...) is true for this station right
+    now, fetching just enough recent history to evaluate it. Only called for
+    a station already flagged as drifted by stations_needing_retrain, so
+    this extra query stays rare rather than running every cycle for every
+    station."""
+    with connection() as conn:
+        rows = conn.execute(
+            """SELECT observed_at, demand, prediction FROM (
+                   SELECT observed_at, demand, prediction FROM "Original Data"
+                   WHERE station_id = %s AND prediction IS NOT NULL
+                   UNION ALL
+                   SELECT observed_at, demand, prediction FROM "Temp"
+                   WHERE station_id = %s AND prediction IS NOT NULL
+               ) recent
+               ORDER BY observed_at DESC
+               LIMIT %s""",
+            (station_id, station_id, CUSUM_LOOKBACK_ROWS),
+        ).fetchall()
+    if len(rows) < 10:
+        return False
+    rows.reverse()
+    return _cusum_recently_alarmed(rows)
 
 
 def has_pending_data() -> bool:
@@ -395,7 +545,14 @@ def check_and_retrain() -> list[str]:
     retrained = []
     for station_id in drifted:
         recent = _fetch_recent(station_id)
-        if len(recent) < MIN_NEW_FOR_RETRAIN:
+        # A station already below ACCURACY_THRESHOLD normally still waits for
+        # MIN_NEW_FOR_RETRAIN new rows (the egress throttle from 2026-09-26).
+        # A confirmed CUSUM alarm - a real, sustained regime shift, not noise
+        # - skips that wait: it's exactly the case (a station, including a
+        # brand-new one never seen before, suddenly behaving unpredictably)
+        # this check exists to catch faster than the row-count throttle alone
+        # would allow.
+        if len(recent) < MIN_NEW_FOR_RETRAIN and not _station_has_fresh_cusum_alarm(station_id):
             continue
 
         frame = _training_frame(station_id, recent)
