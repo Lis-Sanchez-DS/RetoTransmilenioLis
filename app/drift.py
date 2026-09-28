@@ -332,11 +332,14 @@ def _cusum_recently_alarmed(rows: list[tuple]) -> bool:
     station's own residual history, i.e. a genuine, sustained regime shift is
     still "fresh". Safe to run for EVERY station, including ones outside
     CUSUM_ENABLED_STATIONS or a brand-new station never seen before, as a
-    faster-reacting companion to the RECENT_CHECKS/MIN_NEW_FOR_RETRAIN
-    drift gates below: those need a full accuracy window and a pile of new
-    rows before they fire, while a real regime shift shows up in CUSUM's
-    statistical test point by point, well before either gate would trip on
-    its own."""
+    faster-reacting companion to the RECENT_CHECKS/ACCURACY_THRESHOLD drift
+    gate below: that gate needs a full 4-point accuracy window to average
+    below the bar before it fires, while a real regime shift shows up in
+    CUSUM's statistical test point by point, well before that average would
+    catch up. This only ever pulls a station INTO consideration earlier -
+    the separate MIN_NEW_FOR_RETRAIN row-count floor in check_and_retrain
+    still applies unconditionally afterward, so a real alarm with no new
+    data yet never spends a wasted retrain."""
     state = _new_cusum_state()
     for _, demand, prediction in rows:
         residual = float(demand) - float(prediction)
@@ -346,10 +349,10 @@ def _cusum_recently_alarmed(rows: list[tuple]) -> bool:
 
 def _station_has_fresh_cusum_alarm(station_id: str) -> bool:
     """Whether _cusum_recently_alarmed(...) is true for this station right
-    now, fetching just enough recent history to evaluate it. Only called for
-    a station already flagged as drifted by stations_needing_retrain, so
-    this extra query stays rare rather than running every cycle for every
-    station."""
+    now, fetching just enough recent history to evaluate it. Called every
+    cycle for every station that isn't already flagged as accuracy-drifted
+    (see check_and_retrain) - a bounded (CUSUM_LOOKBACK_ROWS-row) query, not
+    the kind of unbounded scan this file's other egress fixes were about."""
     with connection() as conn:
         rows = conn.execute(
             """SELECT observed_at, demand, prediction FROM (
@@ -668,18 +671,24 @@ def _promote_temp_to_original(station_id: str) -> int:
 def check_and_retrain() -> list[str]:
     """Detect drifted stations and retrain + republish their models. Returns the list retrained."""
     stats = station_accuracy_stats()
-    drifted = stations_needing_retrain(stats)
+    drifted = set(stations_needing_retrain(stats))
+    # A confirmed CUSUM alarm - a real, sustained regime shift, not noise -
+    # can pull a station into consideration even before its own crude
+    # RECENT_CHECKS(4)-point rolling accuracy has dropped below
+    # ACCURACY_THRESHOLD, since that short average can lag behind what
+    # CUSUM's statistical test already sees. This only ever ADDS candidates:
+    # it bypasses the ACCURACY_THRESHOLD gate, never the MIN_NEW_FOR_RETRAIN
+    # row-count floor below, which every candidate still has to clear
+    # regardless of why it's here - a real regime shift with no new data yet
+    # to retrain on is not a reason to spend a retrain on unchanged data.
+    for station_id in stats["station_id"]:
+        if station_id not in drifted and _station_has_fresh_cusum_alarm(station_id):
+            drifted.add(station_id)
+
     retrained = []
-    for station_id in drifted:
+    for station_id in sorted(drifted):
         recent = _fetch_recent(station_id)
-        # A station already below ACCURACY_THRESHOLD normally still waits for
-        # MIN_NEW_FOR_RETRAIN new rows (the egress throttle from 2026-09-26).
-        # A confirmed CUSUM alarm - a real, sustained regime shift, not noise
-        # - skips that wait: it's exactly the case (a station, including a
-        # brand-new one never seen before, suddenly behaving unpredictably)
-        # this check exists to catch faster than the row-count throttle alone
-        # would allow.
-        if len(recent) < MIN_NEW_FOR_RETRAIN and not _station_has_fresh_cusum_alarm(station_id):
+        if len(recent) < MIN_NEW_FOR_RETRAIN:
             continue
 
         frame = _training_frame(station_id, recent)
