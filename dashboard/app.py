@@ -28,11 +28,18 @@ ACCURACY_THRESHOLD = 0.85
 HEARTBEAT_STALE_AFTER_MINUTES = 90
 ROLLING_WINDOW = 20
 
-COLOR_PRIMARY = "#0072B2"
-COLOR_SECONDARY = "#999999"
-COLOR_GOOD = "#009E73"
-COLOR_WARNING = "#E69F00"
-COLOR_CRITICAL = "#D55E00"
+# Paleta inspirada en TransMilenio: rojo, amarillo y ámbar extraídos del
+# archivo oficial del logo (Wikimedia Commons, File:TransMilenio_logo.svg).
+# No se encontró un manual de marca público con códigos hex/Pantone
+# explícitos (el "Manual de Imagen de Marca y Normas Gráficas SITP" que sí
+# existe especifica un azul para el uniforme de buses del SITP, distinto del
+# rojo con el que se identifica visualmente a TransMilenio) - estos son los
+# tonos reales tomados directamente del archivo del logo, no inventados.
+COLOR_PRIMARY = "#CC0211"    # rojo TransMilenio - series principales
+COLOR_SECONDARY = "#4A4849"  # gris cálido del mismo logo - líneas de referencia
+COLOR_GOOD = "#FFD100"       # amarillo TransMilenio - accuracy en o sobre el umbral
+COLOR_WARNING = "#F7A50C"    # ámbar - accuracy moderadamente por debajo
+COLOR_CRITICAL = "#B90000"   # rojo oscuro - accuracy muy por debajo del umbral
 
 st.set_page_config(page_title="Pulso TransMi - Dashboard", layout="wide")
 
@@ -245,12 +252,62 @@ with tab_overview:
     )
 
 with tab_station:
-    station_options = summary.sort_values("station_id")
+    STATE_KEY = "selected_station_id"
+    station_options = summary.sort_values("station_id").merge(
+        stations[["station_id", "latitude", "longitude"]], on="station_id", how="left"
+    )
+
+    st.subheader("Mapa de estaciones (Bogotá)")
+    st.caption("Haz clic en una estación del mapa para seleccionarla — el color indica su accuracy reciente (últimos 4 puntos).")
+
+    map_colors = [status_color(a) for a in station_options["accuracy_last_4"]]
+    hover_text = [
+        f"<b>{row.name}</b> ({row.station_id})<br>"
+        f"Accuracy histórica: {row.accuracy_all_time:.1%}<br>"
+        f"Accuracy últimos 4: {row.accuracy_last_4:.1%}" if pd.notna(row.accuracy_last_4)
+        else f"<b>{row.name}</b> ({row.station_id})<br>Accuracy histórica: {row.accuracy_all_time:.1%}"
+        for row in station_options.itertuples()
+    ]
+    map_fig = go.Figure(
+        go.Scattermap(
+            lat=station_options["latitude"],
+            lon=station_options["longitude"],
+            mode="markers+text",
+            marker=dict(size=22, color=map_colors),
+            text=station_options["station_id"],
+            textposition="top center",
+            textfont=dict(color="#1a1a1a", size=11),
+            hovertext=hover_text,
+            hoverinfo="text",
+        )
+    )
+    map_fig.update_layout(
+        map=dict(style="open-street-map", center=dict(lat=4.645, lon=-74.095), zoom=10.3),
+        margin=dict(l=0, r=0, t=0, b=0),
+        height=480,
+    )
+    map_event = st.plotly_chart(
+        map_fig, width="stretch", on_select="rerun", key="station_map_click"
+    )
+
+    ids = list(station_options["station_id"])
+    default_id = st.session_state.get(STATE_KEY, ids[0])
+    selection = getattr(map_event, "selection", None) or (map_event or {}).get("selection")
+    points = getattr(selection, "points", None) if selection is not None else None
+    if points is None and isinstance(selection, dict):
+        points = selection.get("points")
+    if points:
+        clicked_idx = points[0]["point_index"]
+        default_id = ids[clicked_idx]
+        st.session_state[STATE_KEY] = default_id
+
     labels = [
         f"{row.station_id} — {row.name}" for row in station_options.itertuples()
     ]
-    choice = st.selectbox("Estación", labels)
+    default_index = ids.index(default_id) if default_id in ids else 0
+    choice = st.selectbox("Estación (o elige aquí en vez del mapa)", labels, index=default_index)
     station_id = choice.split(" — ")[0]
+    st.session_state[STATE_KEY] = station_id
 
     g = obs[obs["station_id"] == station_id].sort_values("observed_at")
     row = summary[summary["station_id"] == station_id].iloc[0]
