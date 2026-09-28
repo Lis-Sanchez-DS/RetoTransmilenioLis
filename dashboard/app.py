@@ -16,12 +16,18 @@ from pathlib import Path
 
 import pandas as pd
 import plotly.graph_objects as go
+import plotly.io as pio
 import psycopg
 import streamlit as st
 from dotenv import load_dotenv
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(REPO_ROOT / ".env")
+
+# Fondo claro fijo para todas las gráficas, independiente del modo
+# claro/oscuro del navegador de quien las vea (ver también .streamlit/config.toml
+# para el tema general de la app).
+pio.templates.default = "plotly_white"
 
 RECENT_CHECKS = 4
 ACCURACY_THRESHOLD = 0.85

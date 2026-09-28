@@ -1,0 +1,10 @@
+# Tema claro fijo para el dashboard (dashboard/app.py) - sin esto, Streamlit
+# sigue la preferencia de modo oscuro del sistema/navegador de quien lo abre,
+# que es lo que hacía que se viera oscuro por defecto.
+[theme]
+base = "light"
+primaryColor = "#CC0211"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#FFF6E0"
+textColor = "#262626"
+font = "sans serif"
