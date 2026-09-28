@@ -498,6 +498,71 @@ Practical implications:
   number a lot) - always say so rather than presenting it as a clean
   aggregate.
 
+## Monitoring dashboards (`web/` and `dashboard/app.py`)
+
+Two read-only dashboards exist, both querying Supabase directly and never
+writing to it: **`web/`** is a plain HTML/CSS/JS static site (no build, no
+framework) deployed to Vercel at
+**https://web-sigma-lac-7j9zw6955x.vercel.app** - the "always available"
+one, since it needs nothing running locally. **`dashboard/app.py`** is the
+same views in Streamlit, for local dev (`streamlit run dashboard/app.py`).
+Both compute accuracy (all-time / last 20 / last 4, the same window the
+drift gate uses), show a clickable Bogotá map built from `stations`' real
+coordinates, the real-vs-predicted series, the collector heartbeat, and the
+drift-eligible-stations table. Color palette is red/yellow/amber, sourced
+from TransMilenio's actual logo file on Wikimedia Commons (no public brand
+manual with documented hex values was found - see `dashboard/app.py`'s
+comment for the caveat).
+
+### `web/` has no backend - it calls Supabase from the browser with the public key
+
+This is the one genuinely new architectural pattern in this repo: `web/`
+uses `@supabase/supabase-js` with the `anon`/publishable key
+(`web/config.js` - safe to hardcode and commit, that key is *meant* to be
+public, the same way every Supabase frontend does it) instead of a backend
+service. Building it surfaced a real, pre-existing vulnerability
+unconnected to the dashboard itself: that public key already had full
+`SELECT/INSERT/UPDATE/DELETE/TRUNCATE` on `"Original Data"`, `"Temp"`,
+`stations`, and several other tables, with RLS disabled - anyone who ever
+obtained it could have wiped production data, before this dashboard
+existed.
+
+**Fixed in `database/migrations/009_lock_down_anon_access.sql`**, and this
+is the pattern to follow for any future public-facing read: enable RLS on
+the table with **zero policies** (RLS-enabled-with-no-policy denies
+`anon`/`authenticated` access completely via PostgREST's normal
+`/rest/v1/<table>` path, for every operation, on every table it's applied
+to - this never touches `service_role`, which the collector/submissions
+pipeline uses via `SUPABASE_DATABASE_URL` and which always bypasses RLS
+regardless of policies), then expose exactly what's needed through a
+**narrow `SECURITY DEFINER` SQL function** instead of a blanket table
+grant - PostgREST auto-exposes every function as its own endpoint at
+`/rest/v1/rpc/<function_name>`. The four functions
+(`api_station_list`, `api_station_summary`, `api_station_series`,
+`api_job_runs`) each: run with `SET search_path = ''` and fully
+schema-qualify every identifier (the standard SECURITY DEFINER hardening -
+otherwise the function trusts the caller's search_path), aggregate data
+server-side where possible (`api_station_summary` never ships raw
+per-row demand to the client, just the computed accuracy numbers), and
+cap any row-returning limit parameter server-side
+(`LEAST(GREATEST(p_limit, 1), 2000)` in `api_station_series` - a client
+can't request the whole, ever-growing table by passing a huge limit).
+`api_job_runs` also avoids exposing the `ops` schema at all (not in
+Supabase's default exposed-schema list) by living in `public` and
+querying `ops.job_runs` internally.
+
+**Don't add a new public-facing read by granting `SELECT` on a raw table
+to `anon`** - even a read-only grant re-opens exactly this class of
+problem the moment RLS's default-deny gets bypassed by a permissive
+policy, and it ships more data than any dashboard view actually needs.
+Add another narrow function instead, following the same four as a
+template.
+
+Verified live with the real public key before trusting the fix: a direct
+table read now returns `[]`, a direct write is explicitly rejected
+(`"new row violates row-level security policy"`), and all four RPC
+endpoints return real data.
+
 ## Pulso TransMi API quirks worth remembering
 
 - `GET /v1/forecast-cycles/current` - 404 with `no_open_cycle` is a normal
@@ -611,6 +676,21 @@ Keep it this way when touching `submit_current_cycle()`.
    mocked - if a query touches a column/table shape, sanity-check it
    against the live schema (or at minimum against every migration file in
    order), not just against `001_schema.sql`.
+9. **`web/app.js` declared `const supabase = window.supabase.createClient(...)`.**
+   The `@supabase/supabase-js` CDN script (loaded via a plain `<script>` tag
+   before `app.js`, not an ES module) already creates its own global
+   `window.supabase` - redeclaring that identifier with `const` at another
+   `<script>`'s top level throws `Identifier 'supabase' has already been
+   declared` and kills the whole script before `main()` (or any function in
+   the file) ever runs. Symptom in the browser: the page sat on "Cargando
+   datos..." forever, because even the page's own error-handling code never
+   got a chance to execute - the error happens before any of it is defined.
+   `curl` never shows this class of bug (the HTML/JS files serve fine over
+   HTTP; the failure is a JS runtime error, not a network one) - it only
+   surfaced once tested with a real browser. Fixed by renaming the local
+   variable to `supabaseClient`. When wiring up a third-party script loaded
+   via a global `<script>` tag (not a module import), check what globals it
+   creates before naming a local variable the same thing.
 
 ## Diagnosing a stuck or slow-looking workflow run
 
@@ -645,6 +725,25 @@ of the SQL query. No real Supabase connection is used in tests. Run the
 full suite after any change to `app/collector.py`, `app/submit_xgboost.py`,
 `app/drift.py`, or `app/health.py` - these are the modules most prone to
 the "stale history" and "wrong lag" class of bug above.
+
+**`web/` has no Python test suite - it needs a real browser, not `curl`.**
+`curl`/static checks only prove the files serve over HTTP; they say nothing
+about whether the page's JavaScript actually runs (see bug #9 above, which
+`curl` couldn't have caught). To verify a change to `web/`, launch a real
+headless browser and check the DOM after load, e.g. Puppeteer:
+`npm install puppeteer` (may need `apt-get download libnspr4 libnss3
+libatk1.0-0t64 libatk-bridge2.0-0t64 libcups2t64 libxkbcommon0
+libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libpango-1.0-0
+libasound2t64` + `dpkg-deb -x <pkg>.deb <dir>` + `LD_LIBRARY_PATH=<dir>/usr/lib/x86_64-linux-gnu`
+if Chrome fails to launch with a missing `.so` and there's no root/sudo),
+then `puppeteer.launch({args: ["--no-sandbox"]})`, capture both
+`page.on("console")` (filter `type() === "error"`) and
+`page.on("pageerror")`, and assert on real page state after load (e.g. the
+loading spinner actually hid, KPI values aren't still their placeholder
+text, the map has marker elements). Test against the deployed Vercel URL
+too, not just a local `python -m http.server` copy, before calling a
+change verified - a passing local test doesn't guarantee the same files
+serve identically once deployed.
 
 ## Working conventions the user expects
 

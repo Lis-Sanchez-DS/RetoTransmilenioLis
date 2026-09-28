@@ -96,6 +96,9 @@ scripts/
   download_models.sh         wrapper que llama a download_models.py
   download_models.py         sincroniza (de forma incremental) los 48 archivos de modelo (12 estaciones x 4 horizontes) desde Supabase Storage - solo descarga los que cambiaron desde la última vuelta, comparando contra un manifiesto local
 
+dashboard/app.py               panel local (Streamlit) de solo lectura sobre Supabase
+web/                            panel estático (HTML/CSS/JS, sin build ni framework) desplegado en Vercel - ver "Panel de monitoreo" más abajo
+
 models/xgboost/               modelos entrenados, excluidos de Git por tamaño; viven en Supabase Storage
 docs/figures/                  gráficas del análisis exploratorio
 tests/                          suite de pytest, con toda la conexión a la BD simulada (sin Supabase real)
@@ -495,6 +498,97 @@ pytest tests/
 Toda la suite de pruebas simula el acceso a la base de datos (sin conexión
 real a Supabase) - ver `tests/test_drift.py`, `tests/test_collector.py`,
 `tests/test_submit_xgboost.py`, `tests/test_health.py`.
+
+## Panel de monitoreo (dashboard)
+
+**Panel en vivo (no requiere nada local): https://web-sigma-lac-7j9zw6955x.vercel.app**
+
+Hay dos paneles de solo lectura, ambos leyendo directamente de Supabase y
+sin ningún efecto sobre el pipeline de collector/submissions:
+
+- **`web/`** - panel estático (HTML/CSS/JS plano, sin build ni framework),
+  desplegado en Vercel en la URL de arriba. Es el panel "de referencia":
+  público, siempre disponible, sin depender de la máquina de nadie.
+- **`dashboard/app.py`** - la misma información en una app de Streamlit,
+  para correr localmente (`streamlit run dashboard/app.py`) durante
+  desarrollo. Ninguno de los dos escribe en la base de datos.
+
+Ambos muestran: accuracy por estación (histórico, últimos 20, últimos 4 -
+la misma ventana que usa el gate de drift), un mapa interactivo de Bogotá
+con las coordenadas reales de la tabla `stations` (clic en una estación la
+selecciona), la serie real-vs-predicha y su tendencia de accuracy, el
+heartbeat del collector y la tabla de estaciones elegibles para
+reentrenamiento. La paleta de colores (rojo/amarillo/ámbar) se explica en
+`dashboard/app.py` - tomada del logo oficial de TransMilenio en Wikimedia
+Commons, no de un manual de marca con hex documentados (no se encontró
+ninguno público).
+
+### Arquitectura del panel web: por qué necesitó arreglar una vulnerabilidad primero
+
+`web/` no tiene backend propio - el navegador llama a Supabase
+directamente con la llave pública/`anon` (`web/config.js`, segura de
+exponer por diseño, es el equivalente a la llave anónima de cualquier
+proyecto Supabase). Al construir esto se encontró que esa llave pública
+**ya tenía SELECT/INSERT/UPDATE/DELETE/TRUNCATE completos** sobre
+`"Original Data"`, `"Temp"`, `stations` y otras tablas, con Row Level
+Security desactivado - un problema previo y sin relación con el
+dashboard: cualquiera con esa llave ya podía borrar la base de producción
+antes de que existiera este panel.
+
+Arreglado en `database/migrations/009_lock_down_anon_access.sql`:
+
+- RLS activado en todas las tablas antes expuestas
+  (`"Original Data"`, `"Temp"`, `stations`, `collector_state`, `baseline`,
+  `dynamic_harmonic`, `sarimas`, `xgboost`), **sin ninguna política** sobre
+  las tablas crudas - la llave pública ya no puede leer ni escribir nada
+  por la vía normal `/rest/v1/<tabla>` de PostgREST, para ninguna tabla.
+  Esto nunca afecta al pipeline en GitHub Actions: la conexión de
+  `SUPABASE_DATABASE_URL` usa el rol `service_role`, que siempre ignora RLS.
+- Todo el acceso de lectura pasa por **4 funciones SQL específicas**
+  (`SECURITY DEFINER`, `search_path` fijo en `''`, cada identificador
+  calificado por esquema - el endurecimiento estándar para este tipo de
+  función), expuestas por PostgREST como endpoints propios en
+  `/rest/v1/rpc/<función>`:
+  - `api_station_list()` - metadata de estaciones (id, nombre, lat/lon).
+  - `api_station_summary()` - accuracy agregada por estación (todo el
+    historial, últimos 20, últimos 4); nunca expone filas crudas de
+    demanda/predicción para esta vista, el agregado se calcula en SQL.
+  - `api_station_series(p_station_id, p_limit)` - serie real-vs-predicha de
+    una estación, con `p_limit` topado en 2000 filas del lado del servidor
+    (no importa qué límite pida el cliente) para que no se pueda usar para
+    extraer una tabla entera y cada vez más grande de una sola llamada.
+  - `api_job_runs(p_limit)` - heartbeat del collector; evita exponer el
+    esquema `ops` completo (no está en la lista de esquemas expuestos de
+    Supabase por defecto).
+- Verificado en vivo con la llave pública real antes de dar el cambio por
+  bueno: lectura directa de tabla → `[]` vacío, escritura directa →
+  rechazada explícitamente por RLS (`"new row violates row-level security
+  policy"`), los 4 endpoints RPC → datos reales.
+
+Si se agrega una nueva vista al panel que necesite otro dato de Supabase,
+el patrón a seguir es este: una función `SECURITY DEFINER` nueva y
+específica en una migración, nunca una política `SELECT`/`GRANT` amplia
+sobre una tabla cruda para `anon`.
+
+### Un bug real que vale la pena recordar: colisión de nombre con `window.supabase`
+
+`web/app.js` declaraba `const supabase = window.supabase.createClient(...)`.
+El script de `@supabase/supabase-js` (cargado por `<script>` antes que
+`app.js`) ya crea su propio global `window.supabase` - redeclarar ese mismo
+nombre con `const` en el scope superior de otro `<script>` lanza
+`Identifier 'supabase' has already been declared` y mata el script
+completo antes de que `main()` llegue a ejecutarse. El síntoma en el
+navegador era el panel quedándose en "Cargando datos..." para siempre: ni
+siquiera el manejo de errores de la propia página llegaba a correr, porque
+el error ocurre antes de que cualquier función definida en el archivo
+exista. Corregido renombrando la variable local a `supabaseClient`.
+
+Este bug pasó una revisión manual del código y solo se detectó al probarlo
+con un navegador real (`curl` nunca lo habría mostrado, ya que la página
+HTML se sirve bien - el error es de ejecución de JavaScript, no de red).
+Antes de dar por buena cualquier página que dependa de scripts de terceros
+cargados por `<script>` global (no ES modules), conviene evitar nombres de
+variable que puedan coincidir con lo que esa librería expone en `window`.
 
 ## Estado del feed de datos: un reloj virtual lento, no un estancamiento permanente
 
