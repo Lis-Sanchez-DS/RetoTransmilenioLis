@@ -148,6 +148,36 @@ DEFAULT_EWMA_PARAMS = {"alpha": 0.2, "damping": 0.5}
 MIN_EWMA_IMPROVEMENT_PP = 0.5
 STATION_EWMA_PARAMS: dict[str, dict] = {}
 
+# How much of the boosted-regime correction (see the Page-Hinkley-adaptive
+# EWMA section below) carries over to each forecast horizon. HORIZON 1
+# (+15min, the same nowcast the boost is tuned on) always gets the FULL
+# boosted bias; horizons 2-4 blend it back toward the plain/regular bias,
+# with the blend front-loaded by EWMA_DECAY_POWER so it's already mostly
+# regular by +30min instead of fading in a straight line. Backtested
+# 2026-09-28 on all 12 stations over a held-out tail that includes 05100's
+# real collapse: applying the SAME fully-boosted bias to every horizon (what
+# this pipeline did before) wins big at +15min but actively overcorrects
+# from +30min on - a flat linear decay (power=1) closed most but not all of
+# that gap; power=8 (already ~96% regular by +30min, ~99.98% by +45min)
+# matched or beat plain fixed EWMA at every horizon while keeping virtually
+# the entire +15min win, the best result of every variant tried (raw
+# uncorrected, flat CUSUM, flat Page-Hinkley, linear-decay CUSUM/Page-
+# Hinkley, and a more sensitive alarm threshold - which raised the +15min
+# win further but caused false-positive boosts on stations that had never
+# alarmed before, netting worse overall).
+EWMA_DECAY_POWER = 8
+
+
+def _horizon_decay_weight(horizon: int) -> float:
+    """1.0 at the shortest horizon (full boost), 0.0 at the longest (fully
+    regressed to the plain/regular bias), front-loaded per EWMA_DECAY_POWER
+    in between. Independent of which station or correction is being blended -
+    pure function of horizon, so it's cheap to call per prediction target."""
+    h_min, h_max = min(HORIZONS), max(HORIZONS)
+    if h_max == h_min:
+        return 1.0
+    return ((h_max - horizon) / (h_max - h_min)) ** EWMA_DECAY_POWER
+
 
 def _ewma_params(station_id: str) -> dict:
     return STATION_EWMA_PARAMS.get(station_id, DEFAULT_EWMA_PARAMS)
@@ -156,8 +186,8 @@ def _ewma_params(station_id: str) -> dict:
 # An EWMA's weight on a residual n steps back decays geometrically as
 # (1-alpha)^n, so a station's FULL history (tens of thousands of rows and
 # growing) contributes essentially nothing beyond its most recent ~100-150
-# points at alpha=0.2 - fetching all of it anyway (as station_ewma_bias used
-# to, once per station per submission cycle, every ~5min) was one of the
+# points at alpha=0.2 - fetching all of it anyway (as station_bias_components
+# used to, once per station per submission cycle, every ~5min) was one of the
 # largest sources of Supabase DB egress. _ewma_lookback_rows() picks a row
 # count small enough to matter for egress but large enough that the result
 # is numerically indistinguishable (within EWMA_TRUNCATION_EPSILON) from
@@ -171,8 +201,15 @@ def _ewma_lookback_rows(alpha: float) -> int:
     return max(50, math.ceil(math.log(EWMA_TRUNCATION_EPSILON) / math.log(1 - alpha)))
 
 
-def station_ewma_bias(station_id: str) -> float:
-    """The correction to ADD to a station's raw model prediction right now.
+def station_bias_components(station_id: str) -> tuple[float, float]:
+    """Fetches this station's recent residual history ONCE and returns
+    (regular_bias, boosted_bias): the plain fixed-EWMA correction and the
+    Page-Hinkley-boosted correction, both as of right now. station_horizon_bias
+    below blends between these two per forecast horizon - callers handling
+    multiple horizons for the same station in one cycle (submit_xgboost.py)
+    should call this once per station and blend per horizon locally with
+    blend_horizon_bias, so a submission cycle still costs exactly one DB read
+    per station regardless of how many horizons it predicts.
 
     Tracks a causal (no-lookahead) exponentially-weighted average of that
     station's own (actual - predicted) residuals, using that station's most
@@ -186,15 +223,15 @@ def station_ewma_bias(station_id: str) -> float:
     Only the last _ewma_lookback_rows(alpha) rows are fetched (DESC, then
     reversed back to chronological order below) - see that function for why
     this doesn't change the result in any way that matters. A station with
-    the CUSUM boost currently on (see _is_cusum_enabled) needs a longer
-    lookback than that - CUSUM_LOOKBACK_ROWS - since it also has to cover the
-    rolling std window and the longest cooldown an alarm could still be
-    "inside" of.
+    the Page-Hinkley boost currently on (see _is_page_hinkley_enabled) needs
+    a longer lookback than that - PH_LOOKBACK_ROWS - since it also has to
+    cover the rolling std window and the longest cooldown an alarm could
+    still be "inside" of.
     """
     params = _ewma_params(station_id)
     alpha = params["alpha"]
-    cusum_enabled = _is_cusum_enabled(station_id)
-    lookback = max(_ewma_lookback_rows(alpha), CUSUM_LOOKBACK_ROWS) if cusum_enabled else _ewma_lookback_rows(alpha)
+    ph_enabled = _is_page_hinkley_enabled(station_id)
+    lookback = max(_ewma_lookback_rows(alpha), PH_LOOKBACK_ROWS) if ph_enabled else _ewma_lookback_rows(alpha)
     with connection() as conn:
         rows = conn.execute(
             """SELECT observed_at, demand, prediction FROM (
@@ -209,30 +246,62 @@ def station_ewma_bias(station_id: str) -> float:
             (station_id, station_id, lookback),
         ).fetchall()
     if not rows:
-        return 0.0
+        return 0.0, 0.0
     rows.reverse()  # DESC from the query -> chronological, oldest first
-    if cusum_enabled:
-        return _cusum_adaptive_bias(rows, params, CUSUM_ADAPTIVE_PARAMS)
-    bias = 0.0
-    for _, demand, prediction in rows:
-        residual = float(demand) - float(prediction)
-        bias = alpha * residual + (1 - alpha) * bias
-    return params["damping"] * bias
+    if not ph_enabled:
+        bias = 0.0
+        for _, demand, prediction in rows:
+            residual = float(demand) - float(prediction)
+            bias = alpha * residual + (1 - alpha) * bias
+        regular = params["damping"] * bias
+        return regular, regular  # no boost available for this station - both equal
+    return _page_hinkley_dual_bias(rows, params, PH_ADAPTIVE_PARAMS)
 
 
-# --- CUSUM-adaptive EWMA (regime-shift boost) -------------------------------
+def blend_horizon_bias(regular_bias: float, boosted_bias: float, horizon: int) -> float:
+    """Pure, no-I/O blend of the two station_bias_components() outputs for a
+    given forecast horizon - see _horizon_decay_weight and EWMA_DECAY_POWER's
+    docstring/comment above for why horizon 1 gets the full boosted_bias and
+    later horizons decay fast back toward regular_bias."""
+    weight = _horizon_decay_weight(horizon)
+    return weight * boosted_bias + (1 - weight) * regular_bias
+
+
+def station_horizon_bias(station_id: str, horizon: int) -> float:
+    """The correction to ADD to a station's raw model prediction for one
+    specific forecast horizon, right now. Convenience single-call wrapper
+    around station_bias_components + blend_horizon_bias for callers that
+    only need one (station, horizon) pair; a caller needing multiple
+    horizons for the same station (submit_xgboost.py) should call
+    station_bias_components once and blend_horizon_bias per horizon instead,
+    to avoid repeating the DB read."""
+    regular_bias, boosted_bias = station_bias_components(station_id)
+    return blend_horizon_bias(regular_bias, boosted_bias, horizon)
+
+
+# --- Page-Hinkley-adaptive EWMA (regime-shift boost) ------------------------
 #
 # On top of the fixed EWMA above, a station with the boost currently on (per
-# _is_cusum_enabled) also runs a two-sided CUSUM change-point detector on its
-# standardized residuals.
-# While no change point has fired, its behavior is identical to the plain
-# fixed EWMA above. Once CUSUM fires (a real, sustained deviation - not
-# routine noise), the station switches to a more reactive (alpha, damping)
-# pair for a fixed cooldown window, then reverts. Built to react fast to a
-# genuine regime shift (like 05100's multi-hour demand collapses) without
-# the extra reactivity permanently hurting the other, well-behaved stations.
+# _is_page_hinkley_enabled) also runs a two-sided Page-Hinkley change-point
+# test on its standardized residuals - a classical sequential change-
+# detection test (the same family as CUSUM, which this replaced on
+# 2026-09-28: both track a cumulative sum of standardized residuals and
+# alarm once it drifts too far, but Page-Hinkley compares against its own
+# running minimum/maximum rather than resetting to a hard zero floor).
+# Backtested head-to-head against CUSUM on the same 12 stations and held-out
+# window: Page-Hinkley matched or slightly exceeded CUSUM's win on 05100's
+# real collapse, and did so WITHOUT the small regressions CUSUM caused on
+# 09000/09122 - a strict improvement, not just a different tradeoff.
 #
-# Backtested 2026-09-27 on all 12 stations, 3 independent chronological
+# While no change point has fired, its behavior is identical to the plain
+# fixed EWMA above. Once Page-Hinkley fires (a real, sustained deviation -
+# not routine noise), the station switches to a more reactive (alpha,
+# damping) pair for a fixed cooldown window, then reverts. Built to react
+# fast to a genuine regime shift (like 05100's multi-hour demand collapses)
+# without the extra reactivity permanently hurting the other, well-behaved
+# stations.
+#
+# Originally backtested as CUSUM on 2026-09-27, 3 independent chronological
 # folds never touched during tuning: a per-station-tuned version overfit
 # badly (~500 train points isn't enough to pin down 4 free params per
 # station - different folds picked different "best" configs for the same
@@ -249,110 +318,131 @@ def station_ewma_bias(station_id: str) -> float:
 # never re-tuned per station (that's what overfit in the first place) - the
 # only thing that varies per station is whether it's turned on at all.
 #
-# CUSUM_ENABLED_STATIONS below is only the bootstrap default (the 3 stations
+# PH_ENABLED_STATIONS below is only the bootstrap default (the 3 stations
 # with a real, fold-consistent gain in that first backtest: 05100 large,
 # 06000/07111 small but never negative). Which stations actually have it on
-# is re-decided every time that station retrains, by _update_cusum_enabled_state
-# below - so a station that starts showing 05100-like behavior later earns
-# the boost the next time it retrains, without needing a code change, and one
-# that stops benefiting loses it just as automatically.
-CUSUM_K = 0.5  # standard slack: detect a shift of >= 1 std
-CUSUM_STD_WINDOW = 96  # ~1 day at 15min cadence, causal rolling std for standardizing residuals
-CUSUM_ADAPTIVE_PARAMS = {"boost_alpha": 0.4, "boost_damping": 0.7, "cooldown": 80, "cusum_h": 20.0}
-CUSUM_ENABLED_STATIONS: frozenset[str] = frozenset({"05100", "06000", "07111"})
+# is re-decided every time that station retrains, by
+# _update_page_hinkley_enabled_state below - so a station that starts
+# showing 05100-like behavior later earns the boost the next time it
+# retrains, without needing a code change, and one that stops benefiting
+# loses it just as automatically.
+PH_DELTA = 0.5  # slack: ignore drift smaller than this many std, in either direction
+PH_STD_WINDOW = 96  # ~1 day at 15min cadence, causal rolling std for standardizing residuals
+PH_ADAPTIVE_PARAMS = {"boost_alpha": 0.4, "boost_damping": 0.7, "cooldown": 80, "lambda": 25.0}
+PH_ENABLED_STATIONS: frozenset[str] = frozenset({"05100", "06000", "07111"})
 # A candidate must beat the plain fixed EWMA by at least this much (on that
 # station's own full recorded prediction history) before retraining flips it
 # on - same margin and rationale as MIN_EWMA_IMPROVEMENT_PP above: a result
 # under a real margin is noise, not a genuine, actionable difference.
-MIN_CUSUM_IMPROVEMENT_PP = 0.5
-# Long enough for the rolling std window plus the longest cooldown a CUSUM
-# alarm could still be "inside" of, plus slack - independent of (and much
-# larger than) the plain-EWMA lookback above, which decays away almost all
-# of a station's history within ~50-150 rows and would be too short here.
-CUSUM_LOOKBACK_ROWS = CUSUM_STD_WINDOW + CUSUM_ADAPTIVE_PARAMS["cooldown"] + 50
+MIN_PH_IMPROVEMENT_PP = 0.5
+# Long enough for the rolling std window plus the longest cooldown an alarm
+# could still be "inside" of, plus slack - independent of (and much larger
+# than) the plain-EWMA lookback above, which decays away almost all of a
+# station's history within ~50-150 rows and would be too short here.
+PH_LOOKBACK_ROWS = PH_STD_WINDOW + PH_ADAPTIVE_PARAMS["cooldown"] + 50
 
 
-def _cusum_step(residual: float, state: dict, boost_params: dict) -> bool:
-    """One causal CUSUM update, mutating `state` (keys: s_pos, s_neg,
-    cooldown_left, window) in place. Returns True the instant an alarm fires
-    on this exact step. Shared by every function below that needs the CUSUM
-    state machine, so the fiddly two-sided-test bookkeeping exists in exactly
-    one place instead of being retyped (and able to drift out of sync) in
-    each caller."""
+def _page_hinkley_step(residual: float, state: dict, boost_params: dict) -> bool:
+    """One causal Page-Hinkley update, mutating `state` (keys: m_pos, M_pos,
+    m_neg, M_neg, cooldown_left, window) in place. Returns True the instant
+    an alarm fires on this exact step. Shared by every function below that
+    needs the Page-Hinkley state machine, so the fiddly two-sided-test
+    bookkeeping exists in exactly one place instead of being retyped (and
+    able to drift out of sync) in each caller.
+
+    m_pos/m_neg are running cumulative sums of the standardized residual
+    (minus a small slack, PH_DELTA) in each direction; M_pos/M_neg track
+    their all-time running MINIMUM (never reset except on alarm) - the
+    alarm condition is how far the cumulative sum has climbed since its own
+    best point, which is what distinguishes Page-Hinkley from CUSUM's
+    reset-to-zero-floor test above it replaced.
+    """
     window = state["window"]
     std = statistics.pstdev(window) if len(window) >= 10 else None
     alarmed = False
     if std and std > 1e-6:
         z = residual / std
-        state["s_pos"] = max(0.0, state["s_pos"] + z - CUSUM_K)
-        state["s_neg"] = max(0.0, state["s_neg"] - z - CUSUM_K)
-        if state["s_pos"] > boost_params["cusum_h"] or state["s_neg"] > boost_params["cusum_h"]:
+        state["m_pos"] += z - PH_DELTA
+        state["M_pos"] = min(state["M_pos"], state["m_pos"])
+        ph_pos = state["m_pos"] - state["M_pos"]
+        state["m_neg"] += -z - PH_DELTA
+        state["M_neg"] = min(state["M_neg"], state["m_neg"])
+        ph_neg = state["m_neg"] - state["M_neg"]
+        if ph_pos > boost_params["lambda"] or ph_neg > boost_params["lambda"]:
             state["cooldown_left"] = boost_params["cooldown"]
-            state["s_pos"] = state["s_neg"] = 0.0
+            state["m_pos"] = state["M_pos"] = 0.0
+            state["m_neg"] = state["M_neg"] = 0.0
             alarmed = True
         elif state["cooldown_left"] > 0:
             state["cooldown_left"] -= 1
     elif state["cooldown_left"] > 0:
         state["cooldown_left"] -= 1
     window.append(residual)
-    if len(window) > CUSUM_STD_WINDOW:
+    if len(window) > PH_STD_WINDOW:
         window.pop(0)
     return alarmed
 
 
-def _new_cusum_state() -> dict:
-    return {"s_pos": 0.0, "s_neg": 0.0, "cooldown_left": 0, "window": []}
+def _new_page_hinkley_state() -> dict:
+    return {"m_pos": 0.0, "M_pos": 0.0, "m_neg": 0.0, "M_neg": 0.0, "cooldown_left": 0, "window": []}
 
 
-def _cusum_adaptive_bias(rows: list[tuple], normal_params: dict, boost_params: dict) -> float:
-    """Causal (no-lookahead) walk over `rows` (chronological), returning the
-    damped bias correction as of the LAST row - same idea as the plain EWMA
-    loop above, but with a CUSUM-triggered boosted regime layered on top."""
+def _page_hinkley_dual_bias(rows: list[tuple], normal_params: dict, boost_params: dict) -> tuple[float, float]:
+    """Causal (no-lookahead) walk over `rows` (chronological), returning
+    (regular_bias, boosted_bias) as of the LAST row in one pass - the plain
+    fixed-EWMA bias (as if Page-Hinkley never boosted at all) and the
+    Page-Hinkley-boosted bias, computed together so station_bias_components
+    needs only one walk over the fetched rows regardless of how many
+    horizons the caller ends up blending."""
     normal_alpha, normal_damping = normal_params["alpha"], normal_params["damping"]
     boost_alpha, boost_damping = boost_params["boost_alpha"], boost_params["boost_damping"]
 
-    raw_bias = 0.0
-    damping = normal_damping
-    state = _new_cusum_state()
+    regular_raw_bias = 0.0
+    boosted_raw_bias = 0.0
+    boosted_damping = normal_damping
+    state = _new_page_hinkley_state()
 
     for _, demand, prediction in rows:
         residual = float(demand) - float(prediction)
+        regular_raw_bias = normal_alpha * residual + (1 - normal_alpha) * regular_raw_bias
+
         boosted = state["cooldown_left"] > 0
         alpha = boost_alpha if boosted else normal_alpha
-        damping = boost_damping if boosted else normal_damping
-        raw_bias = alpha * residual + (1 - alpha) * raw_bias
-        _cusum_step(residual, state, boost_params)
+        boosted_damping = boost_damping if boosted else normal_damping
+        boosted_raw_bias = alpha * residual + (1 - alpha) * boosted_raw_bias
+        _page_hinkley_step(residual, state, boost_params)
 
-    return damping * raw_bias
+    return normal_damping * regular_raw_bias, boosted_damping * boosted_raw_bias
 
 
-def _cusum_recently_alarmed(rows: list[tuple]) -> bool:
+def _page_hinkley_recently_alarmed(rows: list[tuple]) -> bool:
     """Detection only - never changes any prediction or correction. True if a
-    real CUSUM change point fired within the last `cooldown` points of this
-    station's own residual history, i.e. a genuine, sustained regime shift is
-    still "fresh". Safe to run for EVERY station, including ones outside
-    CUSUM_ENABLED_STATIONS or a brand-new station never seen before, as a
-    faster-reacting companion to the RECENT_CHECKS/ACCURACY_THRESHOLD drift
+    real Page-Hinkley change point fired within the last `cooldown` points of
+    this station's own residual history, i.e. a genuine, sustained regime
+    shift is still "fresh". Safe to run for EVERY station, including ones
+    outside PH_ENABLED_STATIONS or a brand-new station never seen before, as
+    a faster-reacting companion to the RECENT_CHECKS/ACCURACY_THRESHOLD drift
     gate below: that gate needs a full 4-point accuracy window to average
     below the bar before it fires, while a real regime shift shows up in
-    CUSUM's statistical test point by point, well before that average would
-    catch up. This only ever pulls a station INTO consideration earlier -
-    the separate MIN_NEW_FOR_RETRAIN row-count floor in check_and_retrain
-    still applies unconditionally afterward, so a real alarm with no new
-    data yet never spends a wasted retrain."""
-    state = _new_cusum_state()
+    Page-Hinkley's statistical test point by point, well before that average
+    would catch up. This only ever pulls a station INTO consideration
+    earlier - the separate MIN_NEW_FOR_RETRAIN row-count floor in
+    check_and_retrain still applies unconditionally afterward, so a real
+    alarm with no new data yet never spends a wasted retrain."""
+    state = _new_page_hinkley_state()
     for _, demand, prediction in rows:
         residual = float(demand) - float(prediction)
-        _cusum_step(residual, state, CUSUM_ADAPTIVE_PARAMS)
+        _page_hinkley_step(residual, state, PH_ADAPTIVE_PARAMS)
     return state["cooldown_left"] > 0
 
 
-def _station_has_fresh_cusum_alarm(station_id: str) -> bool:
-    """Whether _cusum_recently_alarmed(...) is true for this station right
-    now, fetching just enough recent history to evaluate it. Called every
-    cycle for every station that isn't already flagged as accuracy-drifted
-    (see check_and_retrain) - a bounded (CUSUM_LOOKBACK_ROWS-row) query, not
-    the kind of unbounded scan this file's other egress fixes were about."""
+def _station_has_fresh_page_hinkley_alarm(station_id: str) -> bool:
+    """Whether _page_hinkley_recently_alarmed(...) is true for this station
+    right now, fetching just enough recent history to evaluate it. Called
+    every cycle for every station that isn't already flagged as accuracy-
+    drifted (see check_and_retrain) - a bounded (PH_LOOKBACK_ROWS-row) query,
+    not the kind of unbounded scan this file's other egress fixes were
+    about."""
     with connection() as conn:
         rows = conn.execute(
             """SELECT observed_at, demand, prediction FROM (
@@ -364,12 +454,12 @@ def _station_has_fresh_cusum_alarm(station_id: str) -> bool:
                ) recent
                ORDER BY observed_at DESC
                LIMIT %s""",
-            (station_id, station_id, CUSUM_LOOKBACK_ROWS),
+            (station_id, station_id, PH_LOOKBACK_ROWS),
         ).fetchall()
     if len(rows) < 10:
         return False
     rows.reverse()
-    return _cusum_recently_alarmed(rows)
+    return _page_hinkley_recently_alarmed(rows)
 
 
 def _accuracy_score(abs_err: float, abs_dem: float) -> float:
@@ -379,7 +469,7 @@ def _accuracy_score(abs_err: float, abs_dem: float) -> float:
 def _fixed_ewma_accuracy(rows: list[tuple], normal_params: dict) -> float:
     """WAPE-based accuracy (matches station_accuracy_stats's own formula) of
     the plain fixed EWMA over `rows` (chronological) - the baseline that
-    _cusum_would_help compares the CUSUM-boosted regime against."""
+    _page_hinkley_would_help compares the boosted regime against."""
     alpha, damping = normal_params["alpha"], normal_params["damping"]
     raw_bias = 0.0
     abs_err = abs_dem = 0.0
@@ -392,14 +482,18 @@ def _fixed_ewma_accuracy(rows: list[tuple], normal_params: dict) -> float:
     return _accuracy_score(abs_err, abs_dem)
 
 
-def _cusum_adaptive_accuracy(rows: list[tuple], normal_params: dict, boost_params: dict) -> float:
-    """Same idea as _fixed_ewma_accuracy, but with the CUSUM-boosted regime
-    layered on top - the number _cusum_would_help compares against it."""
+def _page_hinkley_adaptive_accuracy(rows: list[tuple], normal_params: dict, boost_params: dict) -> float:
+    """Same idea as _fixed_ewma_accuracy, but with the Page-Hinkley-boosted
+    regime layered on top - the number _page_hinkley_would_help compares
+    against it. Always uses the FULL boosted bias at every row (weight=1),
+    matching horizon 1 - the horizon the boost is actually tuned and
+    evaluated on; see EWMA_DECAY_POWER's comment for why later horizons
+    deliberately get less of it."""
     normal_alpha, normal_damping = normal_params["alpha"], normal_params["damping"]
     boost_alpha, boost_damping = boost_params["boost_alpha"], boost_params["boost_damping"]
     raw_bias = 0.0
     abs_err = abs_dem = 0.0
-    state = _new_cusum_state()
+    state = _new_page_hinkley_state()
     for _, demand, prediction in rows:
         demand, prediction = float(demand), float(prediction)
         boosted = state["cooldown_left"] > 0
@@ -410,25 +504,25 @@ def _cusum_adaptive_accuracy(rows: list[tuple], normal_params: dict, boost_param
         abs_dem += abs(demand)
         residual = demand - prediction
         raw_bias = alpha * residual + (1 - alpha) * raw_bias
-        _cusum_step(residual, state, boost_params)
+        _page_hinkley_step(residual, state, boost_params)
     return _accuracy_score(abs_err, abs_dem)
 
 
-def _cusum_would_help(station_id: str) -> bool | None:
-    """Whether the single SHARED CUSUM_ADAPTIVE_PARAMS config would beat the
-    plain fixed EWMA by at least MIN_CUSUM_IMPROVEMENT_PP on this station's
-    own full recorded (demand, prediction) history - never re-tuning the
-    boost's own numbers per station (that's what overfit in the 2026-09-27
+def _page_hinkley_would_help(station_id: str) -> bool | None:
+    """Whether the single SHARED PH_ADAPTIVE_PARAMS config would beat the
+    plain fixed EWMA by at least MIN_PH_IMPROVEMENT_PP on this station's own
+    full recorded (demand, prediction) history - never re-tuning the boost's
+    own numbers per station (that's what overfit in the 2026-09-27
     per-station backtest), only ever asking a yes/no question about the
     fixed config. Returns None (meaning "don't change anything") when there
     isn't enough history yet to trust the comparison.
 
     Reads the station's COMPLETE history, deliberately unbounded: this only
-    runs once per retrain (see _update_cusum_enabled_state), and a retrain
-    already reads this station's entire history anyway to build the training
-    frame, so this adds no new class of cost - unlike station_ewma_bias
-    above, which runs every ~5min submission cycle and is bounded for
-    exactly that reason.
+    runs once per retrain (see _update_page_hinkley_enabled_state), and a
+    retrain already reads this station's entire history anyway to build the
+    training frame, so this adds no new class of cost - unlike
+    station_bias_components above, which runs every ~5min submission cycle
+    and is bounded for exactly that reason.
     """
     with connection() as conn:
         rows = conn.execute(
@@ -440,28 +534,28 @@ def _cusum_would_help(station_id: str) -> bool | None:
                ORDER BY observed_at""",
             (station_id, station_id),
         ).fetchall()
-    if len(rows) < CUSUM_LOOKBACK_ROWS:
+    if len(rows) < PH_LOOKBACK_ROWS:
         return None
     fixed_acc = _fixed_ewma_accuracy(rows, DEFAULT_EWMA_PARAMS)
-    adaptive_acc = _cusum_adaptive_accuracy(rows, DEFAULT_EWMA_PARAMS, CUSUM_ADAPTIVE_PARAMS)
-    return (adaptive_acc - fixed_acc) >= (MIN_CUSUM_IMPROVEMENT_PP / 100)
+    adaptive_acc = _page_hinkley_adaptive_accuracy(rows, DEFAULT_EWMA_PARAMS, PH_ADAPTIVE_PARAMS)
+    return (adaptive_acc - fixed_acc) >= (MIN_PH_IMPROVEMENT_PP / 100)
 
 
-def _update_cusum_enabled_state(station_id: str) -> None:
-    """Re-decides whether station_id gets the CUSUM-adaptive EWMA boost,
-    called once per retrain (see check_and_retrain), and persists the
+def _update_page_hinkley_enabled_state(station_id: str) -> None:
+    """Re-decides whether station_id gets the Page-Hinkley-adaptive EWMA
+    boost, called once per retrain (see check_and_retrain), and persists the
     decision in "collector_state" (the same generic key/value table
     collector.py already uses for its own cursor) under the key
-    "cusum_enabled:{station_id}" - each GitHub Actions run is a fresh
+    "page_hinkley_enabled:{station_id}" - each GitHub Actions run is a fresh
     process, so the decision has to live in the DB to survive between
     retrains, not in memory.
 
-    Leaves the stored value untouched when _cusum_would_help can't yet form
-    an opinion (not enough history) - a station keeps whatever its last real
-    decision was (or the CUSUM_ENABLED_STATIONS bootstrap default, if it's
+    Leaves the stored value untouched when _page_hinkley_would_help can't yet
+    form an opinion (not enough history) - a station keeps whatever its last
+    real decision was (or the PH_ENABLED_STATIONS bootstrap default, if it's
     never had one) rather than being silently switched off for lack of data.
     """
-    would_help = _cusum_would_help(station_id)
+    would_help = _page_hinkley_would_help(station_id)
     if would_help is None:
         return
     with connection() as conn:
@@ -470,24 +564,24 @@ def _update_cusum_enabled_state(station_id: str) -> None:
                VALUES (%s, %s, now())
                ON CONFLICT (state_key) DO UPDATE
                SET cursor_value = EXCLUDED.cursor_value, updated_at = now()""",
-            (f"cusum_enabled:{station_id}", "true" if would_help else "false"),
+            (f"page_hinkley_enabled:{station_id}", "true" if would_help else "false"),
         )
 
 
-def _is_cusum_enabled(station_id: str) -> bool:
-    """Whether station_id has the CUSUM-adaptive EWMA boost on right now.
-    Reads collector_state's stored per-station decision (a single indexed
-    row lookup - cheap, unlike the unbounded scans this file's egress fixes
-    were about) and falls back to the CUSUM_ENABLED_STATIONS bootstrap
-    default for a station that hasn't retrained since this mechanism was
-    added and so has no stored decision yet."""
+def _is_page_hinkley_enabled(station_id: str) -> bool:
+    """Whether station_id has the Page-Hinkley-adaptive EWMA boost on right
+    now. Reads collector_state's stored per-station decision (a single
+    indexed row lookup - cheap, unlike the unbounded scans this file's
+    egress fixes were about) and falls back to the PH_ENABLED_STATIONS
+    bootstrap default for a station that hasn't retrained since this
+    mechanism was added and so has no stored decision yet."""
     with connection() as conn:
         row = conn.execute(
             "SELECT cursor_value FROM collector_state WHERE state_key = %s",
-            (f"cusum_enabled:{station_id}",),
+            (f"page_hinkley_enabled:{station_id}",),
         ).fetchone()
     if row is None:
-        return station_id in CUSUM_ENABLED_STATIONS
+        return station_id in PH_ENABLED_STATIONS
     return row[0] == "true"
 
 
@@ -672,17 +766,18 @@ def check_and_retrain() -> list[str]:
     """Detect drifted stations and retrain + republish their models. Returns the list retrained."""
     stats = station_accuracy_stats()
     drifted = set(stations_needing_retrain(stats))
-    # A confirmed CUSUM alarm - a real, sustained regime shift, not noise -
-    # can pull a station into consideration even before its own crude
-    # RECENT_CHECKS(4)-point rolling accuracy has dropped below
+    # A confirmed Page-Hinkley alarm - a real, sustained regime shift, not
+    # noise - can pull a station into consideration even before its own
+    # crude RECENT_CHECKS(4)-point rolling accuracy has dropped below
     # ACCURACY_THRESHOLD, since that short average can lag behind what
-    # CUSUM's statistical test already sees. This only ever ADDS candidates:
-    # it bypasses the ACCURACY_THRESHOLD gate, never the MIN_NEW_FOR_RETRAIN
-    # row-count floor below, which every candidate still has to clear
-    # regardless of why it's here - a real regime shift with no new data yet
-    # to retrain on is not a reason to spend a retrain on unchanged data.
+    # Page-Hinkley's statistical test already sees. This only ever ADDS
+    # candidates: it bypasses the ACCURACY_THRESHOLD gate, never the
+    # MIN_NEW_FOR_RETRAIN row-count floor below, which every candidate still
+    # has to clear regardless of why it's here - a real regime shift with no
+    # new data yet to retrain on is not a reason to spend a retrain on
+    # unchanged data.
     for station_id in stats["station_id"]:
-        if station_id not in drifted and _station_has_fresh_cusum_alarm(station_id):
+        if station_id not in drifted and _station_has_fresh_page_hinkley_alarm(station_id):
             drifted.add(station_id)
 
     retrained = []
@@ -699,9 +794,9 @@ def check_and_retrain() -> list[str]:
             _upload_model(station_id, horizon, path)
         merged = _promote_temp_to_original(station_id)
         retrained.append(station_id)
-        was_enabled = _is_cusum_enabled(station_id)
-        _update_cusum_enabled_state(station_id)
-        now_enabled = _is_cusum_enabled(station_id)
+        was_enabled = _is_page_hinkley_enabled(station_id)
+        _update_page_hinkley_enabled_state(station_id)
+        now_enabled = _is_page_hinkley_enabled(station_id)
         print(
             f"Drift en {station_id}: reentrenados {len(HORIZONS)} horizontes con {len(frame)} observaciones "
             f"({merged} nuevas incorporadas al histórico), modelos republicados en Supabase.",
@@ -709,7 +804,7 @@ def check_and_retrain() -> list[str]:
         )
         if now_enabled != was_enabled:
             print(
-                f"CUSUM-adaptive EWMA para {station_id}: "
+                f"Page-Hinkley-adaptive EWMA para {station_id}: "
                 f"{'activado' if now_enabled else 'desactivado'} tras este reentrenamiento.",
                 flush=True,
             )

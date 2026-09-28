@@ -5,7 +5,7 @@ import pandas as pd
 from app.drift import (
     check_and_retrain,
     station_accuracy_stats,
-    station_ewma_bias,
+    station_horizon_bias,
     stations_needing_retrain,
 )
 
@@ -29,9 +29,10 @@ class FakeConnection:
         return self.rows
 
     def fetchone(self):
-        # _is_cusum_enabled's collector_state lookup: no stored decision in
-        # this fixture, so it falls back to the CUSUM_ENABLED_STATIONS
-        # bootstrap default, same as a station that's never retrained yet.
+        # _is_page_hinkley_enabled's collector_state lookup: no stored
+        # decision in this fixture, so it falls back to the
+        # PH_ENABLED_STATIONS bootstrap default, same as a station that's
+        # never retrained yet.
         if "collector_state" in self._query:
             return None
         return self.rows[0] if self.rows else None
@@ -106,14 +107,15 @@ def test_stations_needing_retrain_empty_stats():
 class RoutedFakeConnection:
     """Dispatches each query to canned rows based on the table/params it touches."""
 
-    def __init__(self, temp_accuracy_rows, historical_rows, temp_recent_rows, cusum_history_rows=None):
+    def __init__(self, temp_accuracy_rows, historical_rows, temp_recent_rows, ph_history_rows=None):
         self.temp_accuracy_rows = temp_accuracy_rows
         self.historical_rows = historical_rows
         self.temp_recent_rows = temp_recent_rows
-        # _cusum_would_help's full-history query, keyed by state_key suffix
-        # (default: not enough rows to form an opinion, i.e. _update_cusum_
-        # enabled_state should no-op). Override per test via this dict.
-        self.cusum_history_rows = cusum_history_rows if cusum_history_rows is not None else []
+        # _page_hinkley_would_help's full-history query, keyed by state_key
+        # suffix (default: not enough rows to form an opinion, i.e.
+        # _update_page_hinkley_enabled_state should no-op). Override per
+        # test via this dict.
+        self.ph_history_rows = ph_history_rows if ph_history_rows is not None else []
         self.collector_state: dict[str, str] = {}
         self.executed = []
         self._last_rowcount = 0
@@ -138,23 +140,24 @@ class RoutedFakeConnection:
             self._result = None
             self._last_rowcount = len(self.temp_recent_rows)
         elif 'INSERT INTO collector_state' in query:
-            # _update_cusum_enabled_state's upsert: params = (state_key, value).
+            # _update_page_hinkley_enabled_state's upsert: params = (state_key, value).
             self.collector_state[params[0]] = params[1]
             self._result = None
         elif 'FROM collector_state' in query:
-            # _is_cusum_enabled's lookup: params = (state_key,).
+            # _is_page_hinkley_enabled's lookup: params = (state_key,).
             value = self.collector_state.get(params[0])
             self._result = (value,) if value is not None else None
         elif ') recent' in query:
-            # station_ewma_bias / _station_has_fresh_cusum_alarm's bounded
-            # combined-history query. None of this fixture's rows carry a
-            # `prediction` column, so there's nothing to evaluate - no alarm,
-            # and the CUSUM path (if enabled) sees no rows either.
+            # station_bias_components / _station_has_fresh_page_hinkley_alarm's
+            # bounded combined-history query. None of this fixture's rows
+            # carry a `prediction` column, so there's nothing to evaluate -
+            # no alarm, and the boosted path (if enabled) sees no rows either.
             self._result = []
         elif 'UNION ALL' in query and 'ORDER BY observed_at' in query:
-            # _cusum_would_help's unbounded full-history query (no DESC, no
-            # ") recent" wrapper - distinct from the two branches above).
-            self._result = self.cusum_history_rows
+            # _page_hinkley_would_help's unbounded full-history query (no
+            # DESC, no ") recent" wrapper - distinct from the two branches
+            # above).
+            self._result = self.ph_history_rows
         elif 'FROM "Original Data" WHERE station_id' in query:
             self._result = self.historical_rows
         elif 'FROM "Temp" WHERE station_id' in query:
@@ -294,7 +297,7 @@ def test_station_ewma_bias_tracks_a_sustained_miss(monkeypatch):
     ]
     monkeypatch.setattr("app.drift.connection", lambda: FakeConnection(rows))
 
-    bias = station_ewma_bias("A")
+    bias = station_horizon_bias("A", 1)
 
     # Every residual is -100 (actual - predicted); the EWMA should converge
     # toward -100 * damping, and always stay on the "correct downward" side.
@@ -309,7 +312,7 @@ def test_station_ewma_bias_tracks_a_sustained_miss(monkeypatch):
 def test_station_ewma_bias_zero_with_no_history(monkeypatch):
     monkeypatch.setattr("app.drift.connection", lambda: FakeConnection([]))
 
-    assert station_ewma_bias("A") == 0.0
+    assert station_horizon_bias("A", 1) == 0.0
 
 
 def test_station_ewma_bias_processes_rows_in_chronological_order(monkeypatch):
@@ -328,7 +331,7 @@ def test_station_ewma_bias_processes_rows_in_chronological_order(monkeypatch):
     ]
     monkeypatch.setattr("app.drift.connection", lambda: FakeConnection(list(rows_desc)))
 
-    bias = station_ewma_bias("A")
+    bias = station_horizon_bias("A", 1)
 
     alpha, damping = 0.2, 0.5
     expected_raw = 0.0
@@ -365,7 +368,7 @@ def test_ewma_lookback_rows_bounds_query_and_stays_accurate(monkeypatch):
 
     monkeypatch.setattr("app.drift.connection", lambda: CapturingConnection([]))
 
-    station_ewma_bias("A")
+    station_horizon_bias("A", 1)
 
     assert "LIMIT" in captured["query"]
     default_alpha = 0.2
@@ -378,70 +381,71 @@ def test_ewma_lookback_rows_bounds_query_and_stays_accurate(monkeypatch):
         assert (1 - alpha) ** lookback < EWMA_TRUNCATION_EPSILON
 
 
-def test_cusum_enabled_station_matches_plain_ewma_when_no_alarm_fires(monkeypatch):
-    """For a CUSUM-enabled station whose residuals never trip the CUSUM
-    threshold, station_ewma_bias() must produce the exact same number as the
-    plain fixed EWMA - the boosted regime should be provably a no-op absent
-    a real, sustained shift, not just "close"."""
-    from app.drift import CUSUM_ENABLED_STATIONS, DEFAULT_EWMA_PARAMS
+def test_page_hinkley_enabled_station_matches_plain_ewma_when_no_alarm_fires(monkeypatch):
+    """For a Page-Hinkley-enabled station whose residuals never trip the
+    alarm threshold, station_horizon_bias() must produce the exact same
+    number as the plain fixed EWMA (at every horizon) - the boosted regime
+    should be provably a no-op absent a real, sustained shift, not just
+    "close"."""
+    from app.drift import PH_ENABLED_STATIONS, DEFAULT_EWMA_PARAMS
 
-    assert "05100" in CUSUM_ENABLED_STATIONS
+    assert "05100" in PH_ENABLED_STATIONS
     rows_desc = [
         ("2026-01-01T00:30:00Z", 100.0, 102.0),
         ("2026-01-01T00:15:00Z", 100.0, 98.0),
         ("2026-01-01T00:00:00Z", 100.0, 101.0),
     ]
-    monkeypatch.setattr("app.drift.connection", lambda: FakeConnection(list(rows_desc)))
-
-    bias = station_ewma_bias("05100")
-
     alpha, damping = DEFAULT_EWMA_PARAMS["alpha"], DEFAULT_EWMA_PARAMS["damping"]
     expected_raw = 0.0
     for _, demand, prediction in reversed(rows_desc):
         expected_raw = alpha * (demand - prediction) + (1 - alpha) * expected_raw
-    assert bias == damping * expected_raw
+    expected = damping * expected_raw
+
+    for horizon in (1, 2, 3, 4):
+        monkeypatch.setattr("app.drift.connection", lambda: FakeConnection(list(rows_desc)))
+        assert station_horizon_bias("05100", horizon) == expected
 
 
-def test_cusum_alarm_fires_on_sustained_shift_not_on_routine_noise():
-    """The CUSUM detector (used both for the boosted-EWMA regime and for the
-    fast retrain path) must stay quiet through ordinary alternating noise,
-    but fire once residuals shift hard and stay shifted - mirroring 05100's
-    real collapse (predictions pinned high while actual demand kept
+def test_page_hinkley_alarm_fires_on_sustained_shift_not_on_routine_noise():
+    """The Page-Hinkley detector (used both for the boosted-EWMA regime and
+    for the fast retrain path) must stay quiet through ordinary alternating
+    noise, but fire once residuals shift hard and stay shifted - mirroring
+    05100's real collapse (predictions pinned high while actual demand kept
     falling)."""
-    from app.drift import _cusum_recently_alarmed
+    from app.drift import _page_hinkley_recently_alarmed
 
     quiet_rows = [
         ("t", 100.0, 100.0 + (5 if i % 2 == 0 else -5)) for i in range(150)
     ]
-    assert _cusum_recently_alarmed(quiet_rows) is False
+    assert _page_hinkley_recently_alarmed(quiet_rows) is False
 
     shifted_rows = list(quiet_rows) + [
         ("t", 100.0, 100.0 + 60 + (5 if i % 2 == 0 else -5)) for i in range(20)
     ]
-    assert _cusum_recently_alarmed(shifted_rows) is True
+    assert _page_hinkley_recently_alarmed(shifted_rows) is True
 
 
 def _alarm_routed_connection(temp_accuracy_rows, historical_rows, temp_recent_rows):
-    """A RoutedFakeConnection where the CUSUM alarm query always reports a
-    real, sustained shift (predictions pinned high while demand suddenly
-    drops and stays down, exactly like 05100's real collapse)."""
+    """A RoutedFakeConnection where the Page-Hinkley alarm query always
+    reports a real, sustained shift (predictions pinned high while demand
+    suddenly drops and stays down, exactly like 05100's real collapse)."""
     quiet = [(f"t{i}", 100.0, 100.0 + (5 if i % 2 == 0 else -5)) for i in range(150)]
     shifted = [(f"t{150+i}", 100.0, 160.0 + (5 if i % 2 == 0 else -5)) for i in range(20)]
-    cusum_history_rows = shifted[::-1] + quiet[::-1]  # DESC order, as the real query returns
+    ph_history_rows = shifted[::-1] + quiet[::-1]  # DESC order, as the real query returns
 
     class AlarmRoutedConnection(RoutedFakeConnection):
         def execute(self, query, params=None):
             if ') recent' in query:
                 self.executed.append((query, params))
-                self._result = cusum_history_rows
+                self._result = ph_history_rows
                 return self
             return super().execute(query, params)
 
     return AlarmRoutedConnection(temp_accuracy_rows, historical_rows, temp_recent_rows)
 
 
-def test_check_and_retrain_cusum_alarm_bypasses_accuracy_not_row_count(monkeypatch, tmp_path):
-    """A confirmed CUSUM alarm pulls a station INTO consideration even
+def test_check_and_retrain_page_hinkley_alarm_bypasses_accuracy_not_row_count(monkeypatch, tmp_path):
+    """A confirmed Page-Hinkley alarm pulls a station INTO consideration even
     though its own crude 4-point rolling accuracy still looks fine (it
     bypasses ACCURACY_THRESHOLD, reacting faster than that short average
     could) - but MIN_NEW_FOR_RETRAIN still has to be satisfied like any
@@ -457,7 +461,7 @@ def test_check_and_retrain_cusum_alarm_bypasses_accuracy_not_row_count(monkeypat
         (start + timedelta(minutes=15 * (700 + i)), 100 + (i % 20)) for i in range(25)
     ]
     # Good accuracy (demand*0.99): stations_needing_retrain would NOT flag
-    # this station on its own - only the CUSUM alarm pulls it in.
+    # this station on its own - only the Page-Hinkley alarm pulls it in.
     temp_accuracy_rows = [(station, demand, demand * 0.99) for _, demand in temp_recent_rows]
 
     fake_conn = _alarm_routed_connection(temp_accuracy_rows, historical_rows, temp_recent_rows)
@@ -474,14 +478,15 @@ def test_check_and_retrain_cusum_alarm_bypasses_accuracy_not_row_count(monkeypat
     assert len(uploads) == 4
 
 
-def test_check_and_retrain_cusum_alarm_never_bypasses_min_new_points(monkeypatch, tmp_path):
-    """The row-count floor is unconditional: a confirmed CUSUM alarm on a
-    station with only a small trickle of new "Temp" rows must NOT retrain -
-    a real regime shift with no meaningful new data yet is not a reason to
-    spend a wasted retrain on effectively unchanged data. (This is the fix
-    for a 2026-09-28 gap: the CUSUM bypass originally skipped
+def test_check_and_retrain_page_hinkley_alarm_never_bypasses_min_new_points(monkeypatch, tmp_path):
+    """The row-count floor is unconditional: a confirmed Page-Hinkley alarm
+    on a station with only a small trickle of new "Temp" rows must NOT
+    retrain - a real regime shift with no meaningful new data yet is not a
+    reason to spend a wasted retrain on effectively unchanged data. (This is
+    the fix for a 2026-09-28 gap: the alarm bypass originally skipped
     MIN_NEW_FOR_RETRAIN entirely, which could fire a full retrain on as few
-    as 0 new rows.)"""
+    as 0 new rows - true first for CUSUM, and true here identically now that
+    Page-Hinkley has replaced it.)"""
     station = "A"
     start = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
@@ -492,8 +497,8 @@ def test_check_and_retrain_cusum_alarm_never_bypasses_min_new_points(monkeypatch
     temp_recent_rows = [
         (start + timedelta(minutes=15 * (700 + i)), 100 + (i % 20)) for i in range(5)
     ]
-    # Good accuracy: only the (irrelevant here) CUSUM alarm could pull this
-    # station in, and it still must not retrain.
+    # Good accuracy: only the (irrelevant here) Page-Hinkley alarm could pull
+    # this station in, and it still must not retrain.
     temp_accuracy_rows = [(station, demand, demand * 0.99) for _, demand in temp_recent_rows]
 
     fake_conn = _alarm_routed_connection(temp_accuracy_rows, historical_rows, temp_recent_rows)
@@ -524,64 +529,64 @@ def _quiet_then_shifted_rows(quiet_n: int, shift_n: int, shift_mag: float = 60.0
     return quiet + shifted
 
 
-def test_cusum_would_help_none_when_too_little_history(monkeypatch):
-    """_update_cusum_enabled_state must not flip a station on or off off the
-    back of too little data - a station with fewer than CUSUM_LOOKBACK_ROWS
-    recorded prediction/actual pairs should get None (i.e. "leave the
-    existing decision alone"), not a guess."""
-    from app.drift import _cusum_would_help, CUSUM_LOOKBACK_ROWS
+def test_page_hinkley_would_help_none_when_too_little_history(monkeypatch):
+    """_update_page_hinkley_enabled_state must not flip a station on or off
+    off the back of too little data - a station with fewer than
+    PH_LOOKBACK_ROWS recorded prediction/actual pairs should get None (i.e.
+    "leave the existing decision alone"), not a guess."""
+    from app.drift import _page_hinkley_would_help, PH_LOOKBACK_ROWS
 
     rows = _quiet_then_shifted_rows(50, 10)
-    assert len(rows) < CUSUM_LOOKBACK_ROWS
+    assert len(rows) < PH_LOOKBACK_ROWS
     monkeypatch.setattr("app.drift.connection", lambda: FakeConnection(rows))
 
-    assert _cusum_would_help("A") is None
+    assert _page_hinkley_would_help("A") is None
 
 
-def test_cusum_would_help_true_for_sustained_shift_false_for_pure_noise(monkeypatch):
-    """The yes/no question _update_cusum_enabled_state actually asks: would
-    the single SHARED CUSUM_ADAPTIVE_PARAMS config (never re-tuned per
+def test_page_hinkley_would_help_true_for_sustained_shift_false_for_pure_noise(monkeypatch):
+    """The yes/no question _update_page_hinkley_enabled_state actually asks:
+    would the single SHARED PH_ADAPTIVE_PARAMS config (never re-tuned per
     station) beat the plain fixed EWMA by a real margin on this station's
     own history? A station with a real, sustained collapse should clear the
     bar; a station that's just ordinary noise the whole time should not -
     this is what keeps 09000/09122 (which never showed this pattern) from
     getting the boost even after future retrains."""
-    from app.drift import _cusum_would_help
+    from app.drift import _page_hinkley_would_help
 
     shifted_rows = _quiet_then_shifted_rows(200, 100)
     monkeypatch.setattr("app.drift.connection", lambda: FakeConnection(shifted_rows))
-    assert _cusum_would_help("A") is True
+    assert _page_hinkley_would_help("A") is True
 
     quiet_rows = _quiet_then_shifted_rows(300, 0)
     monkeypatch.setattr("app.drift.connection", lambda: FakeConnection(quiet_rows))
-    assert _cusum_would_help("A") is False
+    assert _page_hinkley_would_help("A") is False
 
 
-def test_update_and_read_back_cusum_enabled_state(monkeypatch):
-    """_update_cusum_enabled_state's decision must round-trip through
-    _is_cusum_enabled via collector_state - the persistence a fresh
+def test_update_and_read_back_page_hinkley_enabled_state(monkeypatch):
+    """_update_page_hinkley_enabled_state's decision must round-trip through
+    _is_page_hinkley_enabled via collector_state - the persistence a fresh
     GitHub Actions process needs to remember a decision made by a previous
     retrain."""
-    from app.drift import _is_cusum_enabled, _update_cusum_enabled_state, CUSUM_ENABLED_STATIONS
+    from app.drift import _is_page_hinkley_enabled, _update_page_hinkley_enabled_state, PH_ENABLED_STATIONS
 
-    conn = RoutedFakeConnection([], [], [], cusum_history_rows=_quiet_then_shifted_rows(200, 100))
+    conn = RoutedFakeConnection([], [], [], ph_history_rows=_quiet_then_shifted_rows(200, 100))
     monkeypatch.setattr("app.drift.connection", lambda: conn)
 
     # A station outside the bootstrap default starts falling back to it.
     station = "never-seen-before"
-    assert station not in CUSUM_ENABLED_STATIONS
-    assert _is_cusum_enabled(station) is False
+    assert station not in PH_ENABLED_STATIONS
+    assert _is_page_hinkley_enabled(station) is False
 
-    _update_cusum_enabled_state(station)
+    _update_page_hinkley_enabled_state(station)
 
-    assert _is_cusum_enabled(station) is True
-    assert conn.collector_state[f"cusum_enabled:{station}"] == "true"
+    assert _is_page_hinkley_enabled(station) is True
+    assert conn.collector_state[f"page_hinkley_enabled:{station}"] == "true"
 
 
-def test_check_and_retrain_updates_cusum_state_for_newly_justified_station(monkeypatch, tmp_path):
+def test_check_and_retrain_updates_page_hinkley_state_for_newly_justified_station(monkeypatch, tmp_path):
     """The actual behavior the user asked for: when a station retrains, it
-    should also get checked for whether the shared CUSUM config is now
-    justified for it - not just the fixed 05100/06000/07111 set decided
+    should also get checked for whether the shared Page-Hinkley config is
+    now justified for it - not just the fixed 05100/06000/07111 set decided
     once on 2026-09-27. A station outside that set whose full history now
     shows a real, sustained shift should come out of this retrain with the
     boost turned on."""
@@ -595,10 +600,10 @@ def test_check_and_retrain_updates_cusum_state_for_newly_justified_station(monke
         (start + timedelta(minutes=15 * (700 + i)), 100 + (i % 20)) for i in range(60)
     ]
     temp_accuracy_rows = [(station, demand, demand * 0.7) for _, demand in temp_recent_rows]
-    cusum_history_rows = _quiet_then_shifted_rows(200, 100)
+    ph_history_rows = _quiet_then_shifted_rows(200, 100)
 
     fake_conn = RoutedFakeConnection(
-        temp_accuracy_rows, historical_rows, temp_recent_rows, cusum_history_rows=cusum_history_rows
+        temp_accuracy_rows, historical_rows, temp_recent_rows, ph_history_rows=ph_history_rows
     )
     monkeypatch.setattr("app.drift.connection", lambda: fake_conn)
     monkeypatch.setattr("app.drift.MODEL_DIR", str(tmp_path))
@@ -609,4 +614,40 @@ def test_check_and_retrain_updates_cusum_state_for_newly_justified_station(monke
     retrained = check_and_retrain()
 
     assert retrained == [station]
-    assert fake_conn.collector_state[f"cusum_enabled:{station}"] == "true"
+    assert fake_conn.collector_state[f"page_hinkley_enabled:{station}"] == "true"
+
+
+def test_blend_horizon_bias_full_boost_at_shortest_full_regular_at_longest():
+    """blend_horizon_bias must return exactly boosted_bias at horizon 1 and
+    exactly regular_bias at horizon 4 (HORIZONS' own min/max) - the two
+    anchors EWMA_DECAY_POWER's front-loaded curve is built around, so a
+    boosted station's +15min submission keeps the full win and its +60min
+    submission can never do worse than plain fixed EWMA."""
+    from app.drift import blend_horizon_bias, HORIZONS
+
+    regular, boosted = 1.0, -9.0
+    assert blend_horizon_bias(regular, boosted, min(HORIZONS)) == boosted
+    assert blend_horizon_bias(regular, boosted, max(HORIZONS)) == regular
+
+
+def test_station_bias_components_equal_when_page_hinkley_disabled(monkeypatch):
+    """A station without the boost enabled must get identical regular and
+    boosted components (both equal to the plain fixed EWMA bias) - so
+    blend_horizon_bias produces the same, unboosted correction at every
+    horizon for it, regardless of EWMA_DECAY_POWER."""
+    from app.drift import station_bias_components, DEFAULT_EWMA_PARAMS
+
+    rows = [
+        ("2026-01-01T00:00:00Z", 100.0, 200.0),
+        ("2026-01-01T00:15:00Z", 100.0, 200.0),
+    ]
+    monkeypatch.setattr("app.drift.connection", lambda: FakeConnection(rows))
+
+    regular, boosted = station_bias_components("A")  # "A" is outside PH_ENABLED_STATIONS
+
+    assert regular == boosted
+    alpha, damping = DEFAULT_EWMA_PARAMS["alpha"], DEFAULT_EWMA_PARAMS["damping"]
+    expected = 0.0
+    for _, demand, prediction in rows:
+        expected = alpha * (demand - prediction) + (1 - alpha) * expected
+    assert regular == damping * expected

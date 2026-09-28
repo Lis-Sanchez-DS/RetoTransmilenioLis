@@ -146,7 +146,7 @@ def test_submit_current_cycle_treats_409_as_already_submitted(monkeypatch):
     monkeypatch.setattr("app.submit_xgboost.check_collector_heartbeat", lambda: None)
     monkeypatch.setattr("app.submit_xgboost.requests.post", lambda *a, **k: FakeResponse())
     monkeypatch.setattr("app.submit_xgboost.API_KEY", "test-key", raising=False)
-    monkeypatch.setattr("app.submit_xgboost.station_ewma_bias", lambda station_id: 0.0)
+    monkeypatch.setattr("app.submit_xgboost.station_bias_components", lambda station_id: (0.0, 0.0))
 
     result = submit_current_cycle()
 
@@ -154,7 +154,7 @@ def test_submit_current_cycle_treats_409_as_already_submitted(monkeypatch):
 
 
 def test_submit_current_cycle_applies_ewma_bias_correction(monkeypatch):
-    """The EWMA correction (station_ewma_bias) must land on the actual
+    """The EWMA correction (station_bias_components) must land on the actual
     submitted values, on top of the raw model output - not just be computed
     and discarded."""
     station = "A"
@@ -216,11 +216,96 @@ def test_submit_current_cycle_applies_ewma_bias_correction(monkeypatch):
     monkeypatch.setattr("app.submit_xgboost.check_collector_heartbeat", lambda: None)
     monkeypatch.setattr("app.submit_xgboost.requests.post", fake_post)
     monkeypatch.setattr("app.submit_xgboost.API_KEY", "test-key", raising=False)
-    monkeypatch.setattr("app.submit_xgboost.station_ewma_bias", lambda station_id: -10.0)
+    monkeypatch.setattr("app.submit_xgboost.station_bias_components", lambda station_id: (-10.0, -10.0))
 
     submit_current_cycle()
 
     assert captured_payload["predictions"][0]["value"] == 32.0
+
+
+def test_submit_current_cycle_applies_horizon_decayed_bias(monkeypatch):
+    """When regular_bias != boosted_bias (i.e. Page-Hinkley is actively
+    boosted for this station), horizon 1 (+15min) must get the FULL boosted
+    correction and the longest horizon (+60min) must get the FULL regular
+    correction (EWMA_DECAY_POWER's weight is exactly 1.0 / 0.0 at the two
+    ends) - and station_bias_components must be called only ONCE for the
+    station even though this cycle has all 4 of its horizons, preserving the
+    "one DB read per station per submission" invariant regardless of horizon
+    count.
+    """
+    station = "A"
+    cutoff = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+    cycle = {
+        "cycle_id": "cycle-1",
+        "data_cutoff": cutoff.isoformat(),
+        "targets": [
+            {"station_id": station, "target_at": (cutoff + timedelta(minutes=m)).isoformat()}
+            for m in (15, 30, 45, 60)
+        ],
+    }
+
+    class FakeConnection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def execute(self, query, params=None):
+            self._rows = [
+                (station, (cutoff - timedelta(minutes=15 * (lag - 1))).isoformat(), 500.0 + lag)
+                for lag in LAGS
+            ] if 'FROM "Original Data"' in query else []
+            return self
+
+        def fetchall(self):
+            return self._rows
+
+    class FakeModel:
+        def predict(self, features):
+            return [42.0]
+
+    captured_payload = {}
+
+    class FakeResponse:
+        status_code = 200
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"submission_id": "sub-1", "status": "accepted", "predictions_received": 4, "expected_predictions": 4}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        if "/submissions" in url:
+            captured_payload.update(json)
+        return FakeResponse()
+
+    bias_calls = []
+
+    def fake_bias_components(station_id):
+        bias_calls.append(station_id)
+        return (0.0, -100.0)  # regular=0.0, boosted=-100.0 - maximally distinguishable
+
+    monkeypatch.setattr("app.submit_xgboost.collect_new_data", lambda: {"collected": 0, "inserted": 0, "pages": 1, "cursor": None})
+    monkeypatch.setattr(
+        "app.submit_xgboost.api_get",
+        lambda path: cycle if "current" in path else {"display_name": "x"},
+    )
+    monkeypatch.setattr("app.submit_xgboost.connection", lambda: FakeConnection())
+    monkeypatch.setattr("app.submit_xgboost.joblib.load", lambda path: FakeModel())
+    monkeypatch.setattr("app.submit_xgboost.os.path.getmtime", lambda path: 0)
+    monkeypatch.setattr("app.submit_xgboost.check_collector_heartbeat", lambda: None)
+    monkeypatch.setattr("app.submit_xgboost.requests.post", fake_post)
+    monkeypatch.setattr("app.submit_xgboost.API_KEY", "test-key", raising=False)
+    monkeypatch.setattr("app.submit_xgboost.station_bias_components", fake_bias_components)
+
+    submit_current_cycle()
+
+    values = [p["value"] for p in captured_payload["predictions"]]
+    assert values[0] == 0.0  # h1 (+15min): raw 42.0 + full boosted bias (-100.0) -> clamped to 0.0
+    assert values[3] == 42.0  # h4 (+60min): raw 42.0 + full regular bias (0.0) -> unchanged
+    assert bias_calls == ["A"]  # exactly one DB read for the whole station, all 4 horizons
 
 
 def test_submit_current_cycle_queries_only_needed_lag_timestamps(monkeypatch):

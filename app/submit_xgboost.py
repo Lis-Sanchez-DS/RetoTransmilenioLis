@@ -9,7 +9,7 @@ import requests
 
 from app.collector import collect_new_data
 from app.db import connection
-from app.drift import LAGS, station_ewma_bias
+from app.drift import LAGS, blend_horizon_bias, station_bias_components
 from app.features import temporal_features
 from app.health import check_collector_heartbeat
 from app.net import with_retries, UpstreamUnavailable
@@ -171,16 +171,26 @@ def submit_current_cycle() -> dict | None:
     if not predictions:
         raise RuntimeError("Ninguna estación tenía suficiente historia para este ciclo; no se envía submission.")
 
-    # Bias correction on top of the raw model output - see station_ewma_bias's
-    # docstring. One DB read per station per submission (not per target), and
-    # never touches what collector.py stores as "prediction" for drift
-    # monitoring, which stays the model's own raw, uncorrected output.
-    bias_by_station = {}
+    # Bias correction on top of the raw model output - see
+    # station_bias_components's docstring. One DB read per station per
+    # submission (not per target, not per horizon), and never touches what
+    # collector.py stores as "prediction" for drift monitoring, which stays
+    # the model's own raw, uncorrected output. The correction itself is
+    # horizon-aware: horizon 1 (+15min) gets the full boosted bias, later
+    # horizons blend back toward the plain/regular bias (see
+    # EWMA_DECAY_POWER in drift.py) - computed locally per target from the
+    # single fetched (regular, boosted) pair, so this stays one DB read per
+    # station regardless of how many of its 4 horizons appear in this cycle.
+    bias_components_by_station = {}
     for prediction in predictions:
         station_id = prediction["station_id"]
-        if station_id not in bias_by_station:
-            bias_by_station[station_id] = station_ewma_bias(station_id)
-        prediction["value"] = round(max(0.0, prediction["value"] + bias_by_station[station_id]), 3)
+        if station_id not in bias_components_by_station:
+            bias_components_by_station[station_id] = station_bias_components(station_id)
+        regular_bias, boosted_bias = bias_components_by_station[station_id]
+        target_ts = _parse_utc(prediction["target_at"])
+        horizon = round((target_ts - cutoff).total_seconds() / 900)
+        bias = blend_horizon_bias(regular_bias, boosted_bias, horizon)
+        prediction["value"] = round(max(0.0, prediction["value"] + bias), 3)
 
     run_id = f"run-{cycle['cycle_id']}"
     model_info = {
