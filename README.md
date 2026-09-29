@@ -29,7 +29,9 @@ incremental: solo descarga los archivos cuyo `updated_at` cambió desde la
 última vuelta (comparando contra un manifiesto local), no los 48 archivos
 completos cada vez - antes sí lo hacía, lo que generaba ~184GB/mes de
 egress y disparó un aviso de Fair Use Policy de Supabase (ver
-`.claude/skills/pulso-transmi-ops/SKILL.md`).
+`.claude/skills/pulso-transmi-ops/SKILL.md`). Desde el punto 12, solo los
+12 archivos `h1` cambian de `updated_at` en cada reentrenamiento; los 36
+`h2`/`h3`/`h4` siguen en Storage sin tocarse, como rollback.
 
 `GET /v1/forecast-cycles/current` con 404 (`no_open_cycle`) es un estado
 normal de "entre ventanas", no un error. Un modelo faltante o sin historia
@@ -73,7 +75,7 @@ Actions.
 ```
 app/
   collector.py        recolecta observaciones nuevas, las predice y las guarda en "Temp"
-  drift.py             detección de drift + reentrenamiento por estación y horizonte
+  drift.py             detección de drift + reentrenamiento del modelo h1 por estación
   submit_xgboost.py     descubre el ciclo abierto y envía las 4 predicciones por estación
   features.py           codificación temporal compartida entre entrenamiento e inferencia
   health.py              heartbeat del collector (tabla ops.job_runs)
@@ -94,7 +96,7 @@ database/
 
 scripts/
   download_models.sh         wrapper que llama a download_models.py
-  download_models.py         sincroniza (de forma incremental) los 48 archivos de modelo (12 estaciones x 4 horizontes) desde Supabase Storage - solo descarga los que cambiaron desde la última vuelta, comparando contra un manifiesto local
+  download_models.py         sincroniza (de forma incremental) los archivos de modelo desde Supabase Storage - 48 en total (12 estaciones x 4 horizontes: 12 `h1` activos + 36 `h2`/`h3`/`h4` legacy conservados como rollback, ver punto 12), solo descarga los que cambiaron desde la última vuelta, comparando contra un manifiesto local
 
 dashboard/app.py               panel local (Streamlit) de solo lectura sobre Supabase
 web/                            panel estático (HTML/CSS/JS, sin build ni framework) desplegado en Vercel - ver "Panel de monitoreo" más abajo
@@ -247,7 +249,7 @@ modelo desplegado terminaba re-sorteándose cada 30 minutos a partir de ruido
 en vez de converger. La búsqueda de hiperparámetros ahora es un proceso
 aparte, offline, no algo que corre en cada reentrenamiento en producción.)
 
-### 6. Modelos directos por horizonte (arquitectura final)
+### 6. Modelos directos por horizonte (reemplazada 2026-09-29, ver punto 12)
 
 El enfoque recursivo del punto 3 se reemplazó por **4 modelos
 independientes por estación**, uno por cada horizonte (+15/+30/+45/+60 min),
@@ -417,6 +419,96 @@ absolutamente todos los pares (punto 7), esta clase de bug ya no puede
 volver a ocurrir - no hay `lags_for()` ni ninguna otra fuente de un conteo
 de features distinto entre modelos; los 48 comparten el mismo `LAGS`.
 
+### 11. Page-Hinkley: detección adaptativa de cambios de régimen (reemplaza CUSUM, 2026-09-28)
+
+Sobre la corrección EWMA del punto 8, se agregó una capa adicional: un test
+secuencial de cambio de punto de dos colas (Page-Hinkley) corriendo sobre
+los residuos estandarizados de cada estación. Mientras no dispara, el
+comportamiento es idéntico al EWMA fijo; en cuanto dispara (un cambio
+sostenido y real, no ruido rutinario), la estación cambia a un par
+`(alpha, damping)` más reactivo durante una ventana de cooldown fija y
+luego revierte. La primera versión de este mecanismo usaba CUSUM (reinicio
+a un piso duro en cero); Page-Hinkley lo reemplazó por comparar contra su
+propio mínimo/máximo acumulado en vez de resetear a cero, igualando o
+superando la ganancia de CUSUM en el colapso real de 05100 **sin** las
+regresiones que CUSUM causaba en 09000/09122.
+
+La configuración (`PH_ADAPTIVE_PARAMS = {boost_alpha: 0.4, boost_damping:
+0.7, cooldown: 80, lambda: 25.0}`) es **una sola, compartida por las 12
+estaciones** - nunca afinada por estación. Un ajuste por estación se probó
+primero (2026-09-27) y sobreajustó: con ~500 puntos de entrenamiento no
+alcanzan para fijar 4 parámetros libres por estación, y folds distintos
+elegían configuraciones distintas como "mejores" para la misma estación,
+sin sostenerse fuera de esa muestra. Lo único que sí varía por estación es
+si el boost está **encendido o apagado** (`_is_page_hinkley_enabled`,
+re-evaluado en cada reentrenamiento vía `_page_hinkley_would_help`, que
+exige superar al EWMA fijo por `MIN_PH_IMPROVEMENT_PP=0.5` pp sobre el
+historial completo de esa estación) - así una estación que empiece a
+comportarse como el colapso de 05100 más adelante gana el boost
+automáticamente en su siguiente reentrenamiento, sin cambio de código.
+
+Por separado, `_station_has_fresh_page_hinkley_alarm()` corre la misma
+máquina de estados **solo como detección**, nunca cambia ninguna
+corrección por sí sola, para cualquier estación (esté o no en el set con el
+boost encendido) - ver punto 13 para las dos reacciones que sí dispara.
+
+### 12. Reversión de 48 modelos directos a un único modelo recursivo por estación (2026-09-29)
+
+Un backtest held-out riguroso (train en el primer 85% del histórico de cada
+estación, test en el último 15%, sin fuga) comparando la arquitectura
+directa del punto 6 contra volver a encadenar recursivamente solo el modelo
+`h1` (la predicción de +15 min se sustituye como si fuera dato real para
+calcular los rezagos de +30/+45/+60 min) mostró que el diseño directo era
+**consistentemente peor**, no solo en las estaciones con un cambio de nivel
+de demanda reciente sino en las 12, a veces por más de 10 pp de accuracy en
+`h4`. Una descomposición "oráculo" (encadenar con el valor real en vez de
+la propia predicción del modelo) confirmó que la causa no era
+principalmente la acumulación de error de la recursión - esa acumulación es
+real pero pequeña (1-8 pp en h4, sub-aditiva, porque el ruido de XGBoost ahí
+es en su mayoría no sesgado) - sino que los modelos directos de horizontes
+largos dependían demasiado de `lag_96` (o, en algunas estaciones, sobre
+todo de la hora del día), una señal más débil que la que ya aprende el
+modelo `h1` del rezago más reciente y fresco.
+
+Se revirtió: `check_and_retrain()` ahora entrena y sube **solo el modelo
+`h1`** por estación (`predict_cycle_targets()` en `submit_xgboost.py` hace
+el encadenado recursivo en inferencia). Los 36 archivos `h2`/`h3`/`h4`
+directos que ya existían en Supabase Storage se dejaron intactos
+deliberadamente (nunca más se sobrescriben) como ruta de rollback barata -
+si esto necesita revertirse, lo que hay que resucitar es el código del
+punto 6, no solo esos archivos.
+
+### 13. Dos reacciones adicionales a una alarma fresca de Page-Hinkley
+
+Además del boost del punto 11 (que solo aplica si esa estación tiene el
+flag encendido), una alarma fresca de `_station_has_fresh_page_hinkley_alarm`
+- para **cualquier** estación, tenga o no el boost encendido - dispara dos
+cosas más:
+
+- **Reentrenamiento inmediato, saltando ambos pisos.** Antes, una alarma
+  solo saltaba `ACCURACY_THRESHOLD` (ver sección de drift más abajo) pero
+  seguía esperando `MIN_NEW_FOR_RETRAIN=20` filas nuevas en `"Temp"`. Se
+  cambió (2026-09-29) para que también salte ese piso: un modelo con 0 datos
+  nuevos que dispara una alarma real igual necesita reentrenarse para que
+  `_page_hinkley_would_help` se reevalúe con la alarma ya activa, en vez de
+  esperar 20 filas que pueden tardar horas mientras el modelo sigue
+  desactualizado.
+- **Clamp de banda en la cadena recursiva del punto 12.** Mientras la alarma
+  está activa, cada valor de la cadena (el que se sustituye en horizontes
+  futuros Y el que se envía) se recorta a `[ancla x 0.5, ancla x 1.5]`,
+  donde `ancla` es el último valor real observado (`lag_1` en el cutoff)
+  - solo toca predicciones ya extremas en cualquier dirección, nunca las que
+  ya caen dentro de la banda. Se probó primero un *shrink* proporcional
+  (`valor_final = ancla + factor * (predicción - ancla)`) que sí arregló el
+  peor caso de compounding pero distorsionaba **toda** predicción durante la
+  alarma, dañando estaciones cuya alarma dispara por una tendencia legítima
+  y rápida en vez de por drift del modelo (una de doce, 09122, perdía hasta
+  -26 pp en h4 con un shrink agresivo). El clamp de banda, al solo actuar
+  sobre el extremo, recortó ese daño a -2.6 pp mientras conservaba casi toda
+  la ganancia en las estaciones que sí compensaban por compounding severo
+  (una llegó de 0% a más de 87% de accuracy en h4 durante su alarma real).
+  `PH_ALARM_BAND_PCT = 0.5` en `submit_xgboost.py`.
+
 ## Reducción de tráfico a Supabase (2026-09-27)
 
 Varias consultas traían muchísimos más datos de los que en realidad usaban,
@@ -457,7 +549,13 @@ collector, la causa directa del pico de egress que motivó esta sección.
   *conteo*, no por tiempo - así el disparador no se queda ciego si el stream
   se ralentiza o se detiene, y reacciona a cómo está funcionando el modelo
   ahora mismo en vez de diluirse con historia larga) cae por debajo de
-  `ACCURACY_THRESHOLD=0.85`.
+  `ACCURACY_THRESHOLD=0.9` (subido de 0.85 el 2026-09-29, una vez que las 12
+  estaciones se estabilizaron por encima de 0.85 con la arquitectura
+  recursiva del punto 12 - las estaciones que quedaron por debajo del nuevo
+  umbral se reentrenaron de inmediato).
+- **Una alarma fresca de Page-Hinkley** (punto 13) salta tanto este umbral
+  como el piso de `MIN_NEW_FOR_RETRAIN` de abajo - las dos únicas formas de
+  disparar un reentrenamiento sin depender de la ventana de accuracy.
 - **Gate previo**: el chequeo de drift solo corre si `"Temp"` tiene alguna
   fila pendiente (`has_pending_data()`), no si el collector insertó algo
   *en esa vuelta específica*. Con el gate anterior ("solo si esta vuelta
@@ -475,8 +573,9 @@ collector, la causa directa del pico de egress que motivó esta sección.
   predice mejor que uno con una ventana recortada, en 12/12 estaciones; antes
   hubo una prueba de Kolmogorov-Smirnov para decidir esto caso por caso, y
   luego un recorte 1:1 fijo, ambos removidos el 2026-09-24).
-- Al disparar, se reentrenan y republican **los 4 horizontes** de esa
-  estación, no solo uno.
+- Al disparar, se reentrena y republica **solo el modelo `h1`** de esa
+  estación (ver punto 12) - los otros 3 horizontes se derivan en inferencia
+  encadenando ese mismo modelo, no tienen archivo propio que reentrenar.
 
 ## Configuración local (solo para desarrollo/pruebas)
 

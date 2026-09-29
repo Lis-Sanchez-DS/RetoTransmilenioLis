@@ -82,7 +82,10 @@ model quality).
 `ACCURACY_WINDOW_HOURS`/`MIN_DATAPOINTS=20` design): a station's accuracy
 over its own last `RECENT_CHECKS=4` predicted/actual pairs (`MIN_DATAPOINTS
 = RECENT_CHECKS`, so a station never gets judged on fewer than 4 real
-points) falls below `ACCURACY_THRESHOLD=0.85`. A fixed count survives the
+points) falls below `ACCURACY_THRESHOLD=0.9` (raised from 0.85 on
+2026-09-29, once all 12 stations had settled above 0.85 under the
+recursive architecture below - the stations that fell below the new,
+higher bar were retrained immediately as part of that change). A fixed count survives the
 stream slowing down or stalling entirely (a fixed time window could just
 never accumulate enough points), and reacts to how the model is doing
 *right now* instead of being diluted by a longer history that mixes good
@@ -164,13 +167,26 @@ below. This doesn't reintroduce the "blocked forever" failure mode
 trickling in at all, the count keeps growing and eventually clears the bar,
 it just stops spending a full retrain on every single trickle.
 
-**One model per station per horizon, not one recursive model.** Since the
-direct multi-horizon change (see "Multi-horizon prediction" below), a
-drifted station retrains and republishes all 4 horizon models
-(`_train_station_horizon_model`, called once per horizon in
-`HORIZONS = (1, 2, 3, 4)`), each uploaded to Supabase Storage as
-`POST /storage/v1/object/models/xgboost/xgboost_{station}_h{horizon}.joblib`
-with `x-upsert: true` - 48 files total across 12 stations, not 12.
+**A fresh Page-Hinkley alarm (see below) bypasses BOTH `ACCURACY_THRESHOLD`
+AND `MIN_NEW_FOR_RETRAIN` (2026-09-29).** Originally the alarm only skipped
+the accuracy gate; it still waited for 20 new rows like every other drifted
+station. Changed because a station with a real, fresh alarm and 0 new rows
+still needs to retrain - not for new data (there isn't any yet), but so
+`_page_hinkley_would_help` gets re-evaluated with the alarm now active,
+instead of sitting on a stale on/off decision for however long it takes 20
+rows to trickle in.
+
+**One recursive model per station, not one model per (station, horizon)
+(reverted to this 2026-09-29 - see "Recursive vs. direct multi-horizon
+prediction" below).** A drifted station retrains and republishes only its
+`h1` model (`_train_station_horizon_model(station_id, 1, frame)`), uploaded
+to Supabase Storage as
+`POST /storage/v1/object/models/xgboost/xgboost_{station}_h1.joblib` with
+`x-upsert: true` - 12 uploads per retrain cycle, not 48. The 36
+`h2`/`h3`/`h4` `.joblib` files from the direct-model era (2026-09 through
+2026-09-29) are left untouched in Storage on purpose, as a cheap rollback
+path - `download_models.py` still syncs all 48 files that exist, it's just
+that only the 12 `h1` ones ever get a new `updated_at` going forward.
 
 ### Inference-time bias correction (EWMA) (`station_ewma_bias`)
 
@@ -345,8 +361,11 @@ no model bytes transferred - and it's compared against a local manifest
 whose `updated_at` actually changed (or that are missing locally) get a real
 `GET` and count against egress. A drift retrain still propagates to the
 other job within one loop iteration, same as before - only now that
-iteration downloads the ~4 files that changed (one station's 4 horizons),
-not all 48. The manifest lives alongside the models in the same job's
+iteration downloads just the files that changed (at the time of this fix,
+one station's 4 horizon files; since the 2026-09-29 revert to a single
+recursive `h1` model per station - see "Recursive vs. direct multi-horizon
+prediction" below - a retrain changes only 1 file), not all 48. The
+manifest lives alongside the models in the same job's
 filesystem, so it persists across loop iterations within a single ~5.75h
 job run and is naturally rebuilt from scratch (one full download) whenever
 `actions/checkout` resets the workspace on the next job restart - same
@@ -420,41 +439,120 @@ explicitly cancel and re-trigger (`gh run cancel`, then
 `gh workflow run <file>`) to get a fix live immediately, otherwise it only
 takes effect the next time that ~5.75h job naturally restarts.
 
-## Multi-horizon prediction (critical correctness point)
+## Recursive vs. direct multi-horizon prediction (critical correctness point)
 
-`predict_cycle_targets()` in `app/submit_xgboost.py` predicts each
-station's 4 targets (+15/+30/+45/+60 min from `data_cutoff`) **in
-chronological order**, feeding each prediction back into a local
-per-station history dict as the stand-in for the not-yet-observed value the
-next horizon's lags need. This is required because `lag_k` means "demand
-exactly k*15 minutes before the *target* timestamp", which only equals
-"k*15 minutes before `data_cutoff`" for the +15min horizon. **Do not**
-compute all 4 horizons' features relative to `data_cutoff` directly - that
-was a real, previously-shipped bug that silently broke 75% of every
-submission (see below). `app/collector.py`'s `predict_records()` already
-uses the correct pattern for its own (single-step) predictions - mirror it
-rather than reinventing.
+**Current design (since 2026-09-29): one recursive `h1` model per station,
+not one model per (station, horizon).** `predict_cycle_targets()` in
+`app/submit_xgboost.py` loads exactly one model per station
+(`models[station_id]` from `{MODEL_DIR}/xgboost_{station_id}_h1.joblib`)
+and calls it once per horizon **in chronological order**, feeding each
+prediction back in as the stand-in for the not-yet-observed value the next
+horizon's lags need: for target horizon `h`, `lag_k`'s feature value is the
+real observed value at `cutoff - 15*(k-1)` minutes if `k >= h`, otherwise
+it's the chain's own prediction for horizon `h - k`. This is required
+because `lag_k` means "demand exactly k*15 minutes before the *target*
+timestamp", which only equals "k*15 minutes before `data_cutoff`" for the
++15min horizon. **Do not** compute all 4 horizons' features relative to
+`data_cutoff` directly - that was a real, previously-shipped bug that
+silently broke 75% of every submission (see "Known past bugs" below).
+`app/collector.py`'s `predict_records()` already uses the correct pattern
+for its own (single-step) prediction - mirror it rather than reinventing.
 
-If a station is missing history for a lag its target horizon actually needs
-(most likely `lag_96` = one day back, the longest lag now that `lag_672` is
-gone - see below), `predict_cycle_targets` **skips only that target/horizon**
-and logs a warning - it does not abort the whole station or cycle. (Before
-2026-09-26 this checked all of `LAGS` up front per station and skipped the
-*entire station* on any single missing lag; that granularity briefly
-mattered while different (station, horizon) pairs used different lag sets,
-since a station could have full history for one horizon's lags but not
-another's. Preserve the per-target granularity regardless; don't revert to
-the coarser per-station check.)
+A station missing any real lag (most likely `lag_96` = one day back, the
+longest lag now that `lag_672` is gone - see below) is skipped **entirely**
+- all 4 targets, not just one horizon. This differs from the direct
+design's per-target skip: every horizon here ultimately depends on the same
+real `lag_1` (or a prediction chain built from it), so a gap blocks the
+whole recursive chain, not one link of it.
 
-Each horizon is a **separate model file**, loaded as
-`models[(station_id, horizon)]` from
-`{MODEL_DIR}/xgboost_{station_id}_h{horizon}.joblib` - not one shared model
-called four times. `download_models.py` and `drift.py`'s upload step must
-stay in sync with this per-`(station, horizon)` naming. As of 2026-09-27,
-every model (all stations, all horizons) shares the exact same `LAGS =
-(1, 2, 4, 96)` feature set - `collector.py` and `submit_xgboost.py` both
-import `LAGS` directly from `app.drift`, there is no more per-pair
-variation to look up (see "`lag_672` was removed entirely" above).
+**Why this reverted the 2026-09 direct-per-horizon design** (which had 4
+independent models per station, one per horizon, specifically built to
+*eliminate* this recursion/compounding): a held-out backtest (train on the
+front 85% of each station's history, test on the unseen last 15%, no leakage)
+found the direct models were consistently *worse* - not just on stations
+with a fresh demand-level shift, but on all 12, sometimes by 10+ accuracy
+points at `h4`. An oracle decomposition (feeding the chain ground truth
+instead of its own predictions) showed the gap wasn't mainly about
+compounding error - that's real but small (1-8pp at h4, sub-additive,
+since XGBoost's own noise there is mostly unbiased) - it's that the direct
+long-horizon models leaned too heavily on `lag_96` (or, for some stations,
+mostly time-of-day), a weaker signal than what the `h1` model already
+learns from the freshest, tightest lag. `check_and_retrain()` only trains
+and uploads `h1` now; the old `h2`/`h3`/`h4` files stay in Storage
+untouched as a rollback path (see `MIN_NEW_FOR_RETRAIN` section above) -
+reviving this design means reviving the direct-model *code*, not just
+those files.
+
+As of 2026-09-27, every model shares the exact same `LAGS = (1, 2, 4, 96)`
+feature set - `collector.py` and `submit_xgboost.py` both import `LAGS`
+directly from `app.drift`, there is no per-pair variation to look up (see
+"`lag_672` was removed entirely" above).
+
+## Page-Hinkley adaptive drift detection (replaces CUSUM, 2026-09-28)
+
+On top of the EWMA bias correction above, each station's standardized
+residuals also feed a two-sided Page-Hinkley change-point test
+(`_page_hinkley_step`/`_new_page_hinkley_state` in `app/drift.py`). While no
+change point has fired, behavior is identical to the plain fixed EWMA.
+Once it fires (a real, sustained deviation, not routine noise), the
+station switches to a more reactive `(alpha, damping)` pair for a fixed
+cooldown window, then reverts. The original version of this used CUSUM
+(reset to a hard zero floor); Page-Hinkley replaced it by comparing against
+its own running min/max instead of resetting to zero, matching or slightly
+beating CUSUM's win on 05100's real collapse **without** the regressions
+CUSUM caused on 09000/09122.
+
+`PH_ADAPTIVE_PARAMS = {boost_alpha: 0.4, boost_damping: 0.7, cooldown: 80,
+lambda: 25.0}` is **one shared config across all 12 stations, never tuned
+per station** - a per-station version was tried first (2026-09-27) and
+overfit: ~500 training points per station isn't enough to pin down 4 free
+parameters, and different chronological folds picked different "best"
+configs for the same station that didn't hold out-of-fold. What *does*
+vary per station is only whether the boost is **on or off**
+(`_is_page_hinkley_enabled`, backed by `PH_ENABLED_STATIONS` /
+`collector_state`), re-decided every time that station retrains via
+`_page_hinkley_would_help` - it must beat the plain fixed EWMA by
+`MIN_PH_IMPROVEMENT_PP = 0.5`pp on that station's full history before
+flipping on, using the same margin-checked, full-history discipline as the
+EWMA override search above. Don't re-tune `PH_ADAPTIVE_PARAMS` per station
+without repeating the fold-consistency check that caught the 2026-09-27
+overfit - re-pooling the search on just the regressing stations to "fix"
+them specifically made both worse, not better, since shrinking the pool
+removes the regularizing effect that made the shared search work.
+
+Separately, `_station_has_fresh_page_hinkley_alarm(station_id)` runs the
+same state machine as **pure detection** - it never changes any prediction
+or correction by itself, and runs for every station regardless of whether
+that station's boost flag is on. Two things key off this signal:
+`check_and_retrain()`'s alarm-bypass (see `MIN_NEW_FOR_RETRAIN` above) and
+the band clamp below.
+
+### Alarm-gated band clamp on the recursive chain (2026-09-29)
+
+While a station's Page-Hinkley alarm is fresh, `predict_cycle_targets()`
+clamps every horizon's value - both what gets fed forward as a future
+horizon's lag AND what gets emitted/scored - to
+`[anchor * (1 - PH_ALARM_BAND_PCT), anchor * (1 + PH_ALARM_BAND_PCT)]`,
+where `anchor` is the last real observed value (`lag_1` at cutoff) and
+`PH_ALARM_BAND_PCT = 0.5`. Outside an active alarm, nothing changes.
+
+This exists because the recursive chain above can compound badly during a
+genuine demand-level shift: one station's `h4` accuracy hit 0% during a
+real event before this fix. A **proportional shrink** toward the anchor
+(`value = anchor + shrink * (raw - anchor)`) was tried first and backtested
+across full history (not just the held-out tail, which happened to overlap
+the volatile event and made an unconditional shrink look like a universal
+win when it wasn't): it fixed the worst compounding cases but distorted
+*every* alarm-time prediction, including legitimately large real moves -
+one station whose alarms fire on genuine fast trends (not model drift) lost
+up to -26pp at h4 under an aggressive shrink. A **band clamp only touches
+predictions that are already outside the band, symmetric for over- and
+under-prediction** - it left that station's damage at -2.6pp while keeping
+nearly all the gain on the stations with real compounding (one went from
+0% to 87%+ h4 accuracy during its real alarm cutoffs). Gated by the causal,
+no-lookahead alarm signal (same state machine as production), swept across
+several band widths before picking 0.5 as the widest one that still kept
+most of the gain while minimizing the one regressor's damage.
 
 ## Data feed: a slow virtual clock, not a permanent stall
 
@@ -468,7 +566,10 @@ data at roughly real-time pace, chronically ~12 days behind the real
 "now"**, not a feed that died on a fixed date. As of the last live check
 (2026-09-26), every station's most recent real `(demand, prediction)` point
 on record was `2026-09-14 11:30:00 UTC` - confirming the ~12-day lag is
-still the right mental model, not a permanent halt.
+still the right mental model, not a permanent halt. **Re-confirmed
+2026-09-29**: every station's most recent recorded `(demand, prediction)`
+point was still `2026-09-17 00:30:00 UTC` at that check - same ~12-day lag,
+same mental model, not a regression.
 
 Practical implications:
 
@@ -496,7 +597,11 @@ Practical implications:
   since the correction itself is never stored. This is still h1-only and a
   single-timestamp sample (noisy, one or two stations can swing the pooled
   number a lot) - always say so rather than presenting it as a clean
-  aggregate.
+  aggregate. It also doesn't account for the alarm-gated band clamp (see
+  "Recursive vs. direct multi-horizon prediction" below) - if that
+  station's Page-Hinkley alarm was active at that point, the actually-sent
+  value may have been clamped, which this reconstruction has no way to
+  recover since the clamp's effect isn't stored either.
 
 ## Monitoring dashboards (`web/` and `dashboard/app.py`)
 
