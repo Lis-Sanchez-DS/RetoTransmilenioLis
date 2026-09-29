@@ -217,20 +217,17 @@ def test_check_and_retrain_never_drops_history(monkeypatch, tmp_path):
     retrained = check_and_retrain()
 
     assert retrained == ["A"]
-    # All 4 horizon models were actually written to disk (not just claimed).
-    model_paths = [tmp_path / f"xgboost_A_h{h}.joblib" for h in (1, 2, 3, 4)]
-    for model_path in model_paths:
-        assert model_path.exists()
-        assert model_path.stat().st_size > 0
-    # Each was uploaded to the right bucket/path with upsert, and with real file bytes.
-    assert len(uploads) == 4
-    uploaded_urls = sorted(u["url"] for u in uploads)
-    expected_urls = sorted(
-        f"https://fake.supabase.co/storage/v1/object/models/xgboost/xgboost_A_h{h}.joblib"
-        for h in (1, 2, 3, 4)
-    )
-    assert uploaded_urls == expected_urls
-    assert all(u["headers"]["x-upsert"] == "true" for u in uploads)
+    # Only the h1 model gets retrained now - h2/h3/h4 are produced by
+    # chaining h1 forward at inference time (see submit_xgboost.py).
+    model_path = tmp_path / "xgboost_A_h1.joblib"
+    assert model_path.exists()
+    assert model_path.stat().st_size > 0
+    for stale_horizon in (2, 3, 4):
+        assert not (tmp_path / f"xgboost_A_h{stale_horizon}.joblib").exists()
+    # Uploaded to the right bucket/path with upsert, with real file bytes.
+    assert len(uploads) == 1
+    assert uploads[0]["url"] == "https://fake.supabase.co/storage/v1/object/models/xgboost/xgboost_A_h1.joblib"
+    assert uploads[0]["headers"]["x-upsert"] == "true"
     queries_with_params = [(q, p) for q, p in fake_conn.executed]
     # History only grows: no DELETE FROM "Original Data" should ever run.
     assert not any('DELETE FROM "Original Data"' in q for q, _ in queries_with_params)
@@ -475,7 +472,7 @@ def test_check_and_retrain_page_hinkley_alarm_bypasses_accuracy_not_row_count(mo
     retrained = check_and_retrain()
 
     assert retrained == ["A"]
-    assert len(uploads) == 4
+    assert len(uploads) == 1
 
 
 def test_check_and_retrain_page_hinkley_alarm_never_bypasses_min_new_points(monkeypatch, tmp_path):

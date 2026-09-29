@@ -18,7 +18,6 @@ from app.net import with_retries, UpstreamUnavailable
 BASE_URL = os.getenv("PULSO_API_URL", "https://pulso-transmi.72-60-245-2.sslip.io").rstrip("/")
 API_KEY = os.getenv("PULSO_API_KEY") or os.getenv("API-KEY-PulsoTransmi")
 MODEL_DIR = os.getenv("MODEL_DIR", "models/xgboost")
-HORIZONS = (1, 2, 3, 4)
 
 
 def api_get(path: str) -> dict:
@@ -40,23 +39,44 @@ def _parse_utc(value) -> datetime:
 
 
 def predict_cycle_targets(targets: list[dict], history: dict, models: dict, data_cutoff) -> list[dict]:
-    """Predict every target directly - one model per horizon, no recursion.
+    """Predict every target by chaining the station's own h1 model forward -
+    recursive, one model per station (not one per horizon).
 
-    Each station gets 4 targets (+15/+30/+45/+60 min from data_cutoff), and
-    each horizon has its own model (see drift.py's _train_station_horizon_model).
-    Crucially, every horizon's lag_k feature is anchored to the same real,
-    already-observed point - data_cutoff - 15*(k-1) minutes - regardless of
-    which horizon is being predicted, so the lag features are identical
-    across all 4 targets for a station and never depend on another horizon's
-    own prediction the way the old recursive approach did.
+    Replaced the direct-multi-horizon design (2026-09) on 2026-09-29 after a
+    held-out backtest across all 12 stations found the dedicated h2/h3/h4
+    models were consistently *worse* than just re-applying the h1 model
+    recursively - not only on the 4 stations with a fresh demand-level shift,
+    but on every single station, often by double digits of accuracy points at
+    h4. An oracle test (feeding the chain ground truth instead of its own
+    prior predictions) confirmed the direct models' shortfall isn't mostly
+    about avoiding compounding error - it's that they lean heavily on
+    lag_96 (or, for some stations, mostly on time-of-day) at longer
+    horizons, which is a weaker signal than what the h1 model already learned
+    from the tightest, freshest lag. Compounding error from feeding the
+    chain its own prior predictions is real but small (1-8pp at h4) and
+    mostly cancels rather than stacking, since XGBoost's own noise here is
+    unbiased rather than systematic.
 
-    Every station/horizon model shares the same LAGS feature set (see
-    drift.py's comment on why lag_672 was dropped for all of them on
-    2026-09-27), so the feature vector built here always matches what every
-    model was actually trained on - no more per-pair lag sets to track. A
-    station missing history for one of its lags is skipped only for that
-    horizon's target, not the whole station - a gap shouldn't zero out that
-    station's other 3 targets, let alone every other station's submission.
+    For target horizon h, lag_k's feature value is:
+      - the real, already-observed value at data_cutoff - 15*(k-1) minutes,
+        if k >= h (that timestamp is at or before data_cutoff);
+      - otherwise, this same chain's own prediction for horizon (h - k) -
+        the only case this ever happens is k < h, i.e. lag_1 for h=2,3,4 and
+        lag_2 for h=3,4 (lag_4 and lag_96 are always real, since LAGS' next
+        value after 2 is 4).
+    h1 itself never uses a predicted value, so it's identical to the old
+    direct model's own h1 prediction.
+
+    The old h2/h3/h4 model files are intentionally left untouched in
+    Supabase Storage (retraining no longer writes to them) as a cheap
+    rollback path - the direct approach's code, not just its artifacts, is
+    what would need reviving if this needs to be undone.
+
+    A station missing any of its real lags is skipped entirely (all 4
+    targets), not just one horizon - unlike the old per-horizon model, every
+    target in this station's chain depends on the same real lag_1 (or an
+    ancestor built from it), so a gap in real history blocks the whole chain,
+    not one link of it.
     """
     cutoff = _parse_utc(data_cutoff)
     by_station: dict[str, list[dict]] = {}
@@ -65,36 +85,55 @@ def predict_cycle_targets(targets: list[dict], history: dict, models: dict, data
 
     predictions = []
     for station_id, station_targets in by_station.items():
-        lag_values = {}
+        model = models.get(station_id)
+        if model is None:
+            print(f"AVISO: sin modelo h1 para {station_id}; se omite la estación.", flush=True)
+            continue
+
+        real_lags = {}
         for lag in LAGS:
             key = (station_id, cutoff - timedelta(minutes=15 * (lag - 1)))
             if key in history:
-                lag_values[lag] = history[key]
+                real_lags[lag] = history[key]
+        missing = [lag for lag in LAGS if lag not in real_lags]
+        if missing:
+            print(
+                f"AVISO: se omite {station_id} en este ciclo: "
+                f"no hay suficiente historia en lag {missing[0]}",
+                flush=True,
+            )
+            continue
 
+        targets_by_horizon = {}
         for target in station_targets:
             timestamp = _parse_utc(target["target_at"])
             horizon = round((timestamp - cutoff).total_seconds() / 900)
-            model = models.get((station_id, horizon))
-            if model is None:
-                print(f"AVISO: sin modelo para {station_id} horizonte {horizon}; se omite ese target.", flush=True)
-                continue
-            missing = [lag for lag in LAGS if lag not in lag_values]
-            if missing:
-                print(
-                    f"AVISO: se omite {station_id} horizonte {horizon} en este ciclo: "
-                    f"no hay suficiente historia en lag {missing[0]}",
-                    flush=True,
-                )
-                continue
-            features = [lag_values[lag] for lag in LAGS] + temporal_features(timestamp)
+            targets_by_horizon[horizon] = target
+
+        # Walk every horizon from 1 up to the highest one actually requested,
+        # even ones this cycle didn't ask for - a later horizon's chain can
+        # depend on an earlier one's prediction regardless of whether that
+        # earlier horizon has its own target in this cycle.
+        predicted_by_horizon: dict[int, float] = {}
+        for horizon in range(1, max(targets_by_horizon) + 1):
+            target_ts = cutoff + timedelta(minutes=15 * horizon)
+            feature_values = []
+            for lag in LAGS:
+                if lag >= horizon:
+                    feature_values.append(real_lags[lag])
+                else:
+                    feature_values.append(predicted_by_horizon[horizon - lag])
+            features = feature_values + temporal_features(target_ts)
             value = max(0.0, float(model.predict([features])[0]))
-            predictions.append(
-                {
-                    "station_id": station_id,
-                    "target_at": target["target_at"],
-                    "value": round(value, 3),
-                }
-            )
+            predicted_by_horizon[horizon] = value
+            if horizon in targets_by_horizon:
+                predictions.append(
+                    {
+                        "station_id": station_id,
+                        "target_at": targets_by_horizon[horizon]["target_at"],
+                        "value": round(value, 3),
+                    }
+                )
     return predictions
 
 
@@ -163,9 +202,8 @@ def submit_current_cycle() -> dict | None:
     }
 
     models = {
-        (station_id, horizon): joblib.load(os.path.join(MODEL_DIR, f"xgboost_{station_id}_h{horizon}.joblib"))
+        station_id: joblib.load(os.path.join(MODEL_DIR, f"xgboost_{station_id}_h1.joblib"))
         for station_id in station_ids
-        for horizon in HORIZONS
     }
     predictions = predict_cycle_targets(cycle["targets"], history, models, cycle["data_cutoff"])
     if not predictions:

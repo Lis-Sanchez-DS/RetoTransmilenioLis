@@ -793,17 +793,23 @@ def check_and_retrain() -> list[str]:
         frame = _training_frame(station_id, recent)
         if len(frame) <= max(LAGS) + max(HORIZONS):
             continue
-        for horizon in HORIZONS:
-            path = _train_station_horizon_model(station_id, horizon, frame)
-            _upload_model(station_id, horizon, path)
+        # Only h1 gets trained now - h2/h3/h4 are predicted by chaining this
+        # same h1 model forward (see submit_xgboost.py's predict_cycle_targets
+        # docstring for why the direct per-horizon models were dropped
+        # 2026-09-29). The old xgboost_{station}_h{2,3,4}.joblib files are
+        # left untouched in Supabase Storage - nothing reads them anymore,
+        # but they stay there as a free rollback point.
+        path = _train_station_horizon_model(station_id, 1, frame)
+        _upload_model(station_id, 1, path)
         merged = _promote_temp_to_original(station_id)
         retrained.append(station_id)
         was_enabled = _is_page_hinkley_enabled(station_id)
         _update_page_hinkley_enabled_state(station_id)
         now_enabled = _is_page_hinkley_enabled(station_id)
         print(
-            f"Drift en {station_id}: reentrenados {len(HORIZONS)} horizontes con {len(frame)} observaciones "
-            f"({merged} nuevas incorporadas al histórico), modelos republicados en Supabase.",
+            f"Drift en {station_id}: reentrenado el modelo h1 (usado de forma recursiva "
+            f"para los 4 horizontes) con {len(frame)} observaciones "
+            f"({merged} nuevas incorporadas al histórico), modelo republicado en Supabase.",
             flush=True,
         )
         if now_enabled != was_enabled:

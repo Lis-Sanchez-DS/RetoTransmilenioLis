@@ -5,61 +5,67 @@ import requests
 from app.submit_xgboost import LAGS, predict_cycle_targets, submit_current_cycle
 
 
-class EchoPlusHorizonModel:
-    """predict() returns lag_1 (the first feature) plus this model's own horizon,
-    so each horizon's model is distinguishable in assertions.
+class RecordingModel:
+    """Records the exact feature row of every call and predicts lag_1 + 1,
+    so a chain of calls is traceable: each output feeds the next call's
+    lag_1 (or lag_2) slot, making the recursive substitution visible in
+    `self.calls` rather than just in the final numbers.
     """
 
-    def __init__(self, horizon):
-        self.horizon = horizon
+    def __init__(self):
+        self.calls = []
 
     def predict(self, features):
-        return [features[0][0] + self.horizon]
+        row = list(features[0])
+        self.calls.append(row)
+        return [row[0] + 1]
 
 
-def _models_for(station, horizons=(1, 2, 3, 4)):
-    return {(station, h): EchoPlusHorizonModel(h) for h in horizons}
-
-
-def test_predict_cycle_targets_uses_same_real_lags_for_every_horizon():
-    """All 4 horizons must read the SAME real, already-observed lags (anchored
-    to data_cutoff), never another horizon's own prediction. Each target uses
-    its own horizon's model, so with EchoPlusHorizonModel (lag_1 + horizon)
-    and lag_1 == 100 at cutoff, the predictions are 101, 102, 103, 104 - not
-    because of recursion, but because each is a different model called once
-    on the same real inputs.
+def test_predict_cycle_targets_chains_h1_prediction_recursively():
+    """h1 uses only real lags. h2's lag_1 slot must be h1's own prediction
+    (never a real value). h3's lag_1 slot must be h2's prediction and its
+    lag_2 slot must be h1's prediction. h4 continues the pattern. lag_4 and
+    lag_96 stay real at every horizon (LAGS = (1, 2, 4, 96), and no horizon
+    here exceeds 4, so k=4 and k=96 always satisfy k >= h).
     """
     station = "A"
     cutoff = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
-
-    history = {(station, cutoff - timedelta(minutes=m)): 0.0 for m in range(0, 20000, 15)}
-    history[(station, cutoff)] = 100.0
-
+    real_lags = {1: 100.0, 2: 200.0, 4: 400.0, 96: 9600.0}
+    history = {
+        (station, cutoff - timedelta(minutes=15 * (lag - 1))): value
+        for lag, value in real_lags.items()
+    }
     targets = [
         {"station_id": station, "target_at": (cutoff + timedelta(minutes=m)).isoformat()}
         for m in (15, 30, 45, 60)
     ]
-    models = _models_for(station)
+    model = RecordingModel()
+    models = {station: model}
 
     predictions = predict_cycle_targets(targets, history, models, cutoff)
 
     assert [p["value"] for p in predictions] == [101.0, 102.0, 103.0, 104.0]
+    # Feature order matches LAGS = (1, 2, 4, 96): [lag_1_slot, lag_2_slot, lag_4_slot, lag_96_slot].
+    assert model.calls[0][:4] == [100.0, 200.0, 400.0, 9600.0]  # h1: fully real
+    assert model.calls[1][:4] == [101.0, 200.0, 400.0, 9600.0]  # h2: lag_1 <- h1's prediction
+    assert model.calls[2][:4] == [102.0, 101.0, 400.0, 9600.0]  # h3: lag_1<-h2, lag_2<-h1
+    assert model.calls[3][:4] == [103.0, 102.0, 400.0, 9600.0]  # h4: lag_1<-h3, lag_2<-h2
 
 
 def test_predict_cycle_targets_keeps_stations_independent():
-    """Station A's predictions must not leak into station B's history reads."""
+    """Station A's recursive chain must not leak into station B's."""
     cutoff = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
     history = {}
     for station, base in (("A", 100.0), ("B", 500.0)):
-        for m in range(0, 20000, 15):
-            history[(station, cutoff - timedelta(minutes=m))] = base
+        for lag in LAGS:
+            history[(station, cutoff - timedelta(minutes=15 * (lag - 1)))] = base
 
     targets = [
         {"station_id": station, "target_at": (cutoff + timedelta(minutes=m)).isoformat()}
         for station in ("A", "B")
         for m in (15, 30, 45, 60)
     ]
-    models = {**_models_for("A"), **_models_for("B")}
+    models = {"A": RecordingModel(), "B": RecordingModel()}
 
     predictions = predict_cycle_targets(targets, history, models, cutoff)
 
@@ -70,28 +76,32 @@ def test_predict_cycle_targets_keeps_stations_independent():
 
 
 def test_predict_cycle_targets_skips_station_with_missing_history():
-    """A station missing lag history is skipped, not fatal to the whole cycle.
-
-    One station's incomplete history (e.g. a gap in the day-ago lag_96 needs)
-    shouldn't zero out every other station's otherwise-valid submission.
+    """A station missing any real lag is skipped ENTIRELY (all its targets),
+    not just one horizon - unlike the old direct per-horizon design, every
+    horizon here ultimately depends on the same real lags, so a gap blocks
+    the whole recursive chain, not one link of it. One station's incomplete
+    history still must not zero out another station's otherwise-valid targets.
     """
     incomplete_station = "A"
     healthy_station = "B"
     cutoff = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
-    target_ts = cutoff + timedelta(minutes=15)
     targets = [
-        {"station_id": incomplete_station, "target_at": target_ts.isoformat()},
-        {"station_id": healthy_station, "target_at": target_ts.isoformat()},
+        {"station_id": incomplete_station, "target_at": (cutoff + timedelta(minutes=m)).isoformat()}
+        for m in (15, 30)
+    ] + [
+        {"station_id": healthy_station, "target_at": (cutoff + timedelta(minutes=m)).isoformat()}
+        for m in (15, 30)
     ]
     history = {
         (healthy_station, cutoff - timedelta(minutes=15 * (lag - 1))): 500.0 + lag
         for lag in LAGS
     }
-    models = {**_models_for(incomplete_station, (1,)), **_models_for(healthy_station, (1,))}
+    models = {incomplete_station: RecordingModel(), healthy_station: RecordingModel()}
 
     predictions = predict_cycle_targets(targets, history, models, cutoff)
 
-    assert [p["station_id"] for p in predictions] == [healthy_station]
+    assert {p["station_id"] for p in predictions} == {healthy_station}
+    assert len([p for p in predictions if p["station_id"] == healthy_station]) == 2
 
 
 def test_submit_current_cycle_treats_409_as_already_submitted(monkeypatch):
