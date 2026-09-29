@@ -104,6 +104,96 @@ def test_predict_cycle_targets_skips_station_with_missing_history():
     assert len([p for p in predictions if p["station_id"] == healthy_station]) == 2
 
 
+class ConstantModel:
+    """Always predicts the same fixed value regardless of input features -
+    useful for pinning down exactly where the alarm-gated band clamp kicks
+    in, independent of any recursive chaining behavior."""
+
+    def __init__(self, value):
+        self.value = value
+        self.calls = []
+
+    def predict(self, features):
+        self.calls.append(list(features[0]))
+        return [self.value]
+
+
+def _flat_history(station, cutoff, anchor):
+    return {
+        (station, cutoff - timedelta(minutes=15 * (lag - 1))): anchor
+        for lag in LAGS
+    }
+
+
+def test_predict_cycle_targets_clamps_overprediction_during_alarm():
+    """A prediction far above the anchor (last real observed value) must be
+    clamped to the band's upper edge when this station's alarm is active -
+    see PH_ALARM_BAND_PCT (0.5 -> anchor * 1.5)."""
+    station = "A"
+    cutoff = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+    anchor = 100.0
+    history = _flat_history(station, cutoff, anchor)
+    targets = [{"station_id": station, "target_at": (cutoff + timedelta(minutes=15)).isoformat()}]
+    model = ConstantModel(500.0)  # 5x anchor: far outside a 50% band
+
+    predictions = predict_cycle_targets(targets, history, {station: model}, cutoff, {station: True})
+
+    assert predictions[0]["value"] == 150.0
+
+
+def test_predict_cycle_targets_clamps_underprediction_during_alarm():
+    """A severe UNDER-prediction must be clamped symmetrically - the band
+    is not just a ceiling on over-prediction."""
+    station = "A"
+    cutoff = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+    anchor = 100.0
+    history = _flat_history(station, cutoff, anchor)
+    targets = [{"station_id": station, "target_at": (cutoff + timedelta(minutes=15)).isoformat()}]
+    model = ConstantModel(5.0)  # far below anchor: far outside a 50% band
+
+    predictions = predict_cycle_targets(targets, history, {station: model}, cutoff, {station: True})
+
+    assert predictions[0]["value"] == 50.0
+
+
+def test_predict_cycle_targets_no_clamp_without_alarm():
+    """Without a fresh alarm for this station - explicitly False, or the
+    station simply missing from alarm_flags, or alarm_flags omitted
+    entirely - the raw prediction must pass through untouched, however far
+    it is from the anchor."""
+    station = "A"
+    cutoff = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+    anchor = 100.0
+    history = _flat_history(station, cutoff, anchor)
+    targets = [{"station_id": station, "target_at": (cutoff + timedelta(minutes=15)).isoformat()}]
+    model = ConstantModel(500.0)
+
+    assert predict_cycle_targets(targets, history, {station: model}, cutoff, {station: False})[0]["value"] == 500.0
+    assert predict_cycle_targets(targets, history, {station: model}, cutoff, {})[0]["value"] == 500.0
+    assert predict_cycle_targets(targets, history, {station: model}, cutoff)[0]["value"] == 500.0
+
+
+def test_predict_cycle_targets_clamped_value_propagates_through_chain():
+    """The clamped value, not the raw model output, must be what feeds a
+    later horizon's lag_1/lag_2 slot - otherwise the chain would keep
+    compounding the extreme raw prediction internally even while emitting
+    the clamped number for the earlier horizon."""
+    station = "A"
+    cutoff = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+    anchor = 100.0
+    history = _flat_history(station, cutoff, anchor)
+    targets = [
+        {"station_id": station, "target_at": (cutoff + timedelta(minutes=m)).isoformat()}
+        for m in (15, 30)
+    ]
+    model = ConstantModel(500.0)
+
+    predictions = predict_cycle_targets(targets, history, {station: model}, cutoff, {station: True})
+
+    assert predictions[0]["value"] == 150.0  # h1 clamped to the band's upper edge
+    assert model.calls[1][0] == 150.0  # h2's lag_1 slot fed the CLAMPED h1 value, not raw 500.0
+
+
 def test_submit_current_cycle_treats_409_as_already_submitted(monkeypatch):
     """A forecast cycle can still be "current" on the loop's next 5-min tick
     after we already submitted for it. The server rejects the repeat with
@@ -157,6 +247,7 @@ def test_submit_current_cycle_treats_409_as_already_submitted(monkeypatch):
     monkeypatch.setattr("app.submit_xgboost.requests.post", lambda *a, **k: FakeResponse())
     monkeypatch.setattr("app.submit_xgboost.API_KEY", "test-key", raising=False)
     monkeypatch.setattr("app.submit_xgboost.station_bias_components", lambda station_id: (0.0, 0.0))
+    monkeypatch.setattr("app.submit_xgboost._station_has_fresh_page_hinkley_alarm", lambda station_id: False)
 
     result = submit_current_cycle()
 
@@ -227,10 +318,87 @@ def test_submit_current_cycle_applies_ewma_bias_correction(monkeypatch):
     monkeypatch.setattr("app.submit_xgboost.requests.post", fake_post)
     monkeypatch.setattr("app.submit_xgboost.API_KEY", "test-key", raising=False)
     monkeypatch.setattr("app.submit_xgboost.station_bias_components", lambda station_id: (-10.0, -10.0))
+    monkeypatch.setattr("app.submit_xgboost._station_has_fresh_page_hinkley_alarm", lambda station_id: False)
 
     submit_current_cycle()
 
     assert captured_payload["predictions"][0]["value"] == 32.0
+
+
+def test_submit_current_cycle_clamps_prediction_when_station_alarm_is_fresh(monkeypatch):
+    """End-to-end: submit_current_cycle must actually fetch this station's
+    fresh-alarm state (_station_has_fresh_page_hinkley_alarm) and pass it
+    through to predict_cycle_targets, so a raw prediction far from the
+    anchor really does get clamped in the submitted payload - not just in
+    the unit-level predict_cycle_targets tests above."""
+    station = "A"
+    cutoff = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+    target_ts = cutoff + timedelta(minutes=15)
+    anchor = 100.0
+    cycle = {
+        "cycle_id": "cycle-1",
+        "data_cutoff": cutoff.isoformat(),
+        "targets": [{"station_id": station, "target_at": target_ts.isoformat()}],
+    }
+
+    class FakeConnection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def execute(self, query, params=None):
+            self._rows = [
+                (station, (target_ts - timedelta(minutes=15 * lag)).isoformat(), anchor)
+                for lag in LAGS
+            ] if 'FROM "Original Data"' in query else []
+            return self
+
+        def fetchall(self):
+            return self._rows
+
+    class FakeModel:
+        def predict(self, features):
+            return [500.0]  # 5x anchor: far outside a 50% band
+
+    captured_payload = {}
+
+    class FakeResponse:
+        status_code = 200
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"submission_id": "sub-1", "status": "accepted", "predictions_received": 1, "expected_predictions": 1}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        if "/submissions" in url:
+            captured_payload.update(json)
+        return FakeResponse()
+
+    alarm_calls = []
+
+    def fake_alarm(station_id):
+        alarm_calls.append(station_id)
+        return True
+
+    monkeypatch.setattr("app.submit_xgboost.collect_new_data", lambda: {"collected": 0, "inserted": 0, "pages": 1, "cursor": None})
+    monkeypatch.setattr("app.submit_xgboost.api_get", lambda path: cycle if "current" in path else {"display_name": "x"})
+    monkeypatch.setattr("app.submit_xgboost.connection", lambda: FakeConnection())
+    monkeypatch.setattr("app.submit_xgboost.joblib.load", lambda path: FakeModel())
+    monkeypatch.setattr("app.submit_xgboost.os.path.getmtime", lambda path: 0)
+    monkeypatch.setattr("app.submit_xgboost.check_collector_heartbeat", lambda: None)
+    monkeypatch.setattr("app.submit_xgboost.requests.post", fake_post)
+    monkeypatch.setattr("app.submit_xgboost.API_KEY", "test-key", raising=False)
+    monkeypatch.setattr("app.submit_xgboost.station_bias_components", lambda station_id: (0.0, 0.0))
+    monkeypatch.setattr("app.submit_xgboost._station_has_fresh_page_hinkley_alarm", fake_alarm)
+
+    submit_current_cycle()
+
+    assert alarm_calls == [station]
+    assert captured_payload["predictions"][0]["value"] == 150.0  # anchor * 1.5, clamped
 
 
 def test_submit_current_cycle_applies_horizon_decayed_bias(monkeypatch):
@@ -309,6 +477,7 @@ def test_submit_current_cycle_applies_horizon_decayed_bias(monkeypatch):
     monkeypatch.setattr("app.submit_xgboost.requests.post", fake_post)
     monkeypatch.setattr("app.submit_xgboost.API_KEY", "test-key", raising=False)
     monkeypatch.setattr("app.submit_xgboost.station_bias_components", fake_bias_components)
+    monkeypatch.setattr("app.submit_xgboost._station_has_fresh_page_hinkley_alarm", lambda station_id: False)
 
     submit_current_cycle()
 
@@ -355,6 +524,7 @@ def test_submit_current_cycle_queries_only_needed_lag_timestamps(monkeypatch):
     monkeypatch.setattr("app.submit_xgboost.connection", lambda: FakeConnection())
     monkeypatch.setattr("app.submit_xgboost.API_KEY", "test-key", raising=False)
     monkeypatch.setattr("app.submit_xgboost.joblib.load", lambda path: object())
+    monkeypatch.setattr("app.submit_xgboost._station_has_fresh_page_hinkley_alarm", lambda station_id: False)
 
     try:
         submit_current_cycle()

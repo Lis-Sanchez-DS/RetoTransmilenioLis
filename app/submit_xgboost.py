@@ -9,7 +9,12 @@ import requests
 
 from app.collector import collect_new_data
 from app.db import connection
-from app.drift import LAGS, blend_horizon_bias, station_bias_components
+from app.drift import (
+    LAGS,
+    _station_has_fresh_page_hinkley_alarm,
+    blend_horizon_bias,
+    station_bias_components,
+)
 from app.features import temporal_features
 from app.health import check_collector_heartbeat
 from app.net import with_retries, UpstreamUnavailable
@@ -18,6 +23,24 @@ from app.net import with_retries, UpstreamUnavailable
 BASE_URL = os.getenv("PULSO_API_URL", "https://pulso-transmi.72-60-245-2.sslip.io").rstrip("/")
 API_KEY = os.getenv("PULSO_API_KEY") or os.getenv("API-KEY-PulsoTransmi")
 MODEL_DIR = os.getenv("MODEL_DIR", "models/xgboost")
+
+# While a station's Page-Hinkley alarm is fresh (a real, recent change point -
+# see _station_has_fresh_page_hinkley_alarm), the recursive chain is fed its
+# own predictions across a demand level that may already be stale by several
+# points, so a badly-off prediction at one horizon compounds into the next.
+# Clamping every horizon's value to within PH_ALARM_BAND_PCT of the last real
+# observed value (lag_1 at cutoff) only when the alarm is active - never
+# otherwise - was backtested across all 12 stations' full history: a tight
+# band (~15%) fixes the worst compounding cases (one station's h4 accuracy
+# went from 0% to 87%+ during its real alarm cutoffs) but also clips
+# legitimately large, real moves on stations whose alarms fire during fast
+# but genuine demand swings. 0.5 (50%) was the widest band that still kept
+# nearly all of that gain while cutting the one regressor's damage from
+# -26pp to -2.6pp at h4 - unlike a proportional shrink toward the anchor
+# (rejected: it distorts every alarm-time prediction, not just extreme
+# ones), this only touches predictions that are already off by more than the
+# band, in either direction, so it helps over- and under-prediction equally.
+PH_ALARM_BAND_PCT = 0.5
 
 
 def api_get(path: str) -> dict:
@@ -38,7 +61,13 @@ def _parse_utc(value) -> datetime:
     return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
 
 
-def predict_cycle_targets(targets: list[dict], history: dict, models: dict, data_cutoff) -> list[dict]:
+def predict_cycle_targets(
+    targets: list[dict],
+    history: dict,
+    models: dict,
+    data_cutoff,
+    alarm_flags: dict[str, bool] | None = None,
+) -> list[dict]:
     """Predict every target by chaining the station's own h1 model forward -
     recursive, one model per station (not one per horizon).
 
@@ -77,8 +106,15 @@ def predict_cycle_targets(targets: list[dict], history: dict, models: dict, data
     target in this station's chain depends on the same real lag_1 (or an
     ancestor built from it), so a gap in real history blocks the whole chain,
     not one link of it.
+
+    alarm_flags maps station_id -> whether that station's Page-Hinkley alarm
+    is currently fresh (see _station_has_fresh_page_hinkley_alarm); a station
+    missing from the map, or a falsy value, is treated as no alarm. See
+    PH_ALARM_BAND_PCT above for why an active alarm clamps every horizon's
+    value to a band around the last real observed value.
     """
     cutoff = _parse_utc(data_cutoff)
+    alarm_flags = alarm_flags or {}
     by_station: dict[str, list[dict]] = {}
     for target in targets:
         by_station.setdefault(target["station_id"], []).append(target)
@@ -110,6 +146,11 @@ def predict_cycle_targets(targets: list[dict], history: dict, models: dict, data
             horizon = round((timestamp - cutoff).total_seconds() / 900)
             targets_by_horizon[horizon] = target
 
+        is_alarm = bool(alarm_flags.get(station_id))
+        anchor = real_lags[1]
+        band_lo = anchor * (1 - PH_ALARM_BAND_PCT)
+        band_hi = anchor * (1 + PH_ALARM_BAND_PCT)
+
         # Walk every horizon from 1 up to the highest one actually requested,
         # even ones this cycle didn't ask for - a later horizon's chain can
         # depend on an earlier one's prediction regardless of whether that
@@ -125,6 +166,8 @@ def predict_cycle_targets(targets: list[dict], history: dict, models: dict, data
                     feature_values.append(predicted_by_horizon[horizon - lag])
             features = feature_values + temporal_features(target_ts)
             value = max(0.0, float(model.predict([features])[0]))
+            if is_alarm:
+                value = min(max(value, band_lo), band_hi)
             predicted_by_horizon[horizon] = value
             if horizon in targets_by_horizon:
                 predictions.append(
@@ -205,7 +248,14 @@ def submit_current_cycle() -> dict | None:
         station_id: joblib.load(os.path.join(MODEL_DIR, f"xgboost_{station_id}_h1.joblib"))
         for station_id in station_ids
     }
-    predictions = predict_cycle_targets(cycle["targets"], history, models, cycle["data_cutoff"])
+    # One bounded read per station (see PH_LOOKBACK_ROWS), same cost class as
+    # station_bias_components below - detection only, independent of whether
+    # that station's separate PH bias-boost flag is on.
+    alarm_flags = {
+        station_id: _station_has_fresh_page_hinkley_alarm(station_id)
+        for station_id in station_ids
+    }
+    predictions = predict_cycle_targets(cycle["targets"], history, models, cycle["data_cutoff"], alarm_flags)
     if not predictions:
         raise RuntimeError("Ninguna estación tenía suficiente historia para este ciclo; no se envía submission.")
 
