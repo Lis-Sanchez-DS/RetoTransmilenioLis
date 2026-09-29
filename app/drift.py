@@ -47,7 +47,11 @@ LAGS = (1, 2, 4, 96)
 # the old recursive approach. See submit_xgboost.py's predict_cycle_targets.
 HORIZONS = (1, 2, 3, 4)
 
-ACCURACY_THRESHOLD = 0.85
+ACCURACY_THRESHOLD = 0.9
+# Raised from 0.85 on 2026-09-29: every station had settled comfortably above
+# 0.85 (worst was ~85.5%), so that floor stopped catching anything - raising
+# it pushes stations to retrain toward a tighter bar as they improve, instead
+# of leaving a stale threshold that never fires again.
 # Count-based window, not a time window: a station's drift signal is its
 # accuracy over its own last RECENT_CHECKS real prediction/actual pairs,
 # whichever tick they landed on. MIN_DATAPOINTS requires the window to be
