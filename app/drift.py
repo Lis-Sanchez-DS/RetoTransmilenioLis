@@ -774,20 +774,33 @@ def check_and_retrain() -> list[str]:
     # noise - can pull a station into consideration even before its own
     # crude RECENT_CHECKS(4)-point rolling accuracy has dropped below
     # ACCURACY_THRESHOLD, since that short average can lag behind what
-    # Page-Hinkley's statistical test already sees. This only ever ADDS
-    # candidates: it bypasses the ACCURACY_THRESHOLD gate, never the
-    # MIN_NEW_FOR_RETRAIN row-count floor below, which every candidate still
-    # has to clear regardless of why it's here - a real regime shift with no
-    # new data yet to retrain on is not a reason to spend a retrain on
-    # unchanged data.
+    # Page-Hinkley's statistical test already sees.
+    #
+    # As of 2026-09-29 this bypasses MIN_NEW_FOR_RETRAIN too, not just
+    # ACCURACY_THRESHOLD - a real, confirmed alarm means this station's
+    # ph_enabled flag needs to be re-evaluated against the shift that's
+    # actually happening right now, and that flag only gets refreshed at
+    # retrain time. Waiting for 20 fresh rows to accumulate first leaves the
+    # station on its stale (often disabled) boost decision through the exact
+    # window it would help most. This deliberately reverses the 2026-09-28
+    # design (see the removed test that used to assert the opposite,
+    # test_check_and_retrain_page_hinkley_alarm_never_bypasses_min_new_points)
+    # - the tradeoff is that a station whose alarm
+    # stays active across many collector cycles with little new data
+    # trickling in can now retrain repeatedly on close to the same data,
+    # re-spending upload cost each time mostly to refresh the ph_enabled
+    # decision. Accepted as the smaller cost against leaving a real,
+    # detected regime shift uncorrected.
+    alarm_triggered: set[str] = set()
     for station_id in stats["station_id"]:
-        if station_id not in drifted and _station_has_fresh_page_hinkley_alarm(station_id):
+        if _station_has_fresh_page_hinkley_alarm(station_id):
             drifted.add(station_id)
+            alarm_triggered.add(station_id)
 
     retrained = []
     for station_id in sorted(drifted):
         recent = _fetch_recent(station_id)
-        if len(recent) < MIN_NEW_FOR_RETRAIN:
+        if len(recent) < MIN_NEW_FOR_RETRAIN and station_id not in alarm_triggered:
             continue
 
         frame = _training_frame(station_id, recent)
@@ -806,10 +819,15 @@ def check_and_retrain() -> list[str]:
         was_enabled = _is_page_hinkley_enabled(station_id)
         _update_page_hinkley_enabled_state(station_id)
         now_enabled = _is_page_hinkley_enabled(station_id)
+        bypass_note = (
+            f" (alarma Page-Hinkley activa, se adelantó el piso de {MIN_NEW_FOR_RETRAIN} filas nuevas)"
+            if station_id in alarm_triggered and len(recent) < MIN_NEW_FOR_RETRAIN
+            else ""
+        )
         print(
             f"Drift en {station_id}: reentrenado el modelo h1 (usado de forma recursiva "
             f"para los 4 horizontes) con {len(frame)} observaciones "
-            f"({merged} nuevas incorporadas al histórico), modelo republicado en Supabase.",
+            f"({merged} nuevas incorporadas al histórico), modelo republicado en Supabase{bypass_note}.",
             flush=True,
         )
         if now_enabled != was_enabled:

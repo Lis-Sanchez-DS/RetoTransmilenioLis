@@ -441,12 +441,12 @@ def _alarm_routed_connection(temp_accuracy_rows, historical_rows, temp_recent_ro
     return AlarmRoutedConnection(temp_accuracy_rows, historical_rows, temp_recent_rows)
 
 
-def test_check_and_retrain_page_hinkley_alarm_bypasses_accuracy_not_row_count(monkeypatch, tmp_path):
+def test_check_and_retrain_page_hinkley_alarm_bypasses_accuracy_threshold(monkeypatch, tmp_path):
     """A confirmed Page-Hinkley alarm pulls a station INTO consideration even
     though its own crude 4-point rolling accuracy still looks fine (it
     bypasses ACCURACY_THRESHOLD, reacting faster than that short average
-    could) - but MIN_NEW_FOR_RETRAIN still has to be satisfied like any
-    other candidate: with enough new rows piled up, it retrains."""
+    could). With enough new rows piled up too, it retrains - see the
+    row-count bypass test below for the case where it doesn't have enough."""
     station = "A"
     start = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
@@ -475,28 +475,30 @@ def test_check_and_retrain_page_hinkley_alarm_bypasses_accuracy_not_row_count(mo
     assert len(uploads) == 1
 
 
-def test_check_and_retrain_page_hinkley_alarm_never_bypasses_min_new_points(monkeypatch, tmp_path):
-    """The row-count floor is unconditional: a confirmed Page-Hinkley alarm
-    on a station with only a small trickle of new "Temp" rows must NOT
-    retrain - a real regime shift with no meaningful new data yet is not a
-    reason to spend a wasted retrain on effectively unchanged data. (This is
-    the fix for a 2026-09-28 gap: the alarm bypass originally skipped
-    MIN_NEW_FOR_RETRAIN entirely, which could fire a full retrain on as few
-    as 0 new rows - true first for CUSUM, and true here identically now that
-    Page-Hinkley has replaced it.)"""
+def test_check_and_retrain_page_hinkley_alarm_bypasses_min_new_points_too(monkeypatch, tmp_path):
+    """A confirmed Page-Hinkley alarm now bypasses MIN_NEW_FOR_RETRAIN as
+    well as ACCURACY_THRESHOLD (changed 2026-09-29): even a station with
+    ZERO new "Temp" rows must still retrain if its alarm is active, because
+    the only way its ph_enabled flag gets re-evaluated against a real,
+    currently-active shift is at retrain time - waiting for 20 fresh rows
+    would leave it on a stale (often disabled) boost decision through the
+    exact window it would help most. This is a deliberate reversal of the
+    2026-09-28 design (the previous version of this test asserted the
+    opposite): the accepted cost is that a station whose alarm stays active
+    across many cycles can retrain repeatedly on close to the same data."""
     station = "A"
     start = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
     historical_rows = [
         (start + timedelta(minutes=15 * i), 100 + (i % 20)) for i in range(700)
     ]
-    # Below MIN_NEW_FOR_RETRAIN (20).
-    temp_recent_rows = [
-        (start + timedelta(minutes=15 * (700 + i)), 100 + (i % 20)) for i in range(5)
-    ]
-    # Good accuracy: only the (irrelevant here) Page-Hinkley alarm could pull
-    # this station in, and it still must not retrain.
-    temp_accuracy_rows = [(station, demand, demand * 0.99) for _, demand in temp_recent_rows]
+    # Zero new rows in "Temp" for retraining - the alarm alone must still be
+    # enough. station_accuracy_stats' own recent-checks query still needs at
+    # least one row so "A" appears in its result at all (real accuracy is
+    # irrelevant here - only the alarm, not ACCURACY_THRESHOLD, is doing the
+    # bypassing in this test).
+    temp_recent_rows: list[tuple] = []
+    temp_accuracy_rows = [(station, 100.0, 99.0)]
 
     fake_conn = _alarm_routed_connection(temp_accuracy_rows, historical_rows, temp_recent_rows)
     monkeypatch.setattr("app.drift.connection", lambda: fake_conn)
@@ -508,8 +510,8 @@ def test_check_and_retrain_page_hinkley_alarm_never_bypasses_min_new_points(monk
 
     retrained = check_and_retrain()
 
-    assert retrained == []
-    assert uploads == []
+    assert retrained == ["A"]
+    assert len(uploads) == 1
 
 
 def _quiet_then_shifted_rows(quiet_n: int, shift_n: int, shift_mag: float = 60.0) -> list[tuple]:
