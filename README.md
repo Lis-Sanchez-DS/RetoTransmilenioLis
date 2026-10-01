@@ -492,6 +492,18 @@ pérdida repetible: estaciones de bajo volumen cuya demanda colapsa (03000/05100
 sobre todo a +45/+60min. Las dos llamadas a `.predict()` no cambiaron: el
 wrapper devuelve niveles.
 
+**Variables de contexto (`app/context.py`, APAGADAS).** `/v1/context` publica
+`event_intensity`, `rain_*` y `temperature_*`, pero solo historia (hasta
+2026-09-09): hoy no devuelve ninguna fila para el futuro. Se implementó la
+lectura y las features (evento, pronóstico de lluvia y de temperatura en el
+timestamp objetivo) detrás de `USE_CONTEXT_FEATURES = False`; con la bandera
+apagada nada cambia. Backtest: +0.16pp si el contexto está publicado, pero
+-0.54pp en un fold sin contexto en el test (que es lo que pasaría hoy). Los
+efectos reales son chicos (evento +11% de demanda de la red, lluvia -5%). Solo
+encender si la API empieza a publicar contexto futuro, y reentrenar los 12 modelos.
+Tampoco hay señal extra en otras fuentes: las estaciones son independientes entre
+sí (correlación ~0.01, sin efecto de corredor) y los festivos no mueven la demanda.
+
 ### 13. Dos reacciones adicionales a una alarma fresca de Page-Hinkley
 
 Además del boost del punto 11 (que solo aplica si esa estación tiene el

@@ -32,6 +32,7 @@ import pandas as pd
 import requests
 from xgboost import XGBRegressor
 
+from app import context as context_module
 from app.db import connection
 from app.features import temporal_features
 
@@ -793,7 +794,9 @@ class RatioTargetModel:
         return np.maximum(0.0, ratio * (features[:, 0] + 1.0) - 1.0)
 
 
-def _train_station_horizon_model(station_id: str, horizon: int, frame: pd.DataFrame) -> str:
+def _train_station_horizon_model(
+    station_id: str, horizon: int, frame: pd.DataFrame, context: dict | None = None
+) -> str:
     """Train a model that predicts `horizon` steps (15min each) directly ahead.
 
     Every horizon shares the same anchor: the lag_k feature always reads
@@ -812,8 +815,17 @@ def _train_station_horizon_model(station_id: str, horizon: int, frame: pd.DataFr
         [temporal_features(value) for value in frame["observed_at"]],
         columns=["hour_sin", "hour_cos", "week_sin", "week_cos"],
     )
-    features = pd.concat([lagged, calendar], axis=1)
-    valid = features.notna().all(axis=1)
+    base_features = pd.concat([lagged, calendar], axis=1)
+    # A row is trainable when its lags exist; context columns (below) are
+    # allowed to be NaN - that is "no context published for that instant".
+    valid = base_features.notna().all(axis=1)
+    features = base_features
+    if context_module.USE_CONTEXT_FEATURES:
+        context_frame = pd.DataFrame(
+            [context_module.context_features(value, context) for value in frame["observed_at"]],
+            columns=list(context_module.CONTEXT_FIELDS),
+        )
+        features = pd.concat([base_features, context_frame], axis=1)
     assert LAGS[0] == 1, "RatioTargetModel reads lag_1 from column 0"
     # Target: relative move from the last observed value (lag_1 at this
     # horizon is the value at the cutoff). See RatioTargetModel.
@@ -873,6 +885,16 @@ def _promote_temp_to_original(station_id: str) -> int:
     return deleted
 
 
+def _fetch_context_for(frame: pd.DataFrame) -> dict:
+    """Published context covering a training frame; {} (all-NaN features) if the
+    API can't be reached or has none - never blocks a retrain."""
+    try:
+        return context_module.fetch_context(frame["observed_at"].min(), frame["observed_at"].max())
+    except Exception as exc:
+        print(f"AVISO: no se pudo leer /v1/context ({exc}); se entrena sin contexto.", flush=True)
+        return {}
+
+
 def check_and_retrain() -> list[str]:
     """Detect drifted stations and retrain + republish their models. Returns the list retrained."""
     stats = station_accuracy_stats()
@@ -920,7 +942,8 @@ def check_and_retrain() -> list[str]:
         # 2026-09-29). The old xgboost_{station}_h{2,3,4}.joblib files are
         # left untouched in Supabase Storage - nothing reads them anymore,
         # but they stay there as a free rollback point.
-        path = _train_station_horizon_model(station_id, 1, frame)
+        context = _fetch_context_for(frame) if context_module.USE_CONTEXT_FEATURES else None
+        path = _train_station_horizon_model(station_id, 1, frame, context)
         _upload_model(station_id, 1, path)
         merged = _promote_temp_to_original(station_id)
         retrained.append(station_id)

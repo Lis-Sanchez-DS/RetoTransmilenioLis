@@ -7,6 +7,7 @@ import sys
 import joblib
 import requests
 
+from app import context as context_module
 from app.collector import collect_new_data
 from app.db import connection
 from app.drift import (
@@ -67,6 +68,7 @@ def predict_cycle_targets(
     models: dict,
     data_cutoff,
     alarm_flags: dict[str, bool] | None = None,
+    context: dict | None = None,
 ) -> list[dict]:
     """Predict every target by chaining the station's own h1 model forward -
     recursive, one model per station (not one per horizon).
@@ -165,6 +167,8 @@ def predict_cycle_targets(
                 else:
                     feature_values.append(predicted_by_horizon[horizon - lag])
             features = feature_values + temporal_features(target_ts)
+            if context_module.USE_CONTEXT_FEATURES:
+                features += context_module.context_features(target_ts, context)
             value = max(0.0, float(model.predict([features])[0]))
             if is_alarm:
                 value = min(max(value, band_lo), band_hi)
@@ -255,7 +259,17 @@ def submit_current_cycle() -> dict | None:
         station_id: _station_has_fresh_page_hinkley_alarm(station_id)
         for station_id in station_ids
     }
-    predictions = predict_cycle_targets(cycle["targets"], history, models, cycle["data_cutoff"], alarm_flags)
+    cycle_context = None
+    if context_module.USE_CONTEXT_FEATURES:
+        target_times = [_parse_utc(target["target_at"]) for target in cycle["targets"]]
+        try:
+            cycle_context = context_module.fetch_context(min(target_times), max(target_times))
+        except Exception as exc:
+            print(f"AVISO: no se pudo leer /v1/context ({exc}); se predice sin contexto.", flush=True)
+            cycle_context = {}
+    predictions = predict_cycle_targets(
+        cycle["targets"], history, models, cycle["data_cutoff"], alarm_flags, cycle_context
+    )
     if not predictions:
         raise RuntimeError("Ninguna estación tenía suficiente historia para este ciclo; no se envía submission.")
 

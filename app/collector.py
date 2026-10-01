@@ -10,6 +10,7 @@ from urllib.request import Request, urlopen
 import joblib
 import numpy as np
 
+from app import context as context_module
 from app.db import connection
 from app.drift import LAGS, check_and_retrain, has_pending_data
 from app.features import temporal_features
@@ -83,6 +84,13 @@ def predict_records(records: list[dict]) -> list[tuple[dict, float]]:
         station_id: joblib.load(os.path.join(MODEL_DIR, f"xgboost_{station_id}_h1.joblib"))
         for station_id in station_ids
     }
+    record_context = None
+    if context_module.USE_CONTEXT_FEATURES:
+        try:
+            record_context = context_module.fetch_context(min(ts for _, ts in parsed), max(ts for _, ts in parsed))
+        except Exception as exc:
+            print(f"AVISO: no se pudo leer /v1/context ({exc}); se predice sin contexto.", flush=True)
+            record_context = {}
     predictions = []
     for item, ts in parsed:
         features = []
@@ -92,6 +100,8 @@ def predict_records(records: list[dict]) -> list[tuple[dict, float]]:
                 raise RuntimeError(f"Missing lag {lag} for station {item['station_id']} at {ts.isoformat()}")
             features.append(history[key])
         features.extend(temporal_features(ts))
+        if context_module.USE_CONTEXT_FEATURES:
+            features.extend(context_module.context_features(ts, record_context))
         prediction = max(0.0, float(models[item["station_id"]].predict(np.array([features]))[0]))
         predictions.append((item, round(prediction, 4)))
         history[(item["station_id"], ts)] = float(item["demand"])
