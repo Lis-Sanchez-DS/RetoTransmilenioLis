@@ -203,7 +203,36 @@ def _horizon_decay_weight(horizon: int) -> float:
     return ((h_max - horizon) / (h_max - h_min)) ** EWMA_DECAY_POWER
 
 
+# Re-tuned automatically at every retrain (see _update_ewma_params_state):
+# the grid below is searched on the station's FULL recorded history, and a
+# candidate only replaces DEFAULT_EWMA_PARAMS when it wins by at least
+# MIN_EWMA_IMPROVEMENT_PP - the same margin-checked, full-history discipline
+# as the offline search above, so a noisy window can't re-roll the config.
+# Walk-forward backtest (tune on history before each fold, score on the
+# unseen part, 12 stations): fold 70-85% no station cleared the margin
+# (0.00pp), last-15% fold +0.35pp station mean (02300 +2.06, 05000 +1.48,
+# 05100 +0.69), no station worse.
+EWMA_TUNE_ALPHAS = (0.05, 0.1, 0.2, 0.3, 0.4, 0.6)
+EWMA_TUNE_DAMPINGS = (0.0, 0.25, 0.5, 0.75, 1.0)
+EWMA_TUNE_MIN_ROWS = 200
+
+
 def _ewma_params(station_id: str) -> dict:
+    """The (alpha, damping) in force for this station: the value stored by its
+    last retrain (collector_state key "ewma_params:{station}", "alpha,damping")
+    if any, else a STATION_EWMA_PARAMS override, else DEFAULT_EWMA_PARAMS. One
+    indexed single-row lookup - cheap, called once per station per cycle."""
+    with connection() as conn:
+        row = conn.execute(
+            "SELECT cursor_value FROM collector_state WHERE state_key = %s",
+            (f"ewma_params:{station_id}",),
+        ).fetchone()
+    if row is not None:
+        try:
+            alpha, damping = (float(x) for x in str(row[0]).split(","))
+            return {"alpha": alpha, "damping": damping}
+        except ValueError:
+            pass
     return STATION_EWMA_PARAMS.get(station_id, DEFAULT_EWMA_PARAMS)
 
 
@@ -532,6 +561,60 @@ def _page_hinkley_adaptive_accuracy(rows: list[tuple], normal_params: dict, boos
     return _accuracy_score(abs_err, abs_dem)
 
 
+def _fetch_prediction_history(station_id: str) -> list[tuple]:
+    """The station's COMPLETE (observed_at, demand, prediction) history,
+    chronological. Only for once-per-retrain callers - never a hot path."""
+    with connection() as conn:
+        return conn.execute(
+            """SELECT observed_at, demand, prediction FROM "Original Data"
+               WHERE station_id = %s AND prediction IS NOT NULL
+               UNION ALL
+               SELECT observed_at, demand, prediction FROM "Temp"
+               WHERE station_id = %s AND prediction IS NOT NULL
+               ORDER BY observed_at""",
+            (station_id, station_id),
+        ).fetchall()
+
+
+def _tune_ewma_params(station_id: str) -> dict | None:
+    """Best (alpha, damping) on this station's full history, or None when
+    there isn't enough history to trust a search. Falls back to
+    DEFAULT_EWMA_PARAMS unless a candidate beats it by MIN_EWMA_IMPROVEMENT_PP."""
+    rows = _fetch_prediction_history(station_id)
+    if len(rows) < EWMA_TUNE_MIN_ROWS:
+        return None
+    best, best_acc = DEFAULT_EWMA_PARAMS, _fixed_ewma_accuracy(rows, DEFAULT_EWMA_PARAMS)
+    default_acc = best_acc
+    for alpha in EWMA_TUNE_ALPHAS:
+        for damping in EWMA_TUNE_DAMPINGS:
+            candidate = {"alpha": alpha, "damping": damping}
+            acc = _fixed_ewma_accuracy(rows, candidate)
+            if acc > best_acc:
+                best, best_acc = candidate, acc
+    if best_acc - default_acc < MIN_EWMA_IMPROVEMENT_PP / 100:
+        return DEFAULT_EWMA_PARAMS
+    return best
+
+
+def _update_ewma_params_state(station_id: str) -> dict | None:
+    """Re-tunes this station's EWMA (alpha, damping) once per retrain and
+    persists it in collector_state ("ewma_params:{station}"), same pattern as
+    the Page-Hinkley flag. Leaves the stored value alone when there is too
+    little history. Returns the params now in force, or None if unchanged."""
+    tuned = _tune_ewma_params(station_id)
+    if tuned is None:
+        return None
+    with connection() as conn:
+        conn.execute(
+            """INSERT INTO collector_state (state_key, cursor_value, updated_at)
+               VALUES (%s, %s, now())
+               ON CONFLICT (state_key) DO UPDATE
+               SET cursor_value = EXCLUDED.cursor_value, updated_at = now()""",
+            (f"ewma_params:{station_id}", f"{tuned['alpha']},{tuned['damping']}"),
+        )
+    return tuned
+
+
 def _page_hinkley_would_help(station_id: str) -> bool | None:
     """Whether the single SHARED PH_ADAPTIVE_PARAMS config would beat the
     plain fixed EWMA by at least MIN_PH_IMPROVEMENT_PP on this station's own
@@ -548,20 +631,12 @@ def _page_hinkley_would_help(station_id: str) -> bool | None:
     station_bias_components above, which runs every ~5min submission cycle
     and is bounded for exactly that reason.
     """
-    with connection() as conn:
-        rows = conn.execute(
-            """SELECT observed_at, demand, prediction FROM "Original Data"
-               WHERE station_id = %s AND prediction IS NOT NULL
-               UNION ALL
-               SELECT observed_at, demand, prediction FROM "Temp"
-               WHERE station_id = %s AND prediction IS NOT NULL
-               ORDER BY observed_at""",
-            (station_id, station_id),
-        ).fetchall()
+    rows = _fetch_prediction_history(station_id)
     if len(rows) < PH_LOOKBACK_ROWS:
         return None
-    fixed_acc = _fixed_ewma_accuracy(rows, DEFAULT_EWMA_PARAMS)
-    adaptive_acc = _page_hinkley_adaptive_accuracy(rows, DEFAULT_EWMA_PARAMS, PH_ADAPTIVE_PARAMS)
+    normal_params = _ewma_params(station_id)
+    fixed_acc = _fixed_ewma_accuracy(rows, normal_params)
+    adaptive_acc = _page_hinkley_adaptive_accuracy(rows, normal_params, PH_ADAPTIVE_PARAMS)
     return (adaptive_acc - fixed_acc) >= (MIN_PH_IMPROVEMENT_PP / 100)
 
 
@@ -947,6 +1022,14 @@ def check_and_retrain() -> list[str]:
         _upload_model(station_id, 1, path)
         merged = _promote_temp_to_original(station_id)
         retrained.append(station_id)
+        before_ewma = _ewma_params(station_id)
+        after_ewma = _update_ewma_params_state(station_id) or before_ewma
+        if after_ewma != before_ewma:
+            print(
+                f"EWMA de {station_id}: alpha/damping {before_ewma['alpha']}/{before_ewma['damping']}"
+                f" -> {after_ewma['alpha']}/{after_ewma['damping']} tras este reentrenamiento.",
+                flush=True,
+            )
         was_enabled = _is_page_hinkley_enabled(station_id)
         _update_page_hinkley_enabled_state(station_id)
         now_enabled = _is_page_hinkley_enabled(station_id)

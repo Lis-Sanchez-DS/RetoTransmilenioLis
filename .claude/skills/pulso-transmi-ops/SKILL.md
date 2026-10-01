@@ -235,6 +235,23 @@ repeating this margin-checked, full-history search - reacting to an
 isolated bad window is exactly the anti-pattern the 2026-09-24 revert (see
 above) exists to prevent.
 
+### EWMA (alpha, damping) re-tuned automatically at every retrain (2026-10-01)
+
+Requested by the user (they chose it over "retrain when the bias stays large"
+and "continuous alpha"). `check_and_retrain()` now calls
+`_update_ewma_params_state(station)` after each model upload: a grid search
+(`EWMA_TUNE_ALPHAS` x `EWMA_TUNE_DAMPINGS`) on the station's FULL recorded
+history, kept only if it beats `DEFAULT_EWMA_PARAMS` by `MIN_EWMA_IMPROVEMENT_PP`
+(0.5pp); needs `EWMA_TUNE_MIN_ROWS`=200 rows. The result is stored in
+`collector_state` as `ewma_params:{station}` ("alpha,damping") and read by
+`_ewma_params()`, which also becomes the baseline for the Page-Hinkley
+"would it help" check. Walk-forward backtest (tune before each fold, score on
+unseen data): fold 70-85% 0.00pp (margin never cleared), last 15% +0.35pp
+station mean (02300 +2.06, 05000 +1.48, 05100 +0.69), none worse. Only ~925
+rows per station have stored predictions, so the sample is small - this
+supersedes the "STATION_EWMA_PARAMS stays empty" note above for live behavior.
+Earlier warnings still apply: don't tune on a short recent window.
+
 ### `lag_672` was removed entirely, for every station and horizon (2026-09-27)
 
 `lag_672` (a full week back) anchors every model to "what happened at this
@@ -390,6 +407,31 @@ that helps 05100 engages less. Slope features (`lag_1-lag_2`, `lag_1/lag_4`)
 also did nothing (+0.07/+0.02pp). Lesson: backtest any model-side change
 through the whole inference stack (chain + clamp + EWMA/PH), not just raw
 model output - the post-processing can absorb, or interact with, the gain.
+
+### Migration to a new Supabase project (2026-10-01)
+
+The pipeline moved to a **new Supabase project** after the old one (ref
+`egemorkltmcxqadugotl`) was restricted for exceeding its quota (Storage calls
+return HTTP 402 Payment Required; this is also the likely reason collector runs
+failed on 2026-09-30/10-01). `scripts/migrate_supabase.py` copied the database,
+the model files in Storage, and `web/config.js`, then updated the GitHub repo
+secrets (`SUPABASE_DATABASE_URL`, `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`,
+rotated 2026-10-01 01:01 UTC).
+
+Things to remember:
+
+- **Local `.env` holds both projects.** The plain `SUPABASE_*` variables are the
+  OLD project (frozen: its newest heartbeat is 2026-09-30 22:05 UTC); the NEW one
+  is `NEW_SUPABASE_DATABASE_URL`, `NEW_SUPABASE_URL`,
+  `NEW_SUPABASE_SERVICE_ROLE_KEY`, `NEW_SUPABASE_PUBLISHABLE_KEY`. For any live
+  check or manual retrain, map the `NEW_` values onto `DATABASE_URL` /
+  `SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY` first, or you will read stale data
+  and conclude the pipeline is dead when it is fine (this happened once).
+- Don't `source .env` in bash - one value breaks shell parsing; parse it in Python.
+- A failed collector/submission run around 2026-09-30 21:00 to 2026-10-01 01:00 UTC
+  ran on the old credentials; it is a migration artifact, not a code bug.
+- After the migration the data feed is still the slow virtual clock (newest
+  `observed_at` 2026-09-18 in the new DB at the time of writing).
 
 ### Collector heartbeat (`app/health.py`)
 

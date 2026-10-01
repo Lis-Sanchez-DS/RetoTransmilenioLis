@@ -663,11 +663,48 @@ def test_check_and_retrain_updates_page_hinkley_state_for_newly_justified_statio
     monkeypatch.setattr("app.drift.SUPABASE_URL", "https://fake.supabase.co")
     monkeypatch.setattr("app.drift.SUPABASE_SERVICE_ROLE_KEY", "fake-service-role-key")
     _fake_upload(monkeypatch, [])
+    # Isolate Page-Hinkley's own decision from the EWMA re-tune, which would
+    # otherwise adapt to this synthetic shift and change PH's baseline.
+    monkeypatch.setattr("app.drift._update_ewma_params_state", lambda station_id: None)
 
     retrained = check_and_retrain()
 
     assert retrained == [station]
     assert fake_conn.collector_state[f"page_hinkley_enabled:{station}"] == "true"
+
+
+def _biased_rows(n, bias):
+    """Prediction persistently `bias` below demand: a big correction helps."""
+    return [(f"t{i}", 100.0, 100.0 - bias) for i in range(n)]
+
+
+def test_tune_ewma_params_needs_history_and_margin(monkeypatch):
+    from app.drift import _tune_ewma_params, DEFAULT_EWMA_PARAMS, EWMA_TUNE_MIN_ROWS
+
+    monkeypatch.setattr("app.drift.connection", lambda: FakeConnection(_biased_rows(EWMA_TUNE_MIN_ROWS - 1, 30)))
+    assert _tune_ewma_params("A") is None  # too little history to trust a search
+
+    # Unbiased residuals: nothing beats the default by the margin.
+    monkeypatch.setattr("app.drift.connection", lambda: FakeConnection(_biased_rows(300, 0)))
+    assert _tune_ewma_params("A") == DEFAULT_EWMA_PARAMS
+
+    # Persistent bias: a stronger correction wins clearly.
+    monkeypatch.setattr("app.drift.connection", lambda: FakeConnection(_biased_rows(300, 30)))
+    tuned = _tune_ewma_params("A")
+    assert tuned != DEFAULT_EWMA_PARAMS and tuned["damping"] > DEFAULT_EWMA_PARAMS["damping"]
+
+
+def test_ewma_params_round_trip_through_collector_state(monkeypatch):
+    from app.drift import _ewma_params, _update_ewma_params_state, DEFAULT_EWMA_PARAMS
+
+    conn = RoutedFakeConnection([], [], [], ph_history_rows=_biased_rows(300, 30))
+    monkeypatch.setattr("app.drift.connection", lambda: conn)
+    assert _ewma_params("A") == DEFAULT_EWMA_PARAMS  # nothing stored yet
+
+    tuned = _update_ewma_params_state("A")
+
+    assert conn.collector_state["ewma_params:A"] == f"{tuned['alpha']},{tuned['damping']}"
+    assert _ewma_params("A") == tuned
 
 
 def test_blend_horizon_bias_full_boost_at_shortest_full_regular_at_longest():
