@@ -349,7 +349,25 @@ both-folds bar rejected it only because the calm fold has nothing left to
 improve. Still report per-fold and per-station numbers, and still confirm with
 the user before pushing anything with live production effects.
 
-### Ratio-target experiment (2026-09-29) - tested, REJECTED, not deployed
+### Ratio-target model (DEPLOYED 2026-10-01 after a retest; first rejected 2026-09-29)
+
+**Current state: every station's `h1` model is a `RatioTargetModel`** (`app/drift.py`):
+XGBoost on `log((demand+1)/(lag_1+1))`, exposed as a plain level predictor (`.predict(rows)`
+returns levels, column 0 = lag_1), so the two `.predict()` call sites are unchanged. Reason
+it was reversed: the 2026-09-29 test used a calm fold and a collapse fold only. The
+2026-09-17/18 shock added an UPWARD surge past the training range (02300/05000: 19% of points
+above the all-time training max, which a level tree cannot predict), and on three chronological
+folds through the full stack (chain + clamp + EWMA/PH) the ratio model won on all of them:
+station-mean +1.16/+1.41/+0.94pp, pooled +1.32/+1.84/+2.80pp; +2.1pp on the 7 cycles after the
+shock began. Known repeatable loss: low-volume stations whose demand COLLAPSES (03000/05100/09122
+in the shock window, mostly at +45/+60min). A seasonal collapse gate (use the level model when the
+recent level < 0.5x the typical level for those slots) gained <=+0.15pp pooled and would need two
+models per station, so it was NOT built. Deploy note: models are class instances, so any running
+job must be on code that defines `RatioTargetModel` before ratio `.joblib` files are uploaded, or
+`joblib.load` raises AttributeError - push code and restart both workflows FIRST. A bias/EWMA
+history built from the old level model's residuals is briefly mismatched right after the switch.
+
+Original 2026-09-29 rejection (kept for the lessons):
 
 Idea: train XGBoost on `log((demand+1)/(lag_1+1))` (relative move from the last
 observed value) and convert back to a level at predict time, because a

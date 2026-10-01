@@ -1,8 +1,12 @@
 from datetime import datetime, timedelta, timezone
 
+import joblib
+import numpy as np
 import pandas as pd
 
 from app.drift import (
+    RatioTargetModel,
+    _train_station_horizon_model,
     ACCURACY_THRESHOLD,
     ADAPTIVE_MIN_THRESHOLD,
     check_and_retrain,
@@ -700,3 +704,62 @@ def test_station_bias_components_equal_when_page_hinkley_disabled(monkeypatch):
     for _, demand, prediction in rows:
         expected = alpha * (demand - prediction) + (1 - alpha) * expected
     assert regular == damping * expected
+
+
+class _FixedLogRatio:
+    """Stand-in for the inner XGBRegressor: always predicts a fixed log-ratio."""
+
+    n_features_in_ = 8
+
+    def __init__(self, log_ratio):
+        self.log_ratio = log_ratio
+
+    def predict(self, rows):
+        return np.full(len(rows), self.log_ratio)
+
+
+def test_ratio_target_model_scales_last_value_by_predicted_ratio():
+    model = RatioTargetModel(_FixedLogRatio(np.log(1.5)))
+    rows = [[99.0] + [0.0] * 7, [999.0] + [0.0] * 7]
+
+    levels = model.predict(rows)
+
+    # level = ratio * (lag_1 + 1) - 1 -> 1.5 * 100 - 1 and 1.5 * 1000 - 1
+    assert np.allclose(levels, [149.0, 1499.0])
+    assert model.n_features_in_ == 8
+
+
+def test_ratio_target_model_never_predicts_below_zero():
+    model = RatioTargetModel(_FixedLogRatio(np.log(0.001)))
+
+    assert model.predict([[0.0] + [0.0] * 7])[0] == 0.0
+
+
+def test_ratio_target_model_accepts_plain_list_and_numpy_inputs():
+    model = RatioTargetModel(_FixedLogRatio(0.0))
+
+    assert model.predict([[10.0] + [0.0] * 7])[0] == 10.0
+    assert model.predict(np.array([[10.0] + [0.0] * 7]))[0] == 10.0
+
+
+def test_trained_ratio_model_extrapolates_beyond_its_training_range(monkeypatch, tmp_path):
+    """The reason this model exists: a level-target tree is capped at the
+    largest demand it ever saw; the ratio model must keep scaling with the
+    last value instead."""
+    monkeypatch.setattr("app.drift.MODEL_DIR", str(tmp_path))
+    slots = 800
+    observed_at = pd.date_range("2026-08-01", periods=slots, freq="15min", tz="UTC")
+    # Smooth daily wave between ~50 and ~150: nothing here ever exceeds 200.
+    demand = (100 + 50 * np.sin(2 * np.pi * np.arange(slots) / 96)).round().astype(int)
+    frame = pd.DataFrame({"observed_at": observed_at, "demand": demand})
+
+    path = _train_station_horizon_model("TEST", 1, frame)
+    model = joblib.load(path)
+
+    assert isinstance(model, RatioTargetModel)
+    assert model.n_features_in_ == 8
+    last = 1000.0  # 5x the training maximum
+    from app.features import temporal_features
+    surge_row = [last, last, last, last] + temporal_features(observed_at[-1] + pd.Timedelta(minutes=15))
+    prediction = float(model.predict([surge_row])[0])
+    assert prediction > 400  # a level model trained on <=200 could never say this

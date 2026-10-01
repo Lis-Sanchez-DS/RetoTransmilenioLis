@@ -478,6 +478,20 @@ deliberadamente (nunca más se sobrescriben) como ruta de rollback barata -
 si esto necesita revertirse, lo que hay que resucitar es el código del
 punto 6, no solo esos archivos.
 
+### 14. Modelo de razón (ratio-target) en lugar de nivel (2026-10-01)
+
+Cada modelo `h1` ahora se entrena sobre `log((demanda+1)/(lag_1+1))` - cuánto se
+mueve la demanda respecto al último valor - y se convierte de vuelta a nivel con
+`exp(pred)*(lag_1+1)-1` (`RatioTargetModel` en `app/drift.py`). Un árbol con
+objetivo de nivel no puede predecir fuera del rango que vio al entrenar: el 17-18
+de septiembre 02300 y 05000 subieron 3x y ~19% de sus puntos quedaron por encima
+del máximo histórico de entrenamiento. En 3 folds cronológicos con todo el stack
+(cadena recursiva + clamp + EWMA/Page-Hinkley) el modelo de razón ganó en los tres:
++1.16/+1.41/+0.94pp (media por estación) y +1.32/+1.84/+2.80pp (agrupado). Su
+pérdida repetible: estaciones de bajo volumen cuya demanda colapsa (03000/05100),
+sobre todo a +45/+60min. Las dos llamadas a `.predict()` no cambiaron: el
+wrapper devuelve niveles.
+
 ### 13. Dos reacciones adicionales a una alarma fresca de Page-Hinkley
 
 Además del boost del punto 11 (que solo aplica si esa estación tiene el

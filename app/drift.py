@@ -27,6 +27,7 @@ import os
 import statistics
 
 import joblib
+import numpy as np
 import pandas as pd
 import requests
 from xgboost import XGBRegressor
@@ -753,6 +754,45 @@ def _training_frame(station_id: str, recent: list[tuple]) -> pd.DataFrame:
     return frame.drop_duplicates(subset="observed_at").sort_values("observed_at").reset_index(drop=True)
 
 
+class RatioTargetModel:
+    """XGBoost trained on the RELATIVE move from the last observed value,
+    exposed as a plain level predictor (2026-10-01).
+
+    A level-target tree can't predict outside the range it trained on, so a
+    station whose demand surges past anything it has seen (02300 and 05000
+    on 2026-09-17/18: 19% of points above the all-time training maximum)
+    gets stuck near that ceiling. This model instead learns
+    log((demand + 1) / (lag_1 + 1)) - how much demand moves relative to the
+    last value - and converts back with level = exp(pred) * (lag_1 + 1) - 1,
+    so the output scales with the current level instead of being capped.
+
+    `.predict(rows)` still takes the same feature rows and returns LEVELS, so
+    collector.py / submit_xgboost.py (the only two `.predict()` call sites)
+    need no change. Column 0 of every row must be lag_1 (LAGS[0] == 1, an
+    invariant enforced at training time). In the recursive chain lag_1 is
+    sometimes the chain's own earlier prediction rather than a real value;
+    that is the same stand-in the level model already received there.
+
+    Offline backtest (3 chronological folds, full production stack): station-
+    mean accuracy +1.16 / +1.41 / +0.94pp vs the level model, pooled +1.32 /
+    +1.84 / +2.80pp; on the 7 cycles after the 2026-09-18 shock +2.1pp. The
+    only repeatable loss is on low-volume stations whose demand collapses
+    (03000/05100 in the shock window, mostly at +45/+60min).
+    """
+
+    def __init__(self, model: XGBRegressor):
+        self.model = model
+
+    @property
+    def n_features_in_(self) -> int:
+        return self.model.n_features_in_
+
+    def predict(self, rows) -> np.ndarray:
+        features = np.asarray(rows, dtype=float)
+        ratio = np.exp(self.model.predict(features))
+        return np.maximum(0.0, ratio * (features[:, 0] + 1.0) - 1.0)
+
+
 def _train_station_horizon_model(station_id: str, horizon: int, frame: pd.DataFrame) -> str:
     """Train a model that predicts `horizon` steps (15min each) directly ahead.
 
@@ -774,6 +814,10 @@ def _train_station_horizon_model(station_id: str, horizon: int, frame: pd.DataFr
     )
     features = pd.concat([lagged, calendar], axis=1)
     valid = features.notna().all(axis=1)
+    assert LAGS[0] == 1, "RatioTargetModel reads lag_1 from column 0"
+    # Target: relative move from the last observed value (lag_1 at this
+    # horizon is the value at the cutoff). See RatioTargetModel.
+    ratio_target = np.log((y + 1.0) / (lagged["lag_1"] + 1.0))
     model = XGBRegressor(
         grow_policy="lossguide",
         max_depth=0,
@@ -782,10 +826,10 @@ def _train_station_horizon_model(station_id: str, horizon: int, frame: pd.DataFr
         n_jobs=-1,
         **_model_params(station_id),
     )
-    model.fit(features.loc[valid], y.loc[valid])
+    model.fit(features.loc[valid], ratio_target.loc[valid])
     os.makedirs(MODEL_DIR, exist_ok=True)
     path = os.path.join(MODEL_DIR, f"xgboost_{station_id}_h{horizon}.joblib")
-    joblib.dump(model, path)
+    joblib.dump(RatioTargetModel(model), path)
     return path
 
 
