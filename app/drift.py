@@ -47,11 +47,29 @@ LAGS = (1, 2, 4, 96)
 # the old recursive approach. See submit_xgboost.py's predict_cycle_targets.
 HORIZONS = (1, 2, 3, 4)
 
-ACCURACY_THRESHOLD = 0.9
-# Raised from 0.85 on 2026-09-29: every station had settled comfortably above
-# 0.85 (worst was ~85.5%), so that floor stopped catching anything - raising
-# it pushes stations to retrain toward a tighter bar as they improve, instead
-# of leaving a stale threshold that never fires again.
+ACCURACY_THRESHOLD = 0.85
+# Back to 0.85 on 2026-10-01 (it was 0.9 from 2026-09-29). It is now the CAP
+# of each station's own adaptive threshold (see station_adaptive_thresholds
+# below) and the fallback for a station without enough history to have a
+# baseline of its own - not one bar applied identically to every station.
+# Why not a single fixed bar: the 4-point accuracy window is very noisy
+# (std ~7pp per station on live data), so at 0.90 it flagged ~74% of
+# windows for a retrain and at 0.85 still ~45%, mostly noise from inherently
+# jumpy stations, while a steady 89% station sliding to 86% was never
+# flagged at all.
+
+# Per-station adaptive threshold: a station is flagged when its last
+# RECENT_CHECKS accuracy falls ADAPTIVE_DROP below its OWN baseline accuracy
+# (the ADAPTIVE_BASELINE_CHECKS real pairs before that window, ~2 days),
+# clamped to [ADAPTIVE_MIN_THRESHOLD, ACCURACY_THRESHOLD]. The floor stops a
+# long collapse from dragging the bar down with it forever; sustained shifts
+# are also caught independently by the Page-Hinkley alarm, which bypasses
+# this gate entirely. On live data (Sep 9-18, 12 stations) this flagged ~23%
+# of windows vs ~45% for a fixed 0.85.
+ADAPTIVE_BASELINE_CHECKS = 192
+ADAPTIVE_MIN_BASELINE_CHECKS = 48
+ADAPTIVE_DROP = 0.05
+ADAPTIVE_MIN_THRESHOLD = 0.75
 # Count-based window, not a time window: a station's drift signal is its
 # accuracy over its own last RECENT_CHECKS real prediction/actual pairs,
 # whichever tick they landed on. MIN_DATAPOINTS requires the window to be
@@ -662,11 +680,56 @@ def station_accuracy_stats() -> pd.DataFrame:
     return stats.reset_index()[columns]
 
 
-def stations_needing_retrain(stats: pd.DataFrame) -> list[str]:
-    """Stations with enough recent data whose accuracy has dropped below the bar."""
+def station_baseline_accuracy() -> dict[str, float]:
+    """Each station's accuracy over the ADAPTIVE_BASELINE_CHECKS real
+    prediction/actual pairs that come BEFORE its most recent RECENT_CHECKS
+    (so the baseline never includes the window being judged). Stations with
+    fewer than ADAPTIVE_MIN_BASELINE_CHECKS such pairs are omitted and fall
+    back to the fixed ACCURACY_THRESHOLD. Aggregated in SQL - 12 small rows
+    come back, not the history itself."""
+    with connection() as conn:
+        rows = conn.execute(
+            """WITH combined AS (
+                   SELECT station_id, demand, prediction, observed_at FROM "Temp"
+                   UNION ALL
+                   SELECT station_id, demand, prediction, observed_at FROM "Original Data"
+               ),
+               baseline_ranked AS (
+                   SELECT station_id, demand, prediction,
+                          row_number() OVER (PARTITION BY station_id ORDER BY observed_at DESC) AS rn
+                   FROM combined
+                   WHERE prediction IS NOT NULL
+               )
+               SELECT station_id, SUM(ABS(demand - prediction)), SUM(ABS(demand)), COUNT(*)
+               FROM baseline_ranked
+               WHERE rn > %s AND rn <= %s
+               GROUP BY station_id""",
+            (RECENT_CHECKS, RECENT_CHECKS + ADAPTIVE_BASELINE_CHECKS),
+        ).fetchall()
+    baselines = {}
+    for station_id, abs_error, abs_demand, count in rows:
+        if count >= ADAPTIVE_MIN_BASELINE_CHECKS:
+            baselines[station_id] = max(0.0, 1 - float(abs_error) / max(float(abs_demand), 1.0))
+    return baselines
+
+
+def station_adaptive_thresholds(baselines: dict[str, float]) -> dict[str, float]:
+    """station_id -> its own drift threshold: baseline minus ADAPTIVE_DROP,
+    clamped to [ADAPTIVE_MIN_THRESHOLD, ACCURACY_THRESHOLD]."""
+    return {
+        station_id: min(ACCURACY_THRESHOLD, max(ADAPTIVE_MIN_THRESHOLD, baseline - ADAPTIVE_DROP))
+        for station_id, baseline in baselines.items()
+    }
+
+
+def stations_needing_retrain(stats: pd.DataFrame, thresholds: dict[str, float] | None = None) -> list[str]:
+    """Stations with enough recent data whose accuracy has dropped below their
+    bar: their own adaptive threshold if one is given, else ACCURACY_THRESHOLD."""
     if stats.empty:
         return []
-    drifted = stats[(stats["count"] >= MIN_DATAPOINTS) & (stats["accuracy"] < ACCURACY_THRESHOLD)]
+    thresholds = thresholds or {}
+    bar = stats["station_id"].map(lambda station_id: thresholds.get(station_id, ACCURACY_THRESHOLD))
+    drifted = stats[(stats["count"] >= MIN_DATAPOINTS) & (stats["accuracy"] < bar)]
     return sorted(drifted["station_id"].tolist())
 
 
@@ -769,7 +832,8 @@ def _promote_temp_to_original(station_id: str) -> int:
 def check_and_retrain() -> list[str]:
     """Detect drifted stations and retrain + republish their models. Returns the list retrained."""
     stats = station_accuracy_stats()
-    drifted = set(stations_needing_retrain(stats))
+    thresholds = station_adaptive_thresholds(station_baseline_accuracy())
+    drifted = set(stations_needing_retrain(stats, thresholds))
     # A confirmed Page-Hinkley alarm - a real, sustained regime shift, not
     # noise - can pull a station into consideration even before its own
     # crude RECENT_CHECKS(4)-point rolling accuracy has dropped below

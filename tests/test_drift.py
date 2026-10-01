@@ -3,8 +3,12 @@ from datetime import datetime, timedelta, timezone
 import pandas as pd
 
 from app.drift import (
+    ACCURACY_THRESHOLD,
+    ADAPTIVE_MIN_THRESHOLD,
     check_and_retrain,
     station_accuracy_stats,
+    station_adaptive_thresholds,
+    station_baseline_accuracy,
     station_horizon_bias,
     stations_needing_retrain,
 )
@@ -104,6 +108,48 @@ def test_stations_needing_retrain_empty_stats():
     assert stations_needing_retrain(pd.DataFrame(columns=["station_id", "accuracy", "count"])) == []
 
 
+def test_accuracy_threshold_is_back_to_085():
+    assert ACCURACY_THRESHOLD == 0.85
+
+
+def test_station_baseline_accuracy_skips_stations_with_too_little_history(monkeypatch):
+    # (station_id, sum_abs_error, sum_abs_demand, count)
+    rows = [("steady", 100.0, 1000.0, 192), ("new", 10.0, 100.0, 10)]
+    monkeypatch.setattr("app.drift.connection", lambda: FakeConnection(rows))
+
+    baselines = station_baseline_accuracy()
+
+    assert baselines == {"steady": 0.9}
+
+
+def test_station_adaptive_thresholds_are_baseline_minus_drop_clamped():
+    thresholds = station_adaptive_thresholds(
+        {"accurate": 0.95, "ordinary": 0.86, "noisy": 0.72, "collapsed": 0.30}
+    )
+
+    assert thresholds["accurate"] == ACCURACY_THRESHOLD  # capped at 0.85
+    assert abs(thresholds["ordinary"] - 0.81) < 1e-9
+    assert thresholds["noisy"] == ADAPTIVE_MIN_THRESHOLD  # floored at 0.75
+    assert thresholds["collapsed"] == ADAPTIVE_MIN_THRESHOLD  # never drags the bar to zero
+
+
+def test_stations_needing_retrain_uses_each_stations_own_threshold():
+    stats = pd.DataFrame(
+        [
+            # Noisy station that always runs ~0.78: 0.78 is normal for it (bar 0.75).
+            {"station_id": "noisy", "accuracy": 0.78, "count": 4},
+            # Steady 0.89 station sliding to 0.80 is a real drop (bar 0.84).
+            {"station_id": "steady", "accuracy": 0.80, "count": 4},
+            # No baseline yet: falls back to the fixed 0.85 bar.
+            {"station_id": "new", "accuracy": 0.80, "count": 4},
+        ]
+    )
+
+    result = stations_needing_retrain(stats, {"noisy": 0.75, "steady": 0.84})
+
+    assert result == ["new", "steady"]
+
+
 class RoutedFakeConnection:
     """Dispatches each query to canned rows based on the table/params it touches."""
 
@@ -131,7 +177,11 @@ class RoutedFakeConnection:
 
     def execute(self, query, params=None):
         self.executed.append((query, params))
-        if 'FROM ranked' in query:
+        if 'FROM baseline_ranked' in query:
+            # station_baseline_accuracy: no baseline in this fixture, so
+            # every station falls back to the fixed ACCURACY_THRESHOLD.
+            self._result = []
+        elif 'FROM ranked' in query:
             self._result = self.temp_accuracy_rows
         elif 'INSERT INTO "Original Data"' in query:
             self._result = None

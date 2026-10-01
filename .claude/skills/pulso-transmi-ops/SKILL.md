@@ -82,10 +82,20 @@ model quality).
 `ACCURACY_WINDOW_HOURS`/`MIN_DATAPOINTS=20` design): a station's accuracy
 over its own last `RECENT_CHECKS=4` predicted/actual pairs (`MIN_DATAPOINTS
 = RECENT_CHECKS`, so a station never gets judged on fewer than 4 real
-points) falls below `ACCURACY_THRESHOLD=0.9` (raised from 0.85 on
-2026-09-29, once all 12 stations had settled above 0.85 under the
-recursive architecture below - the stations that fell below the new,
-higher bar were retrained immediately as part of that change). A fixed count survives the
+points) falls below **that station's own adaptive threshold** (2026-10-01):
+its baseline accuracy over the `ADAPTIVE_BASELINE_CHECKS=192` pairs before the
+window (~2 days) minus `ADAPTIVE_DROP=0.05`, clamped to
+`[ADAPTIVE_MIN_THRESHOLD=0.75, ACCURACY_THRESHOLD=0.85]`, with the fixed 0.85
+as fallback when a station has < 48 baseline pairs (`station_baseline_accuracy`
+/ `station_adaptive_thresholds` in `app/drift.py`). `ACCURACY_THRESHOLD` was
+0.85, then 0.9 (2026-09-29), then back to 0.85 as the cap. Reason for adaptive:
+the 4-point accuracy window is noisy (std ~7pp/station), so any fixed bar mostly
+sets retrain frequency - 0.90 flagged ~74% of live windows, 0.85 ~45%, adaptive
+~23% (live data Sep 9-18) - while a steady 89% station sliding to 80% still
+trips its own bar. The floor keeps a long collapse from dragging the bar down
+forever; Page-Hinkley alarms bypass this gate regardless. Retrain *policy*
+changes can't be cheaply backtested, so the accuracy effect is unmeasured.
+A fixed count survives the
 stream slowing down or stalling entirely (a fixed time window could just
 never accumulate enough points), and reacts to how the model is doing
 *right now* instead of being diluted by a longer history that mixes good
@@ -325,6 +335,43 @@ Don't wait for the next natural drift trigger to pick up an architecture
 change this way - an untriggered station keeps serving the old, now
 schema-mismatched file indefinitely, and the mismatch only surfaces the
 moment its horizon happens to be requested.
+
+### Acceptance rule for model/feature changes (changed 2026-09-29)
+
+**A change passes if it improves at least one chronological fold and does not
+hurt the other** (per-fold mean delta; a mean loss beyond ~0.3pp, or a station
+losing noticeably, counts as hurting). This replaces the earlier bar of
+">= 0.3pp on BOTH folds independently" used in the `lag_672` and
+`week_sin`/`week_cos` tests above - those results describe how the old rule
+decided, not the current rule. Reason: a change that helps a lot in a stressed
+period (05100's collapse) and is neutral in a calm one is a good trade, and the
+both-folds bar rejected it only because the calm fold has nothing left to
+improve. Still report per-fold and per-station numbers, and still confirm with
+the user before pushing anything with live production effects.
+
+### Ratio-target experiment (2026-09-29) - tested, REJECTED, not deployed
+
+Idea: train XGBoost on `log((demand+1)/(lag_1+1))` (relative move from the last
+observed value) and convert back to a level at predict time, because a
+level-target tree over-predicts by 40-50% while a station's level collapses
+(05100, 03000). The code (a `RatioTargetModel` wrapper in `app/drift.py`, which
+would have kept the `.predict(rows) -> levels` contract so no call site
+changed) was written and verified locally, then reverted at the user's
+decision not to deploy. Don't rebuild it without new evidence.
+
+Offline backtest (12 stations, folds 70-85% and last 15%, recursive h1->h4
+chain): raw chain, calm fold -0.04..+0.2pp mean, collapse fold +0.7..+2.0pp
+(05100 h1 +7.3pp). **With the full production stack (alarm-gated 50% band
+clamp + EWMA/Page-Hinkley bias) the gain nearly vanished:** -0.29/-0.04/+0.06/
++0.09pp (h1-h4) on the calm fold, +0.64/+0.26/+0.24/+0.20pp on the collapse
+fold; 05100 gained +1.2pp at h1 but lost 1.0-1.8pp at h2-h4, and 03000 lost
+0.3-0.9pp on both folds. The EWMA/clamp/PH stack already corrects most of the
+level model's bias, and Page-Hinkley fires less on the ratio model's smaller
+residuals (alarm share 7% vs 11% on the collapse fold), so the clamp/boost
+that helps 05100 engages less. Slope features (`lag_1-lag_2`, `lag_1/lag_4`)
+also did nothing (+0.07/+0.02pp). Lesson: backtest any model-side change
+through the whole inference stack (chain + clamp + EWMA/PH), not just raw
+model output - the post-processing can absorb, or interact with, the gain.
 
 ### Collector heartbeat (`app/health.py`)
 

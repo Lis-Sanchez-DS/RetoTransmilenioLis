@@ -549,10 +549,15 @@ collector, la causa directa del pico de egress que motivó esta sección.
   *conteo*, no por tiempo - así el disparador no se queda ciego si el stream
   se ralentiza o se detiene, y reacciona a cómo está funcionando el modelo
   ahora mismo en vez de diluirse con historia larga) cae por debajo de
-  `ACCURACY_THRESHOLD=0.9` (subido de 0.85 el 2026-09-29, una vez que las 12
-  estaciones se estabilizaron por encima de 0.85 con la arquitectura
-  recursiva del punto 12 - las estaciones que quedaron por debajo del nuevo
-  umbral se reentrenaron de inmediato).
+  el umbral **propio de esa estación**: su accuracy base (los ~192 pares
+  anteriores a la ventana, ~2 días) menos `ADAPTIVE_DROP=0.05`, acotado a
+  `[0.75, ACCURACY_THRESHOLD=0.85]`; sin historia suficiente usa 0.85 fijo.
+  Un umbral fijo es casi puro ruido: la ventana de 4 puntos tiene desviación
+  de ~7pp por estación, así que 0.90 marcaba ~74% de las ventanas y 0.85
+  ~45%, mientras que con el umbral adaptativo (datos en vivo 9-18 sep) se
+  marca ~23%, y una estación estable al 89% que cae a 80% sí se detecta
+  (bajado de 0.9 a 0.85 el 2026-10-01; antes se había subido de 0.85 a 0.9
+  el 2026-09-29).
 - **Una alarma fresca de Page-Hinkley** (punto 13) salta tanto este umbral
   como el piso de `MIN_NEW_FOR_RETRAIN` de abajo - las dos únicas formas de
   disparar un reentrenamiento sin depender de la ventana de accuracy.
