@@ -698,6 +698,18 @@ the wave the EWMA correction is skipped (it's measured on chain residuals). The
 output. Any exception inside the layer degrades to the standard chain and never
 blocks a submission.
 
+**Adaptive multi-period average (2026-10-02).** The wave value is no longer
+`y[target-16]` but the mean of up to `MAX_PERIODS=6` previous periods
+(`y[target-16j]`), stopping at the first missing one or one whose 8-slot block
+was not itself wave (lag-16 accuracy < 0.70, `_period_was_wave`), so it never
+mixes in the pre-wave regime. Why: a single copy carries that period's noise
+(error ~ noise of two samples); averaging cancels it. Production functions on
+real data, same activations: since onset 90.2 -> 92.0, since 09-19 00:00
+90.2 -> 92.4, last 8 cutoffs 89.8 -> 92.7 (all 12 stations improved in the
+24h fold; pre-onset the wave is never active, unchanged). `HISTORY_SLOTS` is
+now 119 (about 1.4k exact timestamps per query, still bounded). Leaders sit
+at ~93 on the rolling 24h board, consistent with a denoised template.
+
 **Evidence (all 12 stations, real cutoffs, station-mean accuracy; chain = full
 production stack).** Exact last 6 cycles (hourly cutoffs 02:00-07:00 on 09-19):
 69.8% -> 90.3%. Since 09-18 12:00: 69.0% -> 89.8%. Pre-onset: 81.0% -> 81.3%

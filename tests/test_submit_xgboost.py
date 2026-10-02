@@ -539,9 +539,10 @@ def test_submit_current_cycle_queries_only_needed_lag_timestamps(monkeypatch):
     queries = [(q, p) for q, p in captured if "station_id = ANY" in q]
     assert len(queries) == 2  # "Original Data" + "Temp"
     expected_timestamps = set(lag_timestamps(cutoff))
-    # La onda de 4h (USE_4H_WAVE) suma una ventana fija de 32 slots: sigue siendo
-    # una lista acotada de timestamps exactos, nunca la tabla completa.
-    expected_timestamps |= {cutoff - timedelta(minutes=15 * k) for k in range(32)}
+    # La onda de 4h (USE_4H_WAVE) suma una ventana fija de 119 slots (promedio de
+    # hasta 6 periodos): sigue siendo una lista acotada de timestamps exactos,
+    # nunca la tabla completa.
+    expected_timestamps |= {cutoff - timedelta(minutes=15 * k) for k in range(119)}
     for _, params in queries:
         station_ids, timestamps = params
         assert station_ids == [station]

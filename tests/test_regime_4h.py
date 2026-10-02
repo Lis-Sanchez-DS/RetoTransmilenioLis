@@ -18,11 +18,47 @@ def wave(period, amplitude=800.0):
     return lambda slot: 1000.0 + amplitude * math.sin(2 * math.pi * slot / period)
 
 
-def test_active_on_a_clean_4h_wave_and_repeats_the_value_16_slots_back():
+def test_active_on_a_clean_4h_wave_and_repeats_the_period():
     data = history(wave(16))
     for horizon in (1, 2, 3, 4):
         assert w4.wave_active(data, "A", CUTOFF, horizon)
+        # onda limpia: promediar periodos previos da lo mismo que copiar uno
         assert abs(w4.wave_forecast(data, "A", CUTOFF, horizon) - wave(16)(horizon - 16)) < 1e-9
+
+
+def test_averages_previous_periods_to_cancel_noise():
+    import random
+
+    rng = random.Random(7)
+    noise = {slot: rng.gauss(0, 60) for slot in range(-(w4.HISTORY_SLOTS + 8), 5)}
+    data = history(lambda slot: wave(16)(slot) + noise[slot])
+    horizon = 2
+    expected_periods = [wave(16)(horizon) + noise[horizon - 16 * k] for k in range(1, w4.MAX_PERIODS + 1)]
+    value = w4.wave_forecast(data, "A", CUTOFF, horizon)
+    assert abs(value - sum(expected_periods) / len(expected_periods)) < 1e-9
+    clean = wave(16)(horizon)
+    single_error = abs(expected_periods[0] - clean)
+    assert abs(value - clean) < single_error  # este ruido concreto: el promedio acerca mas
+
+
+def test_stops_averaging_at_the_first_period_that_was_not_wave():
+    # la onda empieza hace 40 slots: antes hay un nivel plano distinto
+    def onset(slot):
+        return wave(16)(slot) if slot > -40 else 700.0
+
+    data = history(onset)
+    horizon = 1
+    value = w4.wave_forecast(data, "A", CUTOFF, horizon)
+    assert value is not None
+    # solo cuentan los periodos dentro de la onda: y[-15] y y[-31]; y[-47] es nivel plano
+    assert abs(value - wave(16)(horizon)) < 1e-9
+
+
+def test_missing_old_period_just_shortens_the_average():
+    data = history(wave(16))
+    for k in range(-80, -60):
+        data.pop(("A", CUTOFF + timedelta(minutes=15 * k)), None)
+    assert abs(w4.wave_forecast(data, "A", CUTOFF, 1) - wave(16)(1)) < 1e-9
 
 
 def test_off_for_a_6h_wave_a_flat_series_and_non_periodic_noise():
@@ -71,5 +107,5 @@ def test_must_beat_persistence_by_the_margin():
 
 def test_history_timestamps_is_a_small_fixed_window():
     stamps = w4.history_timestamps(CUTOFF)
-    assert len(stamps) == w4.HISTORY_SLOTS == 32
-    assert stamps[0] == CUTOFF and stamps[-1] == CUTOFF - timedelta(minutes=15 * 31)
+    assert len(stamps) == w4.HISTORY_SLOTS == 119
+    assert stamps[0] == CUTOFF and stamps[-1] == CUTOFF - timedelta(minutes=15 * 118)
