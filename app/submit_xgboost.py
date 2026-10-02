@@ -8,6 +8,7 @@ import joblib
 import requests
 
 from app import context as context_module
+from app import regime as regime_module
 from app import regime_4h as wave_module
 from app.collector import collect_new_data
 from app.db import connection
@@ -52,6 +53,55 @@ PH_ALARM_BAND_PCT = 0.5
 # deja todo exactamente como antes.
 USE_4H_WAVE = True
 
+# Capa general (app/regime.py, 2026-10-02): corre DESPUES de la onda de 4h y solo
+# sobre las predicciones que esta no reclamo. Aprende cualquier periodo/signo/
+# amplitud de los datos recientes y mezcla suavemente con el XGBoost; si ningun
+# candidato supera a la cadena por margen y estabilidad, no cambia nada. Apagarla
+# deja solo la onda de 4h + XGBoost estandar. APAGADA por defecto (2026-10-02): en el
+# replay del pipeline completo con datos reales no mejoro nada (0.0 pp en la onda y
+# en las ultimas 6 rondas, -0.07 pp en periodo calmo) porque el unico patron real que
+# hay es el de 4h, que ya cubre el respaldo; su valor es solo de seguro ante otros
+# patrones y se apoya en pruebas sinteticas. Encenderla es decision del usuario.
+USE_GENERIC_REGIME = False
+
+# Marcador (por job: vive junto a los modelos, que checkout limpia al reiniciar)
+# del ultimo ciclo ya enviado. El loop despierta cada 5 min pero un ciclo se
+# envia una sola vez: sin esto las otras ~11 vueltas leen ~196 slots por
+# estacion solo para descubrir un 409 al final.
+LAST_SUBMITTED_MARKER = os.path.join(MODEL_DIR, ".last_submitted_cycle")
+
+
+def _cycle_already_submitted(cycle_id: str) -> bool:
+    try:
+        with open(LAST_SUBMITTED_MARKER) as handle:
+            return handle.read().strip() == cycle_id
+    except OSError:
+        return False
+
+
+def _mark_cycle_submitted(cycle_id: str) -> None:
+    try:
+        os.makedirs(os.path.dirname(LAST_SUBMITTED_MARKER), exist_ok=True)
+        with open(LAST_SUBMITTED_MARKER, "w") as handle:
+            handle.write(cycle_id)
+    except OSError:
+        pass  # solo es una optimizacion: sin marcador se repite el trabajo, nada mas
+
+
+def _fetch_generic_history(station_ids: list[str], cutoff: datetime) -> dict:
+    """Los HISTORY_SLOTS slots que la capa general necesita por estacion, en
+    una sola consulta acotada por rango (nunca la tabla completa)."""
+    start, end = regime_module.history_range(cutoff)
+    with connection() as conn:
+        rows = conn.execute(
+            'SELECT station_id, observed_at, demand FROM "Original Data" '
+            "WHERE station_id = ANY(%s) AND observed_at BETWEEN %s AND %s "
+            'UNION ALL SELECT station_id, observed_at, demand FROM "Temp" '
+            "WHERE station_id = ANY(%s) AND observed_at BETWEEN %s AND %s",
+            (station_ids, start, end, station_ids, start, end),
+        ).fetchall()
+    return {(station_id, _parse_utc(observed_at)): float(demand) for station_id, observed_at, demand in rows}
+
 
 def api_get(path: str) -> dict:
     def _get():
@@ -69,6 +119,20 @@ def _parse_utc(value) -> datetime:
     if isinstance(value, datetime):
         return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
     return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+
+
+def lag_timestamps(cutoff: datetime, max_horizon: int = 4) -> list[datetime]:
+    """Every real timestamp predict_cycle_targets can read for a cycle: for each
+    horizon h and each lag k >= h, the value k*15min before the h-th target
+    (cutoff + 15*(h-k)). A handful of exact points (about 11), never a scan."""
+    return sorted(
+        {
+            cutoff + timedelta(minutes=15 * (horizon - lag))
+            for horizon in range(1, max_horizon + 1)
+            for lag in LAGS
+            if lag >= horizon
+        }
+    )
 
 
 def predict_cycle_targets(
@@ -97,8 +161,10 @@ def predict_cycle_targets(
     mostly cancels rather than stacking, since XGBoost's own noise here is
     unbiased rather than systematic.
 
-    For target horizon h, lag_k's feature value is:
-      - the real, already-observed value at data_cutoff - 15*(k-1) minutes,
+    For target horizon h, lag_k's feature value is "the demand k*15 minutes
+    before the TARGET" (exactly what the h1 model was trained on, where lag_k
+    is y.shift(k)):
+      - the real, already-observed value at data_cutoff + 15*(h-k) minutes,
         if k >= h (that timestamp is at or before data_cutoff);
       - otherwise, this same chain's own prediction for horizon (h - k) -
         the only case this ever happens is k < h, i.e. lag_1 for h=2,3,4 and
@@ -106,6 +172,15 @@ def predict_cycle_targets(
         value after 2 is 4).
     h1 itself never uses a predicted value, so it's identical to the old
     direct model's own h1 prediction.
+
+    FIXED 2026-10-02: until then the real value for k >= h was read at
+    data_cutoff - 15*(k-1) minutes (anchored at the cutoff, as the old direct
+    per-horizon models were), which for h >= 2 is h-1 steps STALER than "k
+    steps before the target" - lag_2, lag_4 and lag_96 fed the model values
+    from the wrong moment. Backtested through the full stack (chain + clamp +
+    EWMA/PH, h1 models retrained on each fold's prefix only) the target-anchored
+    version improved all three chronological folds (+1.17 / +0.95 / +1.01pp
+    station mean, h4 +2 to +3pp) and no station lost more than 0.1pp.
 
     The old h2/h3/h4 model files are intentionally left untouched in
     Supabase Storage (retraining no longer writes to them) as a cheap
@@ -137,12 +212,24 @@ def predict_cycle_targets(
             print(f"AVISO: sin modelo h1 para {station_id}; se omite la estación.", flush=True)
             continue
 
-        real_lags = {}
-        for lag in LAGS:
-            key = (station_id, cutoff - timedelta(minutes=15 * (lag - 1)))
-            if key in history:
-                real_lags[lag] = history[key]
-        missing = [lag for lag in LAGS if lag not in real_lags]
+        targets_by_horizon = {}
+        for target in station_targets:
+            timestamp = _parse_utc(target["target_at"])
+            horizon = round((timestamp - cutoff).total_seconds() / 900)
+            targets_by_horizon[horizon] = target
+
+        # (lag, horizon) -> the real value k*15min before that horizon's target,
+        # for every lag that is already observed at data_cutoff (lag >= horizon).
+        real_lag_values = {}
+        missing = []
+        for horizon in range(1, max(targets_by_horizon) + 1):
+            for lag in LAGS:
+                if lag >= horizon:
+                    key = (station_id, cutoff + timedelta(minutes=15 * (horizon - lag)))
+                    if key in history:
+                        real_lag_values[(lag, horizon)] = history[key]
+                    else:
+                        missing.append(lag)
         if missing:
             print(
                 f"AVISO: se omite {station_id} en este ciclo: "
@@ -151,14 +238,8 @@ def predict_cycle_targets(
             )
             continue
 
-        targets_by_horizon = {}
-        for target in station_targets:
-            timestamp = _parse_utc(target["target_at"])
-            horizon = round((timestamp - cutoff).total_seconds() / 900)
-            targets_by_horizon[horizon] = target
-
         is_alarm = bool(alarm_flags.get(station_id))
-        anchor = real_lags[1]
+        anchor = real_lag_values[(1, 1)]  # the last real observation, at data_cutoff
         band_lo = anchor * (1 - PH_ALARM_BAND_PCT)
         band_hi = anchor * (1 + PH_ALARM_BAND_PCT)
 
@@ -172,7 +253,7 @@ def predict_cycle_targets(
             feature_values = []
             for lag in LAGS:
                 if lag >= horizon:
-                    feature_values.append(real_lags[lag])
+                    feature_values.append(real_lag_values[(lag, horizon)])
                 else:
                     feature_values.append(predicted_by_horizon[horizon - lag])
             features = feature_values + temporal_features(target_ts)
@@ -224,6 +305,10 @@ def submit_current_cycle() -> dict | None:
         if exc.response is not None and exc.response.status_code == 404:
             return None
         raise
+    if _cycle_already_submitted(cycle["cycle_id"]):
+        print(f"Ciclo {cycle['cycle_id']} ya enviado por este job; se omite.", flush=True)
+        check_collector_heartbeat()
+        return None
     cutoff = _parse_utc(cycle["data_cutoff"])
     station_ids = sorted({target["station_id"] for target in cycle["targets"]})
     # Every target's lag features only ever look up cutoff - 15*(lag-1)
@@ -235,7 +320,7 @@ def submit_current_cycle() -> dict | None:
     # tick, by far the largest source of Supabase DB egress. Filtering by
     # the exact points needed cuts that to at most len(station_ids)*len(LAGS)
     # rows per table.
-    needed_timestamps = [cutoff - timedelta(minutes=15 * (lag - 1)) for lag in LAGS]
+    needed_timestamps = lag_timestamps(cutoff)
     if USE_4H_WAVE:
         # 32 slots mas por estacion: lo que necesita wave_module para decidir.
         needed_timestamps = sorted(set(needed_timestamps) | set(wave_module.history_timestamps(cutoff)))
@@ -307,6 +392,30 @@ def submit_current_cycle() -> dict | None:
         except Exception as exc:
             print(f"AVISO: capa de onda 4h fallo ({exc!r}); se usa el XGBoost estandar.", flush=True)
 
+    # Capa general: mezcla suave con el XGBoost solo donde la onda de 4h no
+    # reclamo la prediccion Y hay evidencia periodica estable y claramente mejor.
+    # Se trabaja sobre una copia de seguridad: cualquier error restaura la cadena
+    # estandar intacta (esta capa nunca debe impedir ni corromper una submission).
+    chain_weight: dict[tuple[str, str], float] = {}
+    if USE_GENERIC_REGIME and len(wave_overridden) < len(predictions):
+        snapshot = [dict(prediction) for prediction in predictions]
+        try:
+            generic_history = _fetch_generic_history(station_ids, cutoff)
+            chain_weight = regime_module.apply_generic_layer(
+                predictions, generic_history, models, cutoff, skip=wave_overridden
+            )
+            blended = sum(1 for weight in chain_weight.values() if weight < 0.999)
+            print(
+                f"Capa general: {blended}/{len(chain_weight)} predicciones mezcladas con estructura periodica; "
+                "el resto usa el XGBoost estandar.",
+                flush=True,
+            )
+        except Exception as exc:
+            for prediction, saved in zip(predictions, snapshot):
+                prediction.update(saved)
+            chain_weight = {}
+            print(f"AVISO: capa general fallo ({exc!r}); se usa el XGBoost estandar.", flush=True)
+
     # Bias correction on top of the raw model output - see
     # station_bias_components's docstring. One DB read per station per
     # submission (not per target, not per horizon), and never touches what
@@ -330,6 +439,9 @@ def submit_current_cycle() -> dict | None:
         target_ts = _parse_utc(prediction["target_at"])
         horizon = round((target_ts - cutoff).total_seconds() / 900)
         bias = blend_horizon_bias(regular_bias, boosted_bias, horizon)
+        # El sesgo se mide sobre residuos de la cadena: solo aplica a su parte de
+        # la mezcla (peso 1.0 si la capa general no toco esta prediccion).
+        bias *= chain_weight.get((station_id, prediction["target_at"]), 1.0)
         prediction["value"] = round(max(0.0, prediction["value"] + bias), 3)
 
     run_id = f"run-{cycle['cycle_id']}"
@@ -375,9 +487,11 @@ def submit_current_cycle() -> dict | None:
         # no-op instead of letting it count toward the loop's fail counter.
         if exc.response is not None and exc.response.status_code == 409:
             print(f"Ciclo {cycle['cycle_id']} ya tenía una submission enviada; se omite.", flush=True)
+            _mark_cycle_submitted(cycle["cycle_id"])
             check_collector_heartbeat()
             return None
         raise
+    _mark_cycle_submitted(cycle["cycle_id"])
     result = {
         "student": identity["display_name"],
         "submission_id": receipt["submission_id"],

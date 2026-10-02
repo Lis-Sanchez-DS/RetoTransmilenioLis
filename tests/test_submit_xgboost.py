@@ -1,8 +1,18 @@
 from datetime import datetime, timedelta, timezone
 
+import pytest
 import requests
 
-from app.submit_xgboost import LAGS, predict_cycle_targets, submit_current_cycle
+from app.submit_xgboost import LAGS, lag_timestamps, predict_cycle_targets, submit_current_cycle
+
+
+@pytest.fixture(autouse=True)
+def _isolated_marker(tmp_path, monkeypatch):
+    """El marcador del ultimo ciclo enviado vive en disco: cada prueba usa el suyo."""
+    monkeypatch.setattr("app.submit_xgboost.LAST_SUBMITTED_MARKER", str(tmp_path / ".last_submitted_cycle"))
+    # La capa general viene apagada por defecto; las pruebas la ejercitan encendida
+    # (las que prueban otra cosa la apagan explicitamente despues).
+    monkeypatch.setattr("app.submit_xgboost.USE_GENERIC_REGIME", True)
 
 
 class RecordingModel:
@@ -21,20 +31,22 @@ class RecordingModel:
         return [row[0] + 1]
 
 
+def _full_history(station, cutoff, value_at):
+    """Todos los timestamps reales que la cadena puede leer, con value_at(offset en slots, <= 0)."""
+    return {(station, ts): value_at(round((ts - cutoff).total_seconds() / 900)) for ts in lag_timestamps(cutoff)}
+
+
 def test_predict_cycle_targets_chains_h1_prediction_recursively():
-    """h1 uses only real lags. h2's lag_1 slot must be h1's own prediction
-    (never a real value). h3's lag_1 slot must be h2's prediction and its
-    lag_2 slot must be h1's prediction. h4 continues the pattern. lag_4 and
-    lag_96 stay real at every horizon (LAGS = (1, 2, 4, 96), and no horizon
-    here exceeds 4, so k=4 and k=96 always satisfy k >= h).
+    """lag_k para el objetivo del horizonte h es la demanda k*15 min ANTES DEL
+    OBJETIVO (como entreno el modelo h1, donde lag_k = y.shift(k)). Con k >= h es
+    el valor real en cutoff + 15*(h-k); con k < h es la prediccion propia de la
+    cadena para el horizonte (h-k). Con y(offset) = 1000 + offset cada lag real es
+    distinguible, asi que esta prueba tambien fija el anclaje al OBJETIVO
+    (corregido el 2026-10-02: antes se leia anclado al corte, h-1 pasos mas viejo).
     """
     station = "A"
     cutoff = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
-    real_lags = {1: 100.0, 2: 200.0, 4: 400.0, 96: 9600.0}
-    history = {
-        (station, cutoff - timedelta(minutes=15 * (lag - 1))): value
-        for lag, value in real_lags.items()
-    }
+    history = _full_history(station, cutoff, lambda offset: 1000.0 + offset)  # y[c]=1000, y[c-1]=999, ...
     targets = [
         {"station_id": station, "target_at": (cutoff + timedelta(minutes=m)).isoformat()}
         for m in (15, 30, 45, 60)
@@ -44,12 +56,12 @@ def test_predict_cycle_targets_chains_h1_prediction_recursively():
 
     predictions = predict_cycle_targets(targets, history, models, cutoff)
 
-    assert [p["value"] for p in predictions] == [101.0, 102.0, 103.0, 104.0]
+    assert [p["value"] for p in predictions] == [1001.0, 1002.0, 1003.0, 1004.0]
     # Feature order matches LAGS = (1, 2, 4, 96): [lag_1_slot, lag_2_slot, lag_4_slot, lag_96_slot].
-    assert model.calls[0][:4] == [100.0, 200.0, 400.0, 9600.0]  # h1: fully real
-    assert model.calls[1][:4] == [101.0, 200.0, 400.0, 9600.0]  # h2: lag_1 <- h1's prediction
-    assert model.calls[2][:4] == [102.0, 101.0, 400.0, 9600.0]  # h3: lag_1<-h2, lag_2<-h1
-    assert model.calls[3][:4] == [103.0, 102.0, 400.0, 9600.0]  # h4: lag_1<-h3, lag_2<-h2
+    assert model.calls[0][:4] == [1000.0, 999.0, 997.0, 905.0]  # h1: y[c], y[c-1], y[c-3], y[c-95]
+    assert model.calls[1][:4] == [1001.0, 1000.0, 998.0, 906.0]  # h2: lag_1<-h1 pred; lag_2=y[c], lag_4=y[c-2], lag_96=y[c-94]
+    assert model.calls[2][:4] == [1002.0, 1001.0, 999.0, 907.0]  # h3: lag_1<-h2, lag_2<-h1; lag_4=y[c-1], lag_96=y[c-93]
+    assert model.calls[3][:4] == [1003.0, 1002.0, 1000.0, 908.0]  # h4: lag_1<-h3, lag_2<-h2; lag_4=y[c], lag_96=y[c-92]
 
 
 def test_predict_cycle_targets_keeps_stations_independent():
@@ -57,8 +69,7 @@ def test_predict_cycle_targets_keeps_stations_independent():
     cutoff = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
     history = {}
     for station, base in (("A", 100.0), ("B", 500.0)):
-        for lag in LAGS:
-            history[(station, cutoff - timedelta(minutes=15 * (lag - 1)))] = base
+        history.update(_full_history(station, cutoff, lambda offset, base=base: base))
 
     targets = [
         {"station_id": station, "target_at": (cutoff + timedelta(minutes=m)).isoformat()}
@@ -92,10 +103,7 @@ def test_predict_cycle_targets_skips_station_with_missing_history():
         {"station_id": healthy_station, "target_at": (cutoff + timedelta(minutes=m)).isoformat()}
         for m in (15, 30)
     ]
-    history = {
-        (healthy_station, cutoff - timedelta(minutes=15 * (lag - 1))): 500.0 + lag
-        for lag in LAGS
-    }
+    history = _full_history(healthy_station, cutoff, lambda offset: 500.0 + offset)
     models = {incomplete_station: RecordingModel(), healthy_station: RecordingModel()}
 
     predictions = predict_cycle_targets(targets, history, models, cutoff)
@@ -119,10 +127,7 @@ class ConstantModel:
 
 
 def _flat_history(station, cutoff, anchor):
-    return {
-        (station, cutoff - timedelta(minutes=15 * (lag - 1))): anchor
-        for lag in LAGS
-    }
+    return _full_history(station, cutoff, lambda offset: anchor)
 
 
 def test_predict_cycle_targets_clamps_overprediction_during_alarm():
@@ -431,8 +436,8 @@ def test_submit_current_cycle_applies_horizon_decayed_bias(monkeypatch):
 
         def execute(self, query, params=None):
             self._rows = [
-                (station, (cutoff - timedelta(minutes=15 * (lag - 1))).isoformat(), 500.0 + lag)
-                for lag in LAGS
+                (station, ts.isoformat(), 500.0)
+                for ts in lag_timestamps(cutoff)
             ] if 'FROM "Original Data"' in query else []
             return self
 
@@ -533,7 +538,7 @@ def test_submit_current_cycle_queries_only_needed_lag_timestamps(monkeypatch):
 
     queries = [(q, p) for q, p in captured if "station_id = ANY" in q]
     assert len(queries) == 2  # "Original Data" + "Temp"
-    expected_timestamps = set(cutoff - timedelta(minutes=15 * (lag - 1)) for lag in LAGS)
+    expected_timestamps = set(lag_timestamps(cutoff))
     # La onda de 4h (USE_4H_WAVE) suma una ventana fija de 32 slots: sigue siendo
     # una lista acotada de timestamps exactos, nunca la tabla completa.
     expected_timestamps |= {cutoff - timedelta(minutes=15 * k) for k in range(32)}
@@ -541,7 +546,7 @@ def test_submit_current_cycle_queries_only_needed_lag_timestamps(monkeypatch):
         station_ids, timestamps = params
         assert station_ids == [station]
         assert sorted(timestamps) == sorted(expected_timestamps)
-        assert len(timestamps) == 33  # ventana de 32 slots + lag_96
+        assert len(timestamps) == len(expected_timestamps)
 
 
 def test_submit_current_cycle_queries_only_lag_timestamps_when_wave_is_off(monkeypatch):
@@ -583,7 +588,7 @@ def test_submit_current_cycle_queries_only_lag_timestamps_when_wave_is_off(monke
         pass
     queries = [(q, p) for q, p in captured if "station_id = ANY" in q]
     for _, params in queries:
-        assert sorted(params[1]) == sorted(cutoff - timedelta(minutes=15 * (lag - 1)) for lag in LAGS)
+        assert sorted(params[1]) == lag_timestamps(cutoff)
 
 
 def _run_submit_with_history(monkeypatch, station, cutoff, series, horizons=(1, 2, 3, 4), bias=(-10.0, -10.0)):
@@ -608,17 +613,29 @@ def _run_submit_with_history(monkeypatch, station, cutoff, series, horizons=(1, 
 
         def execute(self, query, params=None):
             if 'FROM "Original Data"' in query and params is not None:
-                self._rows = [(station, ts.isoformat(), series(round((ts - cutoff).total_seconds() / 900))) for ts in params[1]]
+                if len(params) == 6:  # consulta por rango de la capa general: (ids, inicio, fin, ids, inicio, fin)
+                    start, end = params[1], params[2]
+                    stamps = []
+                    ts = start
+                    while ts <= end:
+                        stamps.append(ts)
+                        ts += timedelta(minutes=15)
+                else:  # consulta por timestamps exactos
+                    stamps = params[1]
+                self._rows = [(station, ts.isoformat(), series(round((ts - cutoff).total_seconds() / 900))) for ts in stamps]
             else:
                 self._rows = []
+            self.queries.append(query)
             return self
+
+        queries = []
 
         def fetchall(self):
             return self._rows
 
     class FakeModel:
         def predict(self, features):
-            return [100.0]
+            return [100.0] * len(features)
 
     captured = {}
 
@@ -650,6 +667,7 @@ def _run_submit_with_history(monkeypatch, station, cutoff, series, horizons=(1, 
     monkeypatch.setattr("app.submit_xgboost.API_KEY", "test-key", raising=False)
     monkeypatch.setattr("app.submit_xgboost.station_bias_components", fake_bias)
     monkeypatch.setattr("app.submit_xgboost._station_has_fresh_page_hinkley_alarm", lambda station_id: False)
+    FakeConnection.queries = []
     submit_current_cycle()
     return captured, bias_calls
 
@@ -671,6 +689,8 @@ def test_submit_uses_4h_wave_and_skips_ewma_when_wave_is_intact(monkeypatch):
 def test_submit_falls_back_to_standard_xgboost_when_wave_is_not_4h(monkeypatch):
     import math
 
+    monkeypatch.setattr("app.submit_xgboost.USE_GENERIC_REGIME", False)  # aisla el respaldo de 4h
+
     cutoff = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
     six_hour_wave = lambda slot: 1000.0 + 800.0 * math.sin(2 * math.pi * slot / 24)  # 6h, no 4h
     payload, bias_calls = _run_submit_with_history(monkeypatch, "A", cutoff, six_hour_wave)
@@ -683,6 +703,8 @@ def test_submit_falls_back_to_standard_xgboost_when_wave_is_not_4h(monkeypatch):
 def test_submit_wave_layer_error_never_blocks_the_submission(monkeypatch):
     import math
 
+    monkeypatch.setattr("app.submit_xgboost.USE_GENERIC_REGIME", False)
+
     def boom(*args, **kwargs):
         raise RuntimeError("fallo inesperado")
 
@@ -692,3 +714,78 @@ def test_submit_wave_layer_error_never_blocks_the_submission(monkeypatch):
         monkeypatch, "A", cutoff, lambda slot: 1000.0 + 800.0 * math.sin(2 * math.pi * slot / 16)
     )
     assert [p["value"] for p in payload["predictions"]] == [90.0, 90.0, 90.0, 90.0]
+
+
+def test_generic_layer_follows_a_6h_wave_the_4h_backup_ignores(monkeypatch):
+    """Un patron parecido pero no identico (periodo de 6h): el respaldo de 4h no
+    se activa, la capa general si, y el sesgo EWMA solo cuenta por el peso de la
+    cadena (casi cero aqui): el valor enviado sigue a la onda, no al 100 + (-10)
+    del XGBoost de mentira."""
+    import math
+
+    cutoff = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+    six_hour_wave = lambda slot: 1000.0 + 800.0 * math.sin(2 * math.pi * slot / 24)
+    payload, _ = _run_submit_with_history(monkeypatch, "A", cutoff, six_hour_wave)
+
+    by_target = {p["target_at"]: p["value"] for p in payload["predictions"]}
+    for h in (1, 2, 3, 4):
+        expected = six_hour_wave(h)  # la onda continua: lo que realmente pasara
+        submitted = by_target[(cutoff + timedelta(minutes=15 * h)).isoformat()]
+        assert abs(submitted - expected) < 0.05 * 1800, (h, submitted, expected)  # dentro de 5% de la amplitud pico a pico
+        assert submitted > 300  # muy lejos del 90 que enviaria el XGBoost de mentira
+
+
+def test_generic_layer_leaves_standard_pipeline_alone_without_periodic_structure(monkeypatch):
+    import random
+
+    rng = random.Random(3)
+    noise = {slot: rng.uniform(900, 1100) for slot in range(-400, 10)}
+    cutoff = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+    payload, bias_calls = _run_submit_with_history(monkeypatch, "A", cutoff, lambda slot: noise[slot])
+    assert [p["value"] for p in payload["predictions"]] == [90.0, 90.0, 90.0, 90.0]  # cadena 100 + sesgo -10, intacto
+    assert bias_calls == ["A"]
+
+
+def test_generic_layer_error_restores_standard_values_and_still_submits(monkeypatch):
+    import math
+
+    def corrupt_then_fail(predictions, *args, **kwargs):
+        for prediction in predictions:
+            prediction["value"] = -12345.0  # modifica en su lugar y luego falla
+        raise RuntimeError("fallo a mitad de camino")
+
+    monkeypatch.setattr("app.submit_xgboost.regime_module.apply_generic_layer", corrupt_then_fail)
+    cutoff = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+    payload, _ = _run_submit_with_history(
+        monkeypatch, "A", cutoff, lambda slot: 1000.0 + 800.0 * math.sin(2 * math.pi * slot / 24)
+    )
+    assert [p["value"] for p in payload["predictions"]] == [90.0, 90.0, 90.0, 90.0]
+
+
+def test_generic_layer_is_skipped_for_predictions_the_4h_backup_claimed(monkeypatch):
+    """Cuando la onda de 4h reclama todo, la capa general ni siquiera consulta la historia larga."""
+    import math
+
+    seen_queries = []
+    real_fetch = __import__("app.submit_xgboost", fromlist=["x"])._fetch_generic_history
+
+    def spy(*args, **kwargs):
+        seen_queries.append(args)
+        return real_fetch(*args, **kwargs)
+
+    monkeypatch.setattr("app.submit_xgboost._fetch_generic_history", spy)
+    cutoff = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+    _run_submit_with_history(monkeypatch, "A", cutoff, lambda slot: 1000.0 + 800.0 * math.sin(2 * math.pi * slot / 16))
+    assert seen_queries == []
+
+
+def test_second_loop_iteration_for_the_same_cycle_does_no_heavy_work(monkeypatch):
+    import math
+
+    cutoff = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+    series = lambda slot: 1000.0 + 800.0 * math.sin(2 * math.pi * slot / 24)
+    _run_submit_with_history(monkeypatch, "A", cutoff, series)  # primera vuelta: envia y deja el marcador
+    calls = {"history": 0}
+    monkeypatch.setattr("app.submit_xgboost._fetch_generic_history", lambda *a, **k: calls.__setitem__("history", calls["history"] + 1) or {})
+    payload, bias_calls = _run_submit_with_history(monkeypatch, "A", cutoff, series)  # segunda vuelta, mismo ciclo
+    assert payload == {} and bias_calls == [] and calls["history"] == 0

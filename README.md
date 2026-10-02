@@ -79,6 +79,7 @@ app/
   submit_xgboost.py     descubre el ciclo abierto y envía las 4 predicciones por estación
   features.py           codificación temporal compartida entre entrenamiento e inferencia
   regime_4h.py           respaldo de la onda de 4h: repite y[objetivo-16] mientras la onda se verifica (ver punto 15)
+  regime.py               capa general de estructura periodica sobre el XGBoost, apagada por defecto (ver punto 15)
   health.py              heartbeat del collector (tabla ops.job_runs)
   net.py                  reintentos de red para fallos transitorios
   db.py                    conexión a Supabase Postgres
@@ -601,13 +602,45 @@ activa nunca.
 
 **Límites conocidos.** Está afinada al único régimen real que hemos visto
 (un solo evento); no cubre ondas de otro periodo (simplemente no se activa).
-Existe una versión apilada y más general (`app/regime.py`, sin cablear): busca
-cualquier periodo de 1.5 h a 12 h, ajusta `a + b*y[t-L]` (b negativo cubre
-una onda invertida) y mezcla suavemente con el XGBoost. En backtest real
-quedó cerca del respaldo en las últimas 6 rondas (89.5% vs 90.3%) pero peor
-desde el inicio de la onda (86.2% vs 89.8%) y perdió ~1.1 pp en periodo calmo
-(3.3 pp en h4) por ajustar ruido, así que no cumple la regla de aceptación y
-no se desplegó.
+Existe además una capa general (`app/regime.py`, cableada detrás de
+`USE_GENERIC_REGIME`, **apagada por defecto**): busca cualquier periodo de
+1.5 h a 12 h, ajusta `a + b*y[t-L]` (b negativo cubre una onda invertida) y
+mezcla suavemente con el XGBoost, solo sobre lo que el respaldo de 4h no
+reclamó. Su primera versión perdía ~1.1 pp en periodo calmo (3.3 pp en h4) por
+ajustar ruido; la actual exige correlación estable en signo entre la ventana de
+ajuste y la de validación, superar a la cadena por 0.15 y llegar a 0.80 de
+precisión, y promedia los 3 mejores lags. Replay del pipeline completo contra el
+vigente (178 cortes horarios): periodo calmo -0.07 pp, onda 0.00, últimas 6
+rondas 0.00 - sin beneficio con datos reales (el único patrón real ya lo cubre
+el respaldo); su valor es de seguro ante otros patrones y se apoya en pruebas
+sintéticas (onda de 6 h: ~85% contra ~50% de la cadena; tarda horas en
+readaptarse tras un corte brusco). Encenderla es decisión del usuario.
+
+### 16. Corrección del anclaje de los lags reales en la cadena recursiva (2026-10-02)
+
+Al probar la capa general se encontró que la cadena de producción leía los lags
+reales con `k >= h` en `data_cutoff - 15*(k-1)` (anclados al corte, como los
+modelos directos antiguos) en vez de "k pasos antes del OBJETIVO"
+(`data_cutoff + 15*(h-k)`), que es lo que el modelo h1 vio al entrenar
+(`lag_k = y.shift(k)`). Para h >= 2 eso alimentaba `lag_2`, `lag_4` y `lag_96`
+con valores `h-1` pasos más viejos de lo debido. Backtest con el stack completo
+(cadena + clamp + EWMA/PH) y modelos h1 reentrenados solo con el prefijo de cada
+fold (sin información futura), precisión media por estación, tres folds
+cronológicos:
+
+| Fold | Anclado al corte (antes) | Anclado al objetivo (ahora) | Diferencia |
+|---|---|---|---|
+| 70-85% | 85.12% | 86.29% | +1.17 pp (h4: +3.0) |
+| Últimos 15% | 77.83% | 78.79% | +0.95 pp (h4: +2.1) |
+| Shock 09-17+ | 66.81% | 67.82% | +1.01 pp (h4: +1.7) |
+
+Todas las estaciones mejoran en los tres folds (la peor +0.19 / +0.24 / +0.56 pp),
+así que cumple la regla de aceptación (mejora al menos un fold y no perjudica el
+otro) con holgura. No requiere reentrenar nada: son los mismos modelos h1; solo
+cambia qué timestamps lee `predict_cycle_targets` (`lag_timestamps()` en
+`submit_xgboost.py`, ~8 puntos exactos por estación). Con la onda de 4h activa
+el respaldo reemplaza estos valores, así que el efecto se nota sobre todo fuera
+de la onda y como base del XGBoost cuando esta se apague.
 
 ## Reducción de tráfico a Supabase (2026-09-27)
 

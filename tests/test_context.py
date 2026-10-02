@@ -95,7 +95,9 @@ class _RecordingModel:
 
 
 def _history_for(station):
-    return {(station, CUTOFF - timedelta(minutes=15 * (lag - 1))): 100.0 for lag in LAGS}
+    from app.submit_xgboost import lag_timestamps
+
+    return {(station, ts): 100.0 for ts in lag_timestamps(CUTOFF)}
 
 
 def _targets(station):

@@ -555,13 +555,24 @@ not one model per (station, horizon).** `predict_cycle_targets()` in
 and calls it once per horizon **in chronological order**, feeding each
 prediction back in as the stand-in for the not-yet-observed value the next
 horizon's lags need: for target horizon `h`, `lag_k`'s feature value is the
-real observed value at `cutoff - 15*(k-1)` minutes if `k >= h`, otherwise
-it's the chain's own prediction for horizon `h - k`. This is required
-because `lag_k` means "demand exactly k*15 minutes before the *target*
-timestamp", which only equals "k*15 minutes before `data_cutoff`" for the
-+15min horizon. **Do not** compute all 4 horizons' features relative to
-`data_cutoff` directly - that was a real, previously-shipped bug that
-silently broke 75% of every submission (see "Known past bugs" below).
+real observed value at `cutoff + 15*(h-k)` minutes (= k steps before the
+target) if `k >= h`, otherwise it's the chain's own prediction for horizon
+`h - k`. This is required because `lag_k` means "demand exactly k*15 minutes
+before the *target* timestamp", which only equals "k*15 minutes before
+`data_cutoff`" for the +15min horizon. **Do not** compute all 4 horizons'
+features relative to `data_cutoff` directly - that was a real,
+previously-shipped bug that silently broke 75% of every submission (see
+"Known past bugs" below). **A second, subtler version of the same mistake
+lived in the chain until 2026-10-02**: the real lags for `k >= h` were read
+at `cutoff - 15*(k-1)` (anchored at the cutoff, as the old direct models
+were), i.e. `h-1` steps staler than "k steps before the target" for h >= 2.
+Fixed (`lag_timestamps()` in `submit_xgboost.py` lists the exact points read):
+through the full stack with h1 models retrained on each fold's prefix, it
+improved all three chronological folds (+1.17 / +0.95 / +1.01pp station mean,
+h4 +2 to +3pp, every station gained, none lost >0.3pp). The test that locks it
+is `test_predict_cycle_targets_chains_h1_prediction_recursively` (distinct
+value per offset) plus `test_chain_matrix_matches_the_recursive_chain_used_in_production`
+(the vectorized copy in `app/regime.py` must equal the production chain).
 `app/collector.py`'s `predict_records()` already uses the correct pattern
 for its own (single-step) prediction - mirror it rather than reinventing.
 
@@ -705,7 +716,8 @@ in those first 16 slots, never activates without a wave.
 - A missed-cycle theory for the 65.8%: wrong (the portal showed 6/6 delivered, 100%
   coverage). Cumulative coverage 98.09% = exactly 154/157 cycles, i.e. 3 missed in
   the whole competition.
-- The stacked "learn any period" layer (`app/regime.py`, NOT wired, no tests):
+- The stacked "learn any period" layer, FIRST version (`app/regime.py`, now
+  rewritten - see the next paragraph):
   searches lags 6-48 slots, fits `a + b*y[t-L]` (negative b covers inversion) on a
   fit window, scores on a later validation window, and softmax-blends chain / lag
   forecast / chain + periodic error correction. Real backtest: last 6 cycles 89.5%
@@ -714,6 +726,23 @@ in those first 16 slots, never activates without a wave.
   / 0.09 lag). Fails the acceptance rule. It also adapts only with a delay of hours
   (synthetic inversion/period-switch tests were no better than persistence for the
   first ~30 slots). Improvement ideas are in the README (point 15) and below.
+
+**Generic layer, current state (`app/regime.py`, wired behind `USE_GENERIC_REGIME`,
+OFF by default).** Runs after the 4h backup, only on predictions it did not claim.
+Strict gate: a learned forecast (M1 = `a + b*y[t-L]` over all L in 6-48 slots,
+b may be negative; M2 = chain + periodic correction of its own error) only counts
+if its correlation is stable in sign and |r| >= 0.5 across the fit and validation
+windows, it beats the chain by 0.15 AND reaches 0.80 validation accuracy; the top
+3 stable lags are averaged and softmax-blended with the chain; EWMA is scaled by
+the chain's weight; any error restores the standard chain. Replay of the full
+pipeline vs the live one on 178 hourly cutoffs: calm -0.07pp (0.31% of predictions
+changed, worst station 05000 -0.63pp), wave 0.00, exact last 6 cycles 0.00 - i.e.
+no real-data benefit because the only real pattern is the 4h wave the backup
+already covers; its evidence for other patterns (6h wave, inverted, period
+switch) is synthetic only and it loses ~8-12pp for ~30 slots after an abrupt break.
+Turning it on is the user's call. `submit_current_cycle` also keeps a per-job marker
+file (`.last_submitted_cycle` next to the models) so the later 5-minute wake-ups of
+the same cycle return early instead of re-reading history to hit a 409.
 
 **Lessons.** (1) When a score gap vs. peers looks too large to be model quality,
 inspect the data's structure (autocorrelation by lag, spectrum) before modeling -
