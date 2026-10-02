@@ -78,6 +78,7 @@ app/
   drift.py             detección de drift + reentrenamiento del modelo h1 por estación
   submit_xgboost.py     descubre el ciclo abierto y envía las 4 predicciones por estación
   features.py           codificación temporal compartida entre entrenamiento e inferencia
+  regime_4h.py           respaldo de la onda de 4h: repite y[objetivo-16] mientras la onda se verifica (ver punto 15)
   health.py              heartbeat del collector (tabla ops.job_runs)
   net.py                  reintentos de red para fallos transitorios
   db.py                    conexión a Supabase Postgres
@@ -534,6 +535,79 @@ cosas más:
   la ganancia en las estaciones que sí compensaban por compounding severo
   (una llegó de 0% a más de 87% de accuracy en h4 durante su alarma real).
   `PH_ALARM_BAND_PCT = 0.5` en `submit_xgboost.py`.
+
+### 15. Onda de 4 horas: capa de respaldo sobre el XGBoost (2026-10-02)
+
+**Qué pasó.** Con la tabla de las últimas 6 rondas en 65.8% contra 90-92% de
+los cinco primeros (la acumulada, en cambio, estaba en 75.6%, sexta, a 5 pp
+del primero), se revisó qué estaba pasando en los datos. Desde
+~2026-09-18 11:15 UTC **las 12 estaciones oscilan con periodo de 16 slots
+(4 h)**: esa componente concentra ~81% de la potencia espectral de cada
+estación, y la demanda de 07111 oscila entre ~350 y ~3 500 dentro de cada
+periodo. Los datos son sintéticos (`demand_is_synthetic: true` en
+`/v1/meta`), así que esto es un escenario del reto, no ruido orgánico.
+
+**Por qué el XGBoost no lo ve.** Sus features son `lag_1, lag_2, lag_4,
+lag_96` y calendario de 24 h/semanal; ninguna codifica un ciclo de 4 h, y
+antes del inicio esa onda no existía en el entrenamiento (repetir
+`y[t-16]` rendía solo 12-28%). La cadena recursiva rindió ~70% (h1 85 %, h2
+75 %, h3 64 %, h4 52 %) mientras que repetir `y[objetivo-16]` rinde ~90% en
+los cuatro horizontes. Una prueba de oráculo (la cadena con los lags reales
+en lugar de sus propias predicciones) llega a ~85%: el modelo de un paso está
+bien, lo que se pierde es la información de `lag_1` que no existe aún al
+momento del corte; no es un problema de entrenamiento ni de drift.
+
+**Qué se descartó.** (1) Ciclos perdidos: el panel muestra 6/6 ciclos
+entregados y cobertura 100%. (2) Contexto de la API (`/v1/context`): no
+publica filas posteriores al 2026-09-09 y su efecto medido es pequeño.
+(3) Modelos directos por horizonte reentrenados (estilo antiguo y con features
+relativas, ver punto 12): ninguno mejoró de forma clara en tres folds
+cronológicos (diferencias de -0.76 a +0.83 pp frente a la cadena); en el
+fold del shock todos promedian ~68%, porque no pueden aprender un ciclo que
+no existe en su entrenamiento.
+
+**Qué se desplegó** (`app/regime_4h.py`, cableado en
+`submit_xgboost.submit_current_cycle`, bandera `USE_4H_WAVE`): un interruptor
+por (estación, horizonte) que reemplaza el valor de la cadena por
+`y[objetivo-16]` **solo mientras la onda se verifica** y deja el XGBoost
+estándar (cadena + clamp Page-Hinkley + EWMA) en cualquier otro caso. Entra
+si la precisión de `y[i] ~ y[i-16]` es >= 0.80 en los últimos 16 slots, >=
+0.75 en los últimos 8 y supera por 0.10 a la persistencia al mismo
+horizonte; sale en cuanto los últimos 4 slots bajan de 0.60 o dejan de
+cumplirse las condiciones de entrada. No guarda estado (se recalcula cada
+ciclo con 32 slots por estación, ~33 timestamps con `lag_96`), así que si la
+onda cambia de periodo, se invierte o aparece ruido distinto, vuelve sola al
+XGBoost. Cuando está activo, el EWMA **no** se suma (se mide sobre residuos de
+la cadena); el valor guardado como `prediction` para drift sigue siendo el
+de un paso de la cadena sin tocar. Cualquier excepción dentro de la capa se
+degrada a la cadena estándar: nunca bloquea una submission. Apagar la
+bandera restaura exactamente el comportamiento anterior.
+
+**Backtest** (12 estaciones, cortes reales, precisión media por estación;
+cadena = stack de producción con clamp y EWMA):
+
+| Ventana | Cadena | Con la onda de 4 h |
+|---|---|---|
+| Últimas 6 rondas exactas (cortes horarios 02:00-07:00 del 09-19) | 69.8% | **90.3%** |
+| Desde 09-18 12:00 | 69.0% | 89.8% |
+| Antes de la onda (09-17 07:45 a 09-18 12:00) | 81.0% | 81.3% (activa 2% del tiempo) |
+
+Con una ventana de 8 semanas de historia el criterio (>= 0.80) nunca se
+activa antes del inicio. Pruebas sintéticas de estrés (onda que se detiene,
+cambio de periodo 4 h a 6 h, fase invertida, ráfaga de ruido, amplitud a la
+mitad, sin onda): la capa se apaga en ~16 slots, nunca perjudica de forma
+relevante (peor caso ~-2 pp durante esos primeros 16 slots) y sin onda no se
+activa nunca.
+
+**Límites conocidos.** Está afinada al único régimen real que hemos visto
+(un solo evento); no cubre ondas de otro periodo (simplemente no se activa).
+Existe una versión apilada y más general (`app/regime.py`, sin cablear): busca
+cualquier periodo de 1.5 h a 12 h, ajusta `a + b*y[t-L]` (b negativo cubre
+una onda invertida) y mezcla suavemente con el XGBoost. En backtest real
+quedó cerca del respaldo en las últimas 6 rondas (89.5% vs 90.3%) pero peor
+desde el inicio de la onda (86.2% vs 89.8%) y perdió ~1.1 pp en periodo calmo
+(3.3 pp en h4) por ajustar ruido, así que no cumple la regla de aceptación y
+no se desplegó.
 
 ## Reducción de tráfico a Supabase (2026-09-27)
 

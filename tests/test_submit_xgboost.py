@@ -533,8 +533,162 @@ def test_submit_current_cycle_queries_only_needed_lag_timestamps(monkeypatch):
 
     queries = [(q, p) for q, p in captured if "station_id = ANY" in q]
     assert len(queries) == 2  # "Original Data" + "Temp"
-    expected_timestamps = sorted(cutoff - timedelta(minutes=15 * (lag - 1)) for lag in LAGS)
+    expected_timestamps = set(cutoff - timedelta(minutes=15 * (lag - 1)) for lag in LAGS)
+    # La onda de 4h (USE_4H_WAVE) suma una ventana fija de 32 slots: sigue siendo
+    # una lista acotada de timestamps exactos, nunca la tabla completa.
+    expected_timestamps |= {cutoff - timedelta(minutes=15 * k) for k in range(32)}
     for _, params in queries:
         station_ids, timestamps = params
         assert station_ids == [station]
-        assert sorted(timestamps) == expected_timestamps
+        assert sorted(timestamps) == sorted(expected_timestamps)
+        assert len(timestamps) == 33  # ventana de 32 slots + lag_96
+
+
+def test_submit_current_cycle_queries_only_lag_timestamps_when_wave_is_off(monkeypatch):
+    """Con USE_4H_WAVE apagada la consulta vuelve a ser exactamente la de antes."""
+    monkeypatch.setattr("app.submit_xgboost.USE_4H_WAVE", False)
+    station = "A"
+    cutoff = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+    cycle = {
+        "cycle_id": "cycle-1",
+        "data_cutoff": cutoff.isoformat(),
+        "targets": [{"station_id": station, "target_at": (cutoff + timedelta(minutes=15)).isoformat()}],
+    }
+    captured = []
+
+    class FakeConnection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def execute(self, query, params=None):
+            captured.append((query, params))
+            self._rows = []
+            return self
+
+        def fetchall(self):
+            return self._rows
+
+    monkeypatch.setattr("app.submit_xgboost.collect_new_data", lambda: {"collected": 0, "inserted": 0, "pages": 1, "cursor": None})
+    monkeypatch.setattr("app.submit_xgboost.api_get", lambda path: cycle if "current" in path else {"display_name": "x"})
+    monkeypatch.setattr("app.submit_xgboost.connection", lambda: FakeConnection())
+    monkeypatch.setattr("app.submit_xgboost.API_KEY", "test-key", raising=False)
+    monkeypatch.setattr("app.submit_xgboost.joblib.load", lambda path: object())
+    monkeypatch.setattr("app.submit_xgboost._station_has_fresh_page_hinkley_alarm", lambda station_id: False)
+    try:
+        submit_current_cycle()
+    except RuntimeError:
+        pass
+    queries = [(q, p) for q, p in captured if "station_id = ANY" in q]
+    for _, params in queries:
+        assert sorted(params[1]) == sorted(cutoff - timedelta(minutes=15 * (lag - 1)) for lag in LAGS)
+
+
+def _run_submit_with_history(monkeypatch, station, cutoff, series, horizons=(1, 2, 3, 4), bias=(-10.0, -10.0)):
+    """Corre submit_current_cycle con una historia sintetica `series` (funcion
+    de numero de slot -> demanda; el cutoff es el slot 0) y devuelve
+    (payload, veces que se leyo el sesgo EWMA)."""
+    cycle = {
+        "cycle_id": "cycle-1",
+        "data_cutoff": cutoff.isoformat(),
+        "targets": [
+            {"station_id": station, "target_at": (cutoff + timedelta(minutes=15 * h)).isoformat()} for h in horizons
+        ],
+    }
+    bias_calls = []
+
+    class FakeConnection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def execute(self, query, params=None):
+            if 'FROM "Original Data"' in query and params is not None:
+                self._rows = [(station, ts.isoformat(), series(round((ts - cutoff).total_seconds() / 900))) for ts in params[1]]
+            else:
+                self._rows = []
+            return self
+
+        def fetchall(self):
+            return self._rows
+
+    class FakeModel:
+        def predict(self, features):
+            return [100.0]
+
+    captured = {}
+
+    class FakeResponse:
+        status_code = 200
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"submission_id": "s", "status": "accepted", "predictions_received": len(horizons), "expected_predictions": len(horizons)}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        if "/submissions" in url:
+            captured.update(json)
+        return FakeResponse()
+
+    def fake_bias(station_id):
+        bias_calls.append(station_id)
+        return bias
+
+    monkeypatch.setattr("app.submit_xgboost.collect_new_data", lambda: {"collected": 0, "inserted": 0, "pages": 1, "cursor": None})
+    monkeypatch.setattr("app.submit_xgboost.api_get", lambda path: cycle if "current" in path else {"display_name": "x"})
+    monkeypatch.setattr("app.submit_xgboost.connection", lambda: FakeConnection())
+    monkeypatch.setattr("app.submit_xgboost.joblib.load", lambda path: FakeModel())
+    monkeypatch.setattr("app.submit_xgboost.os.path.getmtime", lambda path: 0)
+    monkeypatch.setattr("app.submit_xgboost.check_collector_heartbeat", lambda: None)
+    monkeypatch.setattr("app.submit_xgboost.requests.post", fake_post)
+    monkeypatch.setattr("app.submit_xgboost.API_KEY", "test-key", raising=False)
+    monkeypatch.setattr("app.submit_xgboost.station_bias_components", fake_bias)
+    monkeypatch.setattr("app.submit_xgboost._station_has_fresh_page_hinkley_alarm", lambda station_id: False)
+    submit_current_cycle()
+    return captured, bias_calls
+
+
+def test_submit_uses_4h_wave_and_skips_ewma_when_wave_is_intact(monkeypatch):
+    import math
+
+    cutoff = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+    wave = lambda slot: 1000.0 + 800.0 * math.sin(2 * math.pi * slot / 16)  # periodo exacto de 16 slots
+    payload, bias_calls = _run_submit_with_history(monkeypatch, "A", cutoff, wave)
+
+    by_target = {p["target_at"]: p["value"] for p in payload["predictions"]}
+    for h in (1, 2, 3, 4):
+        expected = wave(h - 16)  # y[objetivo - 16]
+        assert abs(by_target[(cutoff + timedelta(minutes=15 * h)).isoformat()] - expected) < 0.01
+    assert bias_calls == []  # EWMA no se aplica a valores que ya no vienen de la cadena
+
+
+def test_submit_falls_back_to_standard_xgboost_when_wave_is_not_4h(monkeypatch):
+    import math
+
+    cutoff = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+    six_hour_wave = lambda slot: 1000.0 + 800.0 * math.sin(2 * math.pi * slot / 24)  # 6h, no 4h
+    payload, bias_calls = _run_submit_with_history(monkeypatch, "A", cutoff, six_hour_wave)
+
+    # Chain (model=100) + EWMA bias (-10) = 90 en los cuatro horizontes: nada cambio.
+    assert [p["value"] for p in payload["predictions"]] == [90.0, 90.0, 90.0, 90.0]
+    assert bias_calls == ["A"]
+
+
+def test_submit_wave_layer_error_never_blocks_the_submission(monkeypatch):
+    import math
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("fallo inesperado")
+
+    monkeypatch.setattr("app.submit_xgboost.wave_module.wave_forecast", boom)
+    cutoff = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+    payload, _ = _run_submit_with_history(
+        monkeypatch, "A", cutoff, lambda slot: 1000.0 + 800.0 * math.sin(2 * math.pi * slot / 16)
+    )
+    assert [p["value"] for p in payload["predictions"]] == [90.0, 90.0, 90.0, 90.0]

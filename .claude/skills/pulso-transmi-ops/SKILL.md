@@ -661,6 +661,66 @@ no-lookahead alarm signal (same state machine as production), swept across
 several band widths before picking 0.5 as the widest one that still kept
 most of the gain while minimizing the one regressor's damage.
 
+## 4-hour wave layer (`app/regime_4h.py`, deployed 2026-10-02) - read before touching submissions
+
+**Finding.** Since virtual ~2026-09-18 11:15 UTC all 12 stations oscillate with a
+16-slot (4h) period (~81% of spectral power; the demand is synthetic, so this is a
+scripted scenario). The XGBoost chain (lags 1,2,4,96 + 24h/weekly calendar) can't
+see it: ~70% on those windows vs ~90% for just repeating `y[target-16]`. Before the
+onset `lag16` scored only 12-28%. This is why the user's "last 6 cycles" score
+(65.8%) trailed the leaders (90-92%) while the cumulative board had them 6th, 5pp
+behind first. An oracle test (true lags instead of the chain's own predictions)
+tops out at ~85%, so the leaders' 90% comes from the period, not a better one-step
+model.
+
+**What is wired.** `submit_xgboost.submit_current_cycle` (flag `USE_4H_WAVE`, turn
+it off to restore the old behavior exactly): after `predict_cycle_targets`, each
+(station, horizon) prediction is replaced by `y[target-16]` ONLY while
+`regime_4h.wave_active` holds, otherwise the standard stack (chain + Page-Hinkley
+band clamp + EWMA) is untouched. Entry: lag-16 accuracy >= 0.80 over the last 16
+slots AND >= 0.75 over the last 8 AND >= persistence-at-horizon + 0.10. Exit: last
+4 slots < 0.60, or entry conditions stop holding. Stateless, recomputed every
+cycle from 32 slots/station (the DB read becomes 33 exact timestamps per station
+including `lag_96`; still bounded, never a table scan). When a value comes from
+the wave the EWMA correction is skipped (it's measured on chain residuals). The
+`prediction` stored in `Temp` for drift monitoring stays the raw chain one-step
+output. Any exception inside the layer degrades to the standard chain and never
+blocks a submission.
+
+**Evidence (all 12 stations, real cutoffs, station-mean accuracy; chain = full
+production stack).** Exact last 6 cycles (hourly cutoffs 02:00-07:00 on 09-19):
+69.8% -> 90.3%. Since 09-18 12:00: 69.0% -> 89.8%. Pre-onset: 81.0% -> 81.3%
+(active 2% of the time). The 0.80 entry never fired before the onset in 8 weeks
+of history. Synthetic stress (wave stops, 4h->6h, inverted phase, noise burst,
+amplitude change, no wave): it turns itself off within ~16 slots, worst harm ~-2pp
+in those first 16 slots, never activates without a wave.
+
+**Things tried that did NOT work (don't redo without new evidence).**
+- Retrained direct per-horizon models (old-style absolute lags, relative-ratio
+  features with yesterday's move as ratios, a no-seasonal variant, and a 50/50
+  chain+direct blend) on 3 chronological folds incl. the shock: blend
+  -0.07/+0.83/+0.39pp, the rest worse; all ~68% on the shock fold. They can't learn
+  a cycle absent from their training data.
+- Seasonal-ratio and "same slot yesterday" naive forecasts: ~51% since 09-18 12:00.
+- A missed-cycle theory for the 65.8%: wrong (the portal showed 6/6 delivered, 100%
+  coverage). Cumulative coverage 98.09% = exactly 154/157 cycles, i.e. 3 missed in
+  the whole competition.
+- The stacked "learn any period" layer (`app/regime.py`, NOT wired, no tests):
+  searches lags 6-48 slots, fits `a + b*y[t-L]` (negative b covers inversion) on a
+  fit window, scores on a later validation window, and softmax-blends chain / lag
+  forecast / chain + periodic error correction. Real backtest: last 6 cycles 89.5%
+  (backup 90.3%), since onset 86.2% (backup 89.8%), and it LOST 1.1pp pre-onset
+  (3.3pp at h4) by fitting noise (calm-period weights ~0.51 chain / 0.41 correction
+  / 0.09 lag). Fails the acceptance rule. It also adapts only with a delay of hours
+  (synthetic inversion/period-switch tests were no better than persistence for the
+  first ~30 slots). Improvement ideas are in the README (point 15) and below.
+
+**Lessons.** (1) When a score gap vs. peers looks too large to be model quality,
+inspect the data's structure (autocorrelation by lag, spectrum) before modeling -
+the answer was one lag. (2) The honest ceiling for a model matters: compare against
+an oracle and trivial baselines before building. (3) Synthetic "robustness" results
+vs persistence are weak evidence; always test against the real stack.
+
 ## Data feed: a slow virtual clock, not a permanent stall
 
 **Correction (2026-09-26): an earlier version of this doc said the feed was

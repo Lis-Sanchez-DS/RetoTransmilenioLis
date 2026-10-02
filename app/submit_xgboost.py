@@ -8,6 +8,7 @@ import joblib
 import requests
 
 from app import context as context_module
+from app import regime_4h as wave_module
 from app.collector import collect_new_data
 from app.db import connection
 from app.drift import (
@@ -42,6 +43,14 @@ MODEL_DIR = os.getenv("MODEL_DIR", "models/xgboost")
 # ones), this only touches predictions that are already off by more than the
 # band, in either direction, so it helps over- and under-prediction equally.
 PH_ALARM_BAND_PCT = 0.5
+
+# Respaldo de la onda de 4h (app/regime_4h.py, 2026-10-02): desde ~2026-09-18
+# las estaciones oscilan con periodo de 16 slots y repetir y[objetivo-16]
+# rinde ~90% contra ~70% de la cadena. Se activa por (estacion, horizonte)
+# solo mientras la onda se verifica en los datos mas recientes y se apaga sola
+# ante cualquier otro patron (vuelve al XGBoost estandar). Apagar la bandera
+# deja todo exactamente como antes.
+USE_4H_WAVE = True
 
 
 def api_get(path: str) -> dict:
@@ -227,6 +236,9 @@ def submit_current_cycle() -> dict | None:
     # the exact points needed cuts that to at most len(station_ids)*len(LAGS)
     # rows per table.
     needed_timestamps = [cutoff - timedelta(minutes=15 * (lag - 1)) for lag in LAGS]
+    if USE_4H_WAVE:
+        # 32 slots mas por estacion: lo que necesita wave_module para decidir.
+        needed_timestamps = sorted(set(needed_timestamps) | set(wave_module.history_timestamps(cutoff)))
     with connection() as conn:
         # "Temp" holds every observation collected since the last drift
         # retrain for a station (see drift.py); only drifted stations ever
@@ -273,6 +285,28 @@ def submit_current_cycle() -> dict | None:
     if not predictions:
         raise RuntimeError("Ninguna estación tenía suficiente historia para este ciclo; no se envía submission.")
 
+    # Onda de 4h: reemplaza el valor de la cadena SOLO donde la onda se
+    # verifica ahora mismo (wave_module.wave_forecast devuelve None en cualquier
+    # otro caso). Cualquier error aqui se degrada al XGBoost estandar: esta capa
+    # nunca debe impedir una submission.
+    wave_overridden: set[tuple[str, str]] = set()
+    if USE_4H_WAVE:
+        try:
+            for prediction in predictions:
+                target_ts = _parse_utc(prediction["target_at"])
+                horizon = round((target_ts - cutoff).total_seconds() / 900)
+                value = wave_module.wave_forecast(history, prediction["station_id"], cutoff, horizon)
+                if value is not None:
+                    prediction["value"] = round(value, 3)
+                    wave_overridden.add((prediction["station_id"], prediction["target_at"]))
+            print(
+                f"Onda 4h: {len(wave_overridden)}/{len(predictions)} predicciones reemplazadas "
+                f"({len({station for station, _ in wave_overridden})} estaciones); el resto usa el XGBoost estandar.",
+                flush=True,
+            )
+        except Exception as exc:
+            print(f"AVISO: capa de onda 4h fallo ({exc!r}); se usa el XGBoost estandar.", flush=True)
+
     # Bias correction on top of the raw model output - see
     # station_bias_components's docstring. One DB read per station per
     # submission (not per target, not per horizon), and never touches what
@@ -286,6 +320,10 @@ def submit_current_cycle() -> dict | None:
     bias_components_by_station = {}
     for prediction in predictions:
         station_id = prediction["station_id"]
+        if (station_id, prediction["target_at"]) in wave_overridden:
+            # El EWMA se mide sobre residuos de la cadena: no aplica a un valor
+            # que ya no viene de ella.
+            continue
         if station_id not in bias_components_by_station:
             bias_components_by_station[station_id] = station_bias_components(station_id)
         regular_bias, boosted_bias = bias_components_by_station[station_id]
