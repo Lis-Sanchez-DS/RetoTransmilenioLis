@@ -120,3 +120,62 @@ def test_missing_local_file_forces_redownload(monkeypatch):
     result = download_models.sync_models("https://example.supabase.co", "fake-key")
 
     assert result == [removed_name]
+
+
+class StatusResponse(FakeResponse):
+    def __init__(self, status_code, **kwargs):
+        super().__init__(**kwargs)
+        self.status_code = status_code
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            import requests
+
+            raise requests.exceptions.HTTPError(f"{self.status_code}", response=self)
+
+
+def test_gateway_502_is_retried_and_download_succeeds(monkeypatch):
+    """Un 502 intermitente de Supabase Storage (mato un job el 2026-10-02) se
+    reintenta en vez de propagarse como error de la aplicacion."""
+    monkeypatch.setattr("app.net.time.sleep", lambda s: None)
+    remote_listing = [{"name": name, "updated_at": "v1"} for name in _all_names()]
+    monkeypatch.setattr(
+        download_models.requests, "post", lambda *a, **k: StatusResponse(200, json_data=remote_listing)
+    )
+    calls = {"n": 0}
+
+    def flaky_get(url, headers, timeout):
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            return StatusResponse(502)
+        return StatusResponse(200, content=b"model")
+
+    monkeypatch.setattr(download_models.requests, "get", flaky_get)
+    downloaded = download_models.sync_models("https://example.supabase.co", "key")
+    assert len(downloaded) == len(_all_names())
+    assert calls["n"] == len(_all_names()) + 2  # dos 502 reintentados, luego todo bien
+
+
+def test_persistent_gateway_error_surfaces_as_upstream_unavailable(monkeypatch):
+    from app.net import UpstreamUnavailable
+
+    monkeypatch.setattr("app.net.time.sleep", lambda s: None)
+    monkeypatch.setattr(download_models.requests, "post", lambda *a, **k: StatusResponse(503))
+    with pytest.raises(UpstreamUnavailable):
+        download_models.sync_models("https://example.supabase.co", "key")
+
+
+def test_real_client_errors_are_not_retried(monkeypatch):
+    import requests
+
+    monkeypatch.setattr("app.net.time.sleep", lambda s: None)
+    calls = {"n": 0}
+
+    def post(*a, **k):
+        calls["n"] += 1
+        return StatusResponse(401)
+
+    monkeypatch.setattr(download_models.requests, "post", post)
+    with pytest.raises(requests.exceptions.HTTPError):
+        download_models.sync_models("https://example.supabase.co", "key")
+    assert calls["n"] == 1

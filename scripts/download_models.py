@@ -29,7 +29,13 @@ from pathlib import Path
 
 import requests
 
-from app.net import UpstreamUnavailable, with_retries
+from app.net import UpstreamUnavailable, raise_for_gateway_error, with_retries
+
+# Supabase Storage devuelve 502/503/504 de forma intermitente; un solo 502 en
+# el paso de descarga inicial mato un job entero (2026-10-02). Reintentos mas
+# pacientes que el default (10s, 20s, 40s, 80s, 160s) para estas descargas.
+DOWNLOAD_RETRIES = 6
+DOWNLOAD_BACKOFF_SECONDS = 10
 
 STATIONS = [
     "02300", "03000", "05000", "05100", "06000", "06111",
@@ -64,10 +70,11 @@ def _list_remote(supabase_url: str, headers: dict) -> dict:
             json={"prefix": "xgboost", "limit": 1000},
             timeout=30,
         )
+        raise_for_gateway_error(r)
         r.raise_for_status()
         return r.json()
 
-    items = with_retries(_call)
+    items = with_retries(_call, retries=DOWNLOAD_RETRIES, backoff=DOWNLOAD_BACKOFF_SECONDS)
     return {item["name"]: item.get("updated_at") for item in items}
 
 
@@ -78,10 +85,11 @@ def _download(supabase_url: str, headers: dict, name: str) -> bytes:
             headers=headers,
             timeout=60,
         )
+        raise_for_gateway_error(r)
         r.raise_for_status()
         return r.content
 
-    return with_retries(_call)
+    return with_retries(_call, retries=DOWNLOAD_RETRIES, backoff=DOWNLOAD_BACKOFF_SECONDS)
 
 
 def sync_models(supabase_url: str, service_role_key: str) -> list[str]:
