@@ -33,7 +33,7 @@ def test_averages_previous_periods_to_cancel_noise():
     noise = {slot: rng.gauss(0, 60) for slot in range(-(w4.HISTORY_SLOTS + 8), 5)}
     data = history(lambda slot: wave(16)(slot) + noise[slot])
     horizon = 2
-    expected_periods = [wave(16)(horizon) + noise[horizon - 16 * k] for k in range(1, w4.MAX_PERIODS + 1)]
+    expected_periods = [wave(16)(horizon) + noise[horizon - 16 * k] for k in range(1, w4.MAX_PERIODS_BY_PERIOD[16] + 1)]
     value = w4.wave_forecast(data, "A", CUTOFF, horizon)
     assert abs(value - sum(expected_periods) / len(expected_periods)) < 1e-9
     clean = wave(16)(horizon)
@@ -89,10 +89,20 @@ def test_off_when_the_wave_is_inverted_or_changes_period():
         assert w4.wave_forecast(history(series), "A", CUTOFF, 3) is None
 
 
-def test_missing_data_or_out_of_range_horizon_returns_none():
+def test_a_single_gap_is_tolerated_but_a_missing_latest_slot_or_heavy_gaps_are_not():
     data = history(wave(16))
-    del data[("A", CUTOFF - timedelta(minutes=15 * 5))]
-    assert w4.wave_forecast(data, "A", CUTOFF, 2) is None
+    del data[("A", CUTOFF - timedelta(minutes=15 * 5))]   # un hueco (quality=missing): sigue activa
+    assert w4.wave_forecast(data, "A", CUTOFF, 2) is not None
+    no_latest = history(wave(16))
+    del no_latest[("A", CUTOFF)]
+    assert w4.wave_forecast(no_latest, "A", CUTOFF, 2) is None
+    gappy = history(wave(16))
+    for slot in range(-9, 0, 1):
+        del gappy[("A", CUTOFF + timedelta(minutes=15 * slot))]
+    assert w4.wave_forecast(gappy, "A", CUTOFF, 2) is None
+
+
+def test_missing_data_or_out_of_range_horizon_returns_none():
     assert w4.wave_forecast(history(wave(16)), "A", CUTOFF, 0) is None
     assert w4.wave_forecast(history(wave(16)), "A", CUTOFF, 5) is None
     assert w4.wave_forecast(history(wave(16)), "UNKNOWN", CUTOFF, 1) is None
@@ -120,4 +130,26 @@ def test_fast_exit_when_only_the_last_two_slots_break_the_wave():
     assert w4._accuracy(data, "A", CUTOFF, 16, w4.FAST_WINDOW) >= w4.EXIT_FAST  # la salida de 4 slots aun no dispara
     assert w4._accuracy(data, "A", CUTOFF, 16, w4.FASTEST_WINDOW) < w4.EXIT_FASTEST
     assert not w4.wave_active(data, "A", CUTOFF, 1)
+    assert w4.wave_forecast(data, "A", CUTOFF, 1) is None
+
+
+def test_active_on_an_8h_wave_and_averages_32_slot_periods():
+    # 2026-10-04: la onda paso de 16 a 32 slots; la capa debe seguirla.
+    data = history(wave(32))
+    for horizon in (1, 2, 3, 4):
+        assert w4.active_period(data, "A", CUTOFF, horizon) == 32
+        assert abs(w4.wave_forecast(data, "A", CUTOFF, horizon) - wave(32)(horizon - 32)) < 1e-9
+
+
+def test_16_slot_wave_still_selects_16_not_32():
+    data = history(wave(16))
+    assert w4.active_period(data, "A", CUTOFF, 1) == 16
+
+
+def test_inactive_when_neither_period_repeats():
+    import random
+
+    rng = random.Random(3)
+    data = history(lambda slot: 1000.0 + rng.uniform(-400, 400))
+    assert w4.active_period(data, "A", CUTOFF, 1) is None
     assert w4.wave_forecast(data, "A", CUTOFF, 1) is None
