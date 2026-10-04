@@ -313,13 +313,18 @@ def submit_current_cycle() -> dict | None:
     # instead of something that has to be inferred from timing after the
     # fact - see has_pending_data's docstring for why collector.py's drift
     # check no longer depends on seeing "new" data in its own call.
-    collect_result = collect_new_data()
-    print(
-        f"Collected {collect_result['collected']} observations "
-        f"({collect_result['inserted']} new) in {collect_result['pages']} pages; "
-        f"cursor={collect_result['cursor']}",
-        flush=True,
-    )
+    # A timeout on the observations stream must not block the submission: the
+    # cycle window is short and the history already in the DB is enough to predict.
+    try:
+        collect_result = collect_new_data()
+        print(
+            f"Collected {collect_result['collected']} observations "
+            f"({collect_result['inserted']} new) in {collect_result['pages']} pages; "
+            f"cursor={collect_result['cursor']}",
+            flush=True,
+        )
+    except UpstreamUnavailable as exc:
+        print(f"AVISO: no se pudo leer el stream ({exc}); se envia con la historia ya guardada.", flush=True)
     identity = api_get("/v1/me")
     try:
         cycle = api_get("/v1/forecast-cycles/current")
