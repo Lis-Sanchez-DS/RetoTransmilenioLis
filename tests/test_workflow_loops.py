@@ -99,3 +99,16 @@ def test_a_stale_collector_warning_never_kills_the_submitter(tmp_path):
 def test_loop_blocks_use_a_per_run_timeout():
     for workflow, prefix in (SUBMIT, COLLECT):
         assert re.search(r"timeout \d+ python -m app\.", loop_script(workflow, prefix))
+
+
+def test_submitter_runs_two_replicas_on_separate_runners():
+    text = (ROOT / ".github" / "workflows" / "submissions.yml").read_text()
+    assert "replica: [1, 2]" in text and "fail-fast: false" in text
+    assert "REPLICA: ${{ matrix.replica }}" in text
+    assert 'if [ "$REPLICA" = "2" ]; then sleep 150; fi' in text  # desfase entre replicas
+
+
+def test_pulso_calls_use_a_short_connect_timeout():
+    source = (ROOT / "app" / "submit_xgboost.py").read_text()
+    assert "HTTP_TIMEOUT = (10, 30)" in source
+    assert "timeout=30" not in source  # ninguna llamada a Pulso con el timeout largo de antes

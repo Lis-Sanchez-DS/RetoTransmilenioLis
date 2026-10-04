@@ -56,6 +56,10 @@ PH_ALARM_BAND_PCT = 0.5
 # deja todo exactamente como antes.
 USE_4H_WAVE = True
 
+# (connect, read) en segundos para toda llamada a la API de Pulso: un runner sin ruta
+# al servidor (2026-10-04) debe notarlo en ~10 s por intento, no en 30.
+HTTP_TIMEOUT = (10, 30)
+
 # Capa general (app/regime.py, 2026-10-02): corre DESPUES de la onda de 4h y solo
 # sobre las predicciones que esta no reclamo. Aprende cualquier periodo/signo/
 # amplitud de los datos recientes y mezcla suavemente con el XGBoost; si ningun
@@ -126,7 +130,7 @@ def api_get(path: str) -> dict:
         response = requests.get(
             f"{BASE_URL}{path}",
             headers={"Authorization": f"Bearer {API_KEY}"},
-            timeout=30,
+            timeout=HTTP_TIMEOUT,
         )
         # 429/502/503/504 = the server (or its proxy) is momentarily unavailable
         # -> retried and, if it persists, UpstreamUnavailable (exit 75). A 500 is
@@ -376,7 +380,7 @@ def _latest_values_stream(station_ids: list[str], cutoff: datetime) -> dict[str,
 
     def _get():
         response = requests.get(
-            f"{BASE_URL}/v1/stream/observations", params={"limit": 5000, "cursor": cursor}, timeout=30
+            f"{BASE_URL}/v1/stream/observations", params={"limit": 5000, "cursor": cursor}, timeout=HTTP_TIMEOUT
         )
         raise_for_gateway_error(response)
         response.raise_for_status()
@@ -462,7 +466,7 @@ def _post_submission(payload: dict, idempotency_key: str):
                 "Content-Type": "application/json",
             },
             json=payload,
-            timeout=30,
+            timeout=HTTP_TIMEOUT,
         )
         raise_for_gateway_error(response)
         return response

@@ -50,7 +50,7 @@ def decide(cycle: dict | None, delivered_cycle_id: str | None, now: datetime, gr
     return True, f"ciclo {cycle['cycle_id']} abierto hace {age:.1f} min sin entrega registrada"
 
 
-def _get_json(url: str, headers: dict, attempts: int = 2, timeout: int = 20):
+def _get_json(url: str, headers: dict, attempts: int = 3, timeout: int = 10):
     last = None
     for _ in range(attempts):
         try:

@@ -649,11 +649,14 @@ loop reintentaba para siempre sin contar fallos: el job figuraba *en curso*, nad
 perdieron 2 ciclos (los de las 15:51 y 16:51 UTC; la cobertura de 24h cayó a 83.3%). Los demás
 participantes tenían cobertura 1.0: fue de ese runner, no del servidor.
 
+**Evidencia de que fue el runner y no el servidor:** el job del collector, arrancado en otro runner a la vez (15:54), llegó al servidor sin problema todo ese tiempo, y el submitter del siguiente runner (17:01) entregó sin problema. Un runner sin ruta es, por tanto, un punto único de fallo.
+
 **Capas de defensa** (cada una cubre un modo de fallo distinto):
 
 | Modo de fallo | Defensa |
 |---|---|
-| El runner no llega al servidor (el incidente) | `submit_current_cycle` pide **primero** el ciclo vigente: en una caída lo sabe en una ronda de reintentos (sale con 75) en vez de gastar ~3 min en el stream y `/v1/me`. Tras **3 vueltas seguidas con 75** el job termina en rojo (`::error::`) y el siguiente run en cola (cron `*/5`) arranca en un runner nuevo. |
+| El runner no llega al servidor (el incidente) | `submit_current_cycle` pide **primero** el ciclo vigente: en una caída lo sabe en una ronda de reintentos (sale con 75) en vez de gastar ~3 min en el stream y `/v1/me`. Tras **3 vueltas seguidas con 75** (~4 min, con timeout de conexión de 10 s) el job termina en rojo (`::error::`) y el siguiente run en cola (cron `*/5`) arranca en un runner nuevo. |
+| El submitter está en un runner malo | **Dos réplicas** del submitter en runners distintos (`strategy.matrix.replica: [1, 2]`, la 2 desfasada 150 s): si las dos entregan, la segunda recibe 409 y el ledger evita trabajo repetido. Aviso: la concurrencia es por *run*, así que si una réplica termina por una caída, la otra sigue y el relevo llega al siguiente cambio de run (≤5.75 h); el vigilante cubre mientras tanto. |
 | El submitter principal está caído, atascado o en un runner malo | **Vigilante** `.github/workflows/watchdog.yml` + `scripts/cycle_watch.py` (otro workflow, otro runner, cada 5 min): si hay un ciclo abierto hace más de 5 min y el *ledger* no lo lista, **lo entrega él mismo** y termina en rojo a propósito (Actions envía correo). En operación normal el primer paso (solo biblioteca estándar, ~10 s) dice "no hace falta" y no instala ni descarga nada. |
 | Llamada colgada (red/BD) que deja el job "vivo" sin enviar | `timeout 600 python -m app.submit_xgboost` (el 124 cuenta como fallo; a los 3 el job se detiene) y `connect_timeout=15` en `app/db.py`. |
 | El stack de modelos falla (modelo corrupto, bug en una capa, BD caída) | Red de seguridad por ciclo: cualquier excepción degrada a **persistencia** (último valor real) en vez de perder el ciclo. Una estación rota no tumba a las otras 11. La persistencia sale de la BD y, si la BD no responde, **del propio stream** (cursor sintético de las últimas 3 h; verificado en vivo con BD caída y modelos rotos). |

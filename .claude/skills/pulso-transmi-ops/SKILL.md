@@ -946,7 +946,7 @@ reach the Pulso server (connect timeouts on every call). `app.submit_xgboost` ex
 ("server unavailable - not an app failure") each round and the loop retried forever *without
 counting failures*, so the job stayed `in_progress`, nothing failed, and the 15:51 and 16:51 cycles
 were lost (rolling-24h coverage 0.833, cumulative 98.1% -> 96.1%). Other students had coverage 1.0,
-so it was that runner's network, not the server. Diagnosis trick: an in-progress job's log is
+so it was that runner's network, not the server (proof: the collector job started on another runner at the same time reached the server all along, and the next submitter at 17:01 delivered fine). Diagnosis trick: an in-progress job's log is
 unreadable, so `gh run cancel` it, redispatch immediately, then read the cancelled job's log
 (`gh api repos/{owner}/{repo}/actions/jobs/<job_id>/logs`).
 
@@ -974,6 +974,9 @@ unreadable, so `gh run cancel` it, redispatch immediately, then read the cancell
   group, every 5 min, steps in only if a cycle has been open > 5 min with no ledger entry; it downloads
   models/installs deps ONLY then (a fresh runner downloads all 48 models - doing that every 5 min would
   recreate the 2026-09-26 egress incident). It ends red on purpose when it had to intervene.
+- `submissions.yml` runs **two replicas** (`matrix.replica: [1, 2]`, #2 offset 150 s) on separate runners; all Pulso
+  HTTP calls use `HTTP_TIMEOUT = (10, 30)` so a blackholed runner is noticed in seconds. Concurrency is per RUN: if one
+  replica exits after an outage the other keeps going and the next run only starts when the whole run ends.
 - `app/db.py` uses `connect_timeout=15`. Tests that run the workflows' bash loop blocks against a fake
   `python`: `tests/test_workflow_loops.py` - keep them in sync if the loop logic changes.
 - The local Postgres password for the new Supabase project is rejected from this machine; REST

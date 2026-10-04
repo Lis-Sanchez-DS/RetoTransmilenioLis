@@ -12,6 +12,15 @@ concurrency:
 jobs:
   submit:
     runs-on: ubuntu-latest
+    # DOS replicas en runners distintos (2026-10-04): un runner sin ruta al servidor
+    # de Pulso dejo el unico submitter 67 min sin entregar y se perdieron 2 ciclos
+    # mientras otro runner arrancado a la vez funcionaba bien. La segunda replica solo
+    # cuesta CPU de Actions (repo publico) y es inocua: si las dos entregan, la
+    # segunda recibe 409 (ya entregado) y el ledger evita trabajo repetido.
+    strategy:
+      fail-fast: false
+      matrix:
+        replica: [1, 2]
     # GitHub's cron has no SLA and can be delayed well past its 5-minute
     # interval under load, so this job polls internally for ~5.75h instead
     # of relying on the next scheduled tick. The concurrency group above
@@ -24,6 +33,7 @@ jobs:
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
       PULSO_API_URL: https://pulso-transmi.72-60-245-2.sslip.io
+      REPLICA: ${{ matrix.replica }}
     steps:
       - name: Descargar código
         uses: actions/checkout@v4
@@ -57,6 +67,8 @@ jobs:
           end=$(( $(date +%s) + 345 * 60 ))
           fails=0
           outage=0
+          # La replica 2 se desfasa 150 s: entre las dos se consulta cada ~2.5 min.
+          if [ "$REPLICA" = "2" ]; then sleep 150; fi
           while [ "$(date +%s)" -lt "$end" ]; do
             # Re-descargar antes de cada vuelta: si collector.yml reentrenó y
             # republicó un modelo por drift a mitad de este job (que vive
@@ -73,15 +85,15 @@ jobs:
               # El servidor de Pulso no responde DESDE ESTE RUNNER. Antes se
               # reintentaba para siempre sin contar fallos: el 2026-10-04 un runner
               # sin ruta al servidor estuvo 67 min en este bucle y se perdieron 2
-              # ciclos. Tras 3 vueltas seguidas el job se detiene (visible en
+              # ciclos. Tras 3 vueltas seguidas (~4 min) el job se detiene (visible en
               # Actions) y el siguiente run en cola arranca en un runner nuevo.
               outage=$((outage + 1))
               echo "::warning::Servidor PulsoTransmi no responde desde este runner (vuelta $outage consecutiva)."
               if [ $outage -ge 3 ]; then
-                echo "::error::Sin respuesta del servidor tras $outage vueltas (~9 min): se detiene el job para que un runner nuevo tome el relevo."
+                echo "::error::Sin respuesta del servidor tras $outage vueltas (~4 min): se detiene el job para que un runner nuevo tome el relevo."
                 exit 1
               fi
-              sleep 60
+              sleep 30
               continue
             fi
             outage=0
