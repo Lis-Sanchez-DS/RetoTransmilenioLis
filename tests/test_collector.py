@@ -1,7 +1,8 @@
+import pytest
 import urllib.error
 from datetime import datetime, timedelta, timezone
 
-from app.collector import LAGS, _synthetic_cursor, collect_new_data, predict_records
+from app.collector import LAGS, _synthetic_cursor, collect_new_data, normalize_record, predict_records
 
 
 def test_collector_collects_all_pages_and_returns_cursor(monkeypatch):
@@ -258,3 +259,28 @@ def test_predict_records_only_queries_needed_lag_timestamps(monkeypatch):
         station_ids, timestamps = params
         assert station_ids == [station]
         assert sorted(timestamps) == expected_timestamps
+
+
+def test_normalize_record_flattens_schema_v2_measurement():
+    v2 = {
+        "station_id": "02300",
+        "observed_at": "2026-09-20T12:15:00Z",
+        "released_at": "2026-10-03T23:19:15.124962Z",
+        "schema_version": 2,
+        "measurement": {"value": "546.00", "unit": "passengers", "quality": "observed"},
+    }
+    assert normalize_record(v2)["demand"] == 546.0
+    v1 = {"station_id": "02300", "observed_at": "2026-09-20T12:00:00Z", "demand": 556}
+    assert normalize_record(v1) is v1
+
+
+def test_normalize_record_skips_unrecognised_measurement(capsys):
+    record = {
+        "station_id": "02300",
+        "observed_at": "2026-09-20T12:15:00Z",
+        "measurement": {"value": "546.00", "unit": "passengers", "quality": "estimated"},
+    }
+    assert normalize_record(record) is None
+    assert "AVISO" in capsys.readouterr().out
+    with pytest.raises(ValueError):
+        normalize_record({"station_id": "02300", "observed_at": "2026-09-20T12:15:00Z"})
