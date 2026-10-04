@@ -284,3 +284,41 @@ def test_normalize_record_skips_unrecognised_measurement(capsys):
     assert "AVISO" in capsys.readouterr().out
     with pytest.raises(ValueError):
         normalize_record({"station_id": "02300", "observed_at": "2026-09-20T12:15:00Z"})
+
+
+def test_normalize_record_skips_missing_observation(capsys):
+    """Contract fase-final: quality "missing" carries value null; a gap is not zero."""
+    record = {
+        "station_id": "09000",
+        "observed_at": "2026-09-20T14:30:00Z",
+        "schema_version": 2,
+        "measurement": {"value": None, "unit": "passengers", "quality": "missing"},
+    }
+    assert normalize_record(record) is None
+    assert "faltante" in capsys.readouterr().out
+
+
+def test_predict_records_stores_none_when_a_lag_is_a_gap(monkeypatch):
+    """A lag that falls on a missing observation must not fail the batch."""
+    cutoff = datetime(2026, 9, 20, 14, 30, tzinfo=timezone.utc)
+
+    class FakeConnection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def execute(self, query, params=None):
+            return self
+
+        def fetchall(self):
+            return []
+
+    monkeypatch.setattr("app.collector.connection", lambda: FakeConnection())
+    monkeypatch.setattr("app.collector.context_module.USE_CONTEXT_FEATURES", False)
+    record = {"station_id": "09000", "observed_at": (cutoff + timedelta(minutes=15)).isoformat(), "demand": 100.0}
+
+    result = predict_records([record])
+
+    assert result == [(record, None)]

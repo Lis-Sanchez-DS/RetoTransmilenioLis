@@ -41,16 +41,25 @@ def normalize_record(item: dict) -> dict | None:
     The stream moved to schema_version 2 on 2026-10-03 (~23:19 UTC): `demand`
     became `measurement: {value: "546.00", unit, quality}`. Checked against
     the live stream, only the encoding changed - same cadence, stations and
-    contiguous values. Anything we don't recognise (another unit, a quality
-    other than "observed") is skipped with a warning instead of being fed
-    into the lag history as if it were a real observation.
+    contiguous values. Later the stream also started releasing genuine gaps
+    as `{value: null, quality: "missing"}`; those are skipped (a "Temp" row
+    needs a real demand) and the lag lookups in predict_records tolerate the
+    hole. Anything else we don't recognise (another unit or quality) is
+    skipped with a warning instead of being fed into the lag history as if it
+    were a real observation.
     """
     if "demand" in item:
         return item
     measurement = item.get("measurement")
     if not isinstance(measurement, dict) or "value" not in measurement:
         raise ValueError(f"Registro sin demand ni measurement: {item}")
-    if measurement.get("unit") != "passengers" or measurement.get("quality") != "observed":
+    if measurement.get("quality") == "missing" and measurement.get("value") is None:
+        print(
+            f"AVISO: observacion faltante en el stream: {item['station_id']} {item['observed_at']}",
+            flush=True,
+        )
+        return None
+    if measurement.get("unit") != "passengers" or measurement.get("quality") != "observed" or measurement["value"] is None:
         print(f"AVISO: se omite registro con measurement no reconocido: {item}", flush=True)
         return None
     return {**item, "demand": float(measurement["value"])}
@@ -118,8 +127,21 @@ def predict_records(records: list[dict]) -> list[tuple[dict, float]]:
         for lag in LAGS:
             key = (item["station_id"], ts - timedelta(minutes=15 * lag))
             if key not in history:
-                raise RuntimeError(f"Missing lag {lag} for station {item['station_id']} at {ts.isoformat()}")
+                # A lag lands on a gap the stream reported as missing: store
+                # the observation without a prediction (drift ignores
+                # prediction IS NULL rows) instead of failing the whole batch.
+                print(
+                    f"AVISO: sin lag {lag} para {item['station_id']} en {ts.isoformat()}; "
+                    "se guarda sin prediccion.",
+                    flush=True,
+                )
+                features = None
+                break
             features.append(history[key])
+        if features is None:
+            predictions.append((item, None))
+            history[(item["station_id"], ts)] = float(item["demand"])
+            continue
         features.extend(temporal_features(ts))
         if context_module.USE_CONTEXT_FEATURES:
             features.extend(context_module.context_features(ts, record_context))
