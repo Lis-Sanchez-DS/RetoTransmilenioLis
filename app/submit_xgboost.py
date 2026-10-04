@@ -135,6 +135,19 @@ def lag_timestamps(cutoff: datetime, max_horizon: int = 4) -> list[datetime]:
     )
 
 
+def _nearest_observation(history: dict, station_id: str, stamp: datetime) -> float | None:
+    """Closest recorded value for the station to `stamp` (a gap from a
+    quality=missing observation); None only if it has no history at all."""
+    best = None
+    for (station, observed), value in history.items():
+        if station != station_id:
+            continue
+        distance = abs((observed - stamp).total_seconds())
+        if best is None or distance < best[0]:
+            best = (distance, value)
+    return None if best is None else best[1]
+
+
 def predict_cycle_targets(
     targets: list[dict],
     history: dict,
@@ -187,11 +200,10 @@ def predict_cycle_targets(
     rollback path - the direct approach's code, not just its artifacts, is
     what would need reviving if this needs to be undone.
 
-    A station missing any of its real lags is skipped entirely (all 4
-    targets), not just one horizon - unlike the old per-horizon model, every
-    target in this station's chain depends on the same real lag_1 (or an
-    ancestor built from it), so a gap in real history blocks the whole chain,
-    not one link of it.
+    A real lag missing from history (a quality=missing observation) is
+    replaced by the station's nearest recorded value instead of skipping the
+    station: the server answers 500 to a submission with fewer than the 48
+    expected targets. Only a station with no history at all is skipped.
 
     alarm_flags maps station_id -> whether that station's Page-Hinkley alarm
     is currently fresh (see _station_has_fresh_page_hinkley_alarm); a station
@@ -221,22 +233,32 @@ def predict_cycle_targets(
         # (lag, horizon) -> the real value k*15min before that horizon's target,
         # for every lag that is already observed at data_cutoff (lag >= horizon).
         real_lag_values = {}
-        missing = []
+        filled = []
         for horizon in range(1, max(targets_by_horizon) + 1):
             for lag in LAGS:
                 if lag >= horizon:
-                    key = (station_id, cutoff + timedelta(minutes=15 * (horizon - lag)))
+                    stamp = cutoff + timedelta(minutes=15 * (horizon - lag))
+                    key = (station_id, stamp)
                     if key in history:
                         real_lag_values[(lag, horizon)] = history[key]
                     else:
-                        missing.append(lag)
-        if missing:
+                        substitute = _nearest_observation(history, station_id, stamp)
+                        if substitute is None:
+                            filled = None
+                            break
+                        real_lag_values[(lag, horizon)] = substitute
+                        filled.append(lag)
+            if filled is None:
+                break
+        if filled is None:
+            print(f"AVISO: se omite {station_id} en este ciclo: no hay ninguna observacion", flush=True)
+            continue
+        if filled:
             print(
-                f"AVISO: se omite {station_id} en este ciclo: "
-                f"no hay suficiente historia en lag {missing[0]}",
+                f"AVISO: {station_id} con huecos en lags {sorted(set(filled))}; "
+                "se sustituyen por la observacion mas cercana para no dejar el ciclo incompleto.",
                 flush=True,
             )
-            continue
 
         is_alarm = bool(alarm_flags.get(station_id))
         anchor = real_lag_values[(1, 1)]  # the last real observation, at data_cutoff

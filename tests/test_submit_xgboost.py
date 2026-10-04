@@ -86,13 +86,9 @@ def test_predict_cycle_targets_keeps_stations_independent():
     assert b_values == [501.0, 502.0, 503.0, 504.0]
 
 
-def test_predict_cycle_targets_skips_station_with_missing_history():
-    """A station missing any real lag is skipped ENTIRELY (all its targets),
-    not just one horizon - unlike the old direct per-horizon design, every
-    horizon here ultimately depends on the same real lags, so a gap blocks
-    the whole recursive chain, not one link of it. One station's incomplete
-    history still must not zero out another station's otherwise-valid targets.
-    """
+def test_predict_cycle_targets_skips_station_without_any_history():
+    """A station with no history at all is skipped, and that must not zero out
+    another station's otherwise-valid targets."""
     incomplete_station = "A"
     healthy_station = "B"
     cutoff = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
@@ -110,6 +106,22 @@ def test_predict_cycle_targets_skips_station_with_missing_history():
 
     assert {p["station_id"] for p in predictions} == {healthy_station}
     assert len([p for p in predictions if p["station_id"] == healthy_station]) == 2
+
+
+def test_predict_cycle_targets_fills_gap_so_all_targets_are_sent():
+    """A quality=missing hole in one lag must not drop the station: the server
+    500s on fewer than the 48 expected targets."""
+    cutoff = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+    targets = [
+        {"station_id": "A", "target_at": (cutoff + timedelta(minutes=m)).isoformat()}
+        for m in (15, 30, 45, 60)
+    ]
+    history = _full_history("A", cutoff, lambda offset: 100.0 + offset)
+    del history[("A", cutoff - timedelta(minutes=15))]
+
+    predictions = predict_cycle_targets(targets, history, {"A": RecordingModel()}, cutoff)
+
+    assert len(predictions) == 4
 
 
 class ConstantModel:
