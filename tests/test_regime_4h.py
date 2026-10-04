@@ -109,3 +109,15 @@ def test_history_timestamps_is_a_small_fixed_window():
     stamps = w4.history_timestamps(CUTOFF)
     assert len(stamps) == w4.HISTORY_SLOTS == 119
     assert stamps[0] == CUTOFF and stamps[-1] == CUTOFF - timedelta(minutes=15 * 118)
+
+
+def test_fast_exit_when_only_the_last_two_slots_break_the_wave():
+    # onda limpia de 4h, pero los ultimos 2 slots se desvian de golpe (fin abrupto)
+    broken = lambda slot: wave(16)(slot) + (625.0 if slot >= -1 else 0.0)
+    data = history(broken)
+    assert w4._accuracy(data, "A", CUTOFF, 16, w4.LONG_WINDOW) >= w4.ENTER
+    assert w4._accuracy(data, "A", CUTOFF, 16, w4.SHORT_WINDOW) >= w4.ENTER_RECENT
+    assert w4._accuracy(data, "A", CUTOFF, 16, w4.FAST_WINDOW) >= w4.EXIT_FAST  # la salida de 4 slots aun no dispara
+    assert w4._accuracy(data, "A", CUTOFF, 16, w4.FASTEST_WINDOW) < w4.EXIT_FASTEST
+    assert not w4.wave_active(data, "A", CUTOFF, 1)
+    assert w4.wave_forecast(data, "A", CUTOFF, 1) is None

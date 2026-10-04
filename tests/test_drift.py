@@ -800,3 +800,23 @@ def test_trained_ratio_model_extrapolates_beyond_its_training_range(monkeypatch,
     surge_row = [last, last, last, last] + temporal_features(observed_at[-1] + pd.Timedelta(minutes=15))
     prediction = float(model.predict([surge_row])[0])
     assert prediction > 400  # a level model trained on <=200 could never say this
+
+
+def test_station_recent_pairs_is_bounded_chronological_and_filters_by_cutoff(monkeypatch):
+    captured = {}
+
+    class Conn(FakeConnection):
+        def execute(self, query, params=None):
+            captured["query"], captured["params"] = query, params
+            return super().execute(query, params)
+
+    newest_first = [("t3", 3, 3.0), ("t2", 2, 2.0), ("t1", 1, 1.0)]
+    monkeypatch.setattr("app.drift.connection", lambda: Conn(list(newest_first)))
+    cutoff = object()
+    from app import drift
+
+    rows = drift.station_recent_pairs("A", cutoff, 8)
+    assert rows == [("t1", 1, 1.0), ("t2", 2, 2.0), ("t3", 3, 3.0)]
+    assert captured["params"] == ("A", cutoff, "A", cutoff, 8)
+    assert "LIMIT %s" in captured["query"] and "prediction IS NOT NULL" in captured["query"]
+    assert 'FROM "Original Data"' in captured["query"] and 'FROM "Temp"' in captured["query"]

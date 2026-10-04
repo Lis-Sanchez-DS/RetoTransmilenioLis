@@ -12,7 +12,10 @@ se rompe:
     - ... y en los ultimos 8 slots >= ENTER_RECENT (0.75)
     - ... y supera por MARGIN (0.10) a la persistencia al mismo horizonte.
   SALE (cualquiera, se evalua en cada ciclo, sin estado):
-    - los ultimos 4 slots caen bajo EXIT_FAST (0.60): corte brusco de la onda
+    - los ultimos 2 slots caen bajo EXIT_FASTEST (0.60) (2026-10-04: la onda
+      termino en ~2026-09-20 12:00 y la ventana de 4 slots tardaba en soltarla;
+      el replay del stack completo dio +0.63pp tras el corte y 0.00 antes)
+    - o los ultimos 4 slots caen bajo EXIT_FAST (0.60): corte brusco de la onda
     - o dejan de cumplirse las condiciones de entrada.
   Si falta cualquier dato, o el periodo cambia/se invierte/aparece ruido
   distinto, la precision de lag-16 cae y el resultado es exactamente el del
@@ -29,9 +32,11 @@ SLOT_MINUTES = 15
 LONG_WINDOW = 16
 SHORT_WINDOW = 8
 FAST_WINDOW = 4
+FASTEST_WINDOW = 2
 ENTER = 0.80
 ENTER_RECENT = 0.75
 EXIT_FAST = 0.60
+EXIT_FASTEST = 0.60   # salida rapida: los ultimos 2 slots ya no repiten el periodo anterior
 MARGIN = 0.10
 MAX_HORIZON = 4
 MAX_PERIODS = 6          # periodos previos que se promedian como maximo
@@ -62,11 +67,13 @@ def wave_active(history: dict, station_id: str, cutoff: datetime, horizon: int) 
     long_acc = _accuracy(history, station_id, cutoff, PERIOD_SLOTS, LONG_WINDOW)
     short_acc = _accuracy(history, station_id, cutoff, PERIOD_SLOTS, SHORT_WINDOW)
     fast_acc = _accuracy(history, station_id, cutoff, PERIOD_SLOTS, FAST_WINDOW)
+    fastest_acc = _accuracy(history, station_id, cutoff, PERIOD_SLOTS, FASTEST_WINDOW)
     persistence = _accuracy(history, station_id, cutoff, horizon, LONG_WINDOW)
-    if None in (long_acc, short_acc, fast_acc, persistence):
+    if None in (long_acc, short_acc, fast_acc, fastest_acc, persistence):
         return False
     return (
-        fast_acc >= EXIT_FAST
+        fastest_acc >= EXIT_FASTEST
+        and fast_acc >= EXIT_FAST
         and long_acc >= ENTER
         and short_acc >= ENTER_RECENT
         and long_acc >= persistence + MARGIN

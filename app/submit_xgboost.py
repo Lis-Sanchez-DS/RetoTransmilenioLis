@@ -10,6 +10,7 @@ import requests
 from app import context as context_module
 from app import regime as regime_module
 from app import regime_4h as wave_module
+from app import trend_gate
 from app.collector import collect_new_data
 from app.db import connection
 from app.drift import (
@@ -17,6 +18,7 @@ from app.drift import (
     _station_has_fresh_page_hinkley_alarm,
     blend_horizon_bias,
     station_bias_components,
+    station_recent_pairs,
 )
 from app.features import temporal_features
 from app.health import check_collector_heartbeat
@@ -63,6 +65,12 @@ USE_4H_WAVE = True
 # hay es el de 4h, que ya cubre el respaldo; su valor es solo de seguro ante otros
 # patrones y se apoya en pruebas sinteticas. Encenderla es decision del usuario.
 USE_GENERIC_REGIME = False
+
+# Compuerta de tendencia (app/trend_gate.py, 2026-10-04): tras terminar la onda
+# de 4h la cadena pierde contra la persistencia; donde no manda la onda y la
+# persistencia viene ganando, se mezcla 50/50 con una tendencia amortiguada.
+# Apagarla deja todo exactamente como antes.
+USE_TREND_GATE = True
 
 # Marcador (por job: vive junto a los modelos, que checkout limpia al reiniciar)
 # del ultimo ciclo ya enviado. El loop despierta cada 5 min pero un ciclo se
@@ -470,6 +478,35 @@ def submit_current_cycle() -> dict | None:
         # la mezcla (peso 1.0 si la capa general no toco esta prediccion).
         bias *= chain_weight.get((station_id, prediction["target_at"]), 1.0)
         prediction["value"] = round(max(0.0, prediction["value"] + bias), 3)
+
+    # Compuerta de tendencia: despues del EWMA y solo donde no mando la onda.
+    # Cualquier error se degrada al valor ya calculado y nunca bloquea el envio.
+    if USE_TREND_GATE:
+        try:
+            margins: dict[str, float | None] = {}
+            blended = 0
+            for prediction in predictions:
+                station_id = prediction["station_id"]
+                if (station_id, prediction["target_at"]) in wave_overridden:
+                    continue
+                if station_id not in margins:
+                    pairs = [
+                        (_parse_utc(observed_at), demand, predicted)
+                        for observed_at, demand, predicted in station_recent_pairs(
+                            station_id, cutoff, trend_gate.GATE_WINDOW
+                        )
+                    ]
+                    margins[station_id] = trend_gate.gate_margin(history, station_id, pairs)
+                horizon = round((_parse_utc(prediction["target_at"]) - cutoff).total_seconds() / 900)
+                value = trend_gate.blended_value(
+                    history, station_id, cutoff, horizon, prediction["value"], margins[station_id]
+                )
+                if value != prediction["value"]:
+                    prediction["value"] = round(value, 3)
+                    blended += 1
+            print(f"Compuerta de tendencia: {blended}/{len(predictions)} predicciones mezcladas.", flush=True)
+        except Exception as exc:
+            print(f"AVISO: compuerta de tendencia fallo ({exc!r}); se usan los valores sin mezclar.", flush=True)
 
     run_id = f"run-{cycle['cycle_id']}"
     model_info = {

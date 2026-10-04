@@ -515,6 +515,27 @@ def _station_has_fresh_page_hinkley_alarm(station_id: str) -> bool:
     return _page_hinkley_recently_alarmed(rows)
 
 
+def station_recent_pairs(station_id: str, cutoff, limit: int) -> list[tuple]:
+    """The station's last `limit` (observed_at, demand, prediction) rows with a
+    stored prediction at or before `cutoff`, chronological. One bounded read
+    (never a table scan); used by app/trend_gate.py."""
+    with connection() as conn:
+        rows = conn.execute(
+            """SELECT observed_at, demand, prediction FROM (
+                   SELECT observed_at, demand, prediction FROM "Original Data"
+                   WHERE station_id = %s AND prediction IS NOT NULL AND observed_at <= %s
+                   UNION ALL
+                   SELECT observed_at, demand, prediction FROM "Temp"
+                   WHERE station_id = %s AND prediction IS NOT NULL AND observed_at <= %s
+               ) recent
+               ORDER BY observed_at DESC
+               LIMIT %s""",
+            (station_id, cutoff, station_id, cutoff, limit),
+        ).fetchall()
+    rows.reverse()
+    return rows
+
+
 def _accuracy_score(abs_err: float, abs_dem: float) -> float:
     return max(0.0, 1 - abs_err / max(abs_dem, 1.0))
 

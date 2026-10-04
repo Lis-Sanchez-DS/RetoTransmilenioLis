@@ -13,6 +13,8 @@ def _isolated_marker(tmp_path, monkeypatch):
     # La capa general viene apagada por defecto; las pruebas la ejercitan encendida
     # (las que prueban otra cosa la apagan explicitamente despues).
     monkeypatch.setattr("app.submit_xgboost.USE_GENERIC_REGIME", True)
+    # La compuerta de tendencia lee la DB: por defecto sin pares guardados (inactiva).
+    monkeypatch.setattr("app.submit_xgboost.station_recent_pairs", lambda station_id, cutoff, limit: [])
 
 
 class RecordingModel:
@@ -802,3 +804,73 @@ def test_second_loop_iteration_for_the_same_cycle_does_no_heavy_work(monkeypatch
     monkeypatch.setattr("app.submit_xgboost._fetch_generic_history", lambda *a, **k: calls.__setitem__("history", calls["history"] + 1) or {})
     payload, bias_calls = _run_submit_with_history(monkeypatch, "A", cutoff, series)  # segunda vuelta, mismo ciclo
     assert payload == {} and bias_calls == [] and calls["history"] == 0
+
+
+def _pairs_off_by(cutoff, demand, prediction, n=8):
+    return [(cutoff - timedelta(minutes=15 * k), demand, prediction) for k in range(n - 1, -1, -1)]
+
+
+def test_trend_gate_blends_with_trend_when_persistence_beats_the_chain(monkeypatch):
+    monkeypatch.setattr("app.submit_xgboost.USE_GENERIC_REGIME", False)
+    cutoff = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+    seen = []
+
+    def pairs(station_id, at, limit):
+        seen.append((station_id, at, limit))
+        return _pairs_off_by(cutoff, 500.0, 100.0)  # la cadena viene fallando por mucho
+
+    monkeypatch.setattr("app.submit_xgboost.station_recent_pairs", pairs)
+    payload, _ = _run_submit_with_history(monkeypatch, "A", cutoff, lambda slot: 500.0)
+    # cadena 100 + EWMA -10 = 90; tendencia con serie plana = 500 -> 0.5*500 + 0.5*90
+    assert [p["value"] for p in payload["predictions"]] == [295.0, 295.0, 295.0, 295.0]
+    assert seen == [("A", cutoff, 8)]  # una sola lectura por estacion
+
+
+def test_trend_gate_leaves_values_alone_when_the_chain_is_fine(monkeypatch):
+    monkeypatch.setattr("app.submit_xgboost.USE_GENERIC_REGIME", False)
+    cutoff = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(
+        "app.submit_xgboost.station_recent_pairs", lambda station_id, at, limit: _pairs_off_by(cutoff, 500.0, 500.0)
+    )
+    payload, _ = _run_submit_with_history(monkeypatch, "A", cutoff, lambda slot: 500.0)
+    assert [p["value"] for p in payload["predictions"]] == [90.0, 90.0, 90.0, 90.0]
+
+
+def test_trend_gate_does_not_touch_predictions_the_4h_wave_claimed(monkeypatch):
+    import math
+
+    cutoff = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+    wave = lambda slot: 1000.0 + 800.0 * math.sin(2 * math.pi * slot / 16)
+    calls = []
+    monkeypatch.setattr(
+        "app.submit_xgboost.station_recent_pairs",
+        lambda station_id, at, limit: calls.append(station_id) or _pairs_off_by(cutoff, 500.0, 100.0),
+    )
+    payload, _ = _run_submit_with_history(monkeypatch, "A", cutoff, wave)
+    by_target = {p["target_at"]: p["value"] for p in payload["predictions"]}
+    for h in (1, 2, 3, 4):
+        assert abs(by_target[(cutoff + timedelta(minutes=15 * h)).isoformat()] - wave(h - 16)) < 0.01
+    assert calls == []
+
+
+def test_trend_gate_error_never_blocks_the_submission(monkeypatch):
+    monkeypatch.setattr("app.submit_xgboost.USE_GENERIC_REGIME", False)
+    cutoff = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("db caida")
+
+    monkeypatch.setattr("app.submit_xgboost.station_recent_pairs", boom)
+    payload, _ = _run_submit_with_history(monkeypatch, "A", cutoff, lambda slot: 500.0)
+    assert [p["value"] for p in payload["predictions"]] == [90.0, 90.0, 90.0, 90.0]
+
+
+def test_trend_gate_flag_off_restores_previous_behavior(monkeypatch):
+    monkeypatch.setattr("app.submit_xgboost.USE_GENERIC_REGIME", False)
+    monkeypatch.setattr("app.submit_xgboost.USE_TREND_GATE", False)
+    cutoff = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(
+        "app.submit_xgboost.station_recent_pairs", lambda station_id, at, limit: _pairs_off_by(cutoff, 500.0, 100.0)
+    )
+    payload, _ = _run_submit_with_history(monkeypatch, "A", cutoff, lambda slot: 500.0)
+    assert [p["value"] for p in payload["predictions"]] == [90.0, 90.0, 90.0, 90.0]
