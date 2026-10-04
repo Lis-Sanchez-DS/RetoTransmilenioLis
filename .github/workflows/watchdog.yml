@@ -1,19 +1,20 @@
 name: Vigilante de ciclos
 
-# Red de seguridad INDEPENDIENTE del submitter principal (submissions.yml). El
-# 2026-10-04 el submitter estuvo 67 min en un runner sin ruta al servidor de Pulso,
-# sin fallar, y se perdieron 2 ciclos. Este workflow corre en OTRO runner cada 5 min:
-# si hay un ciclo abierto hace mas de 5 min que el ledger (collector_state
-# 'last_submission') no lista como entregado, lo entrega el mismo. En operacion
-# normal el primer paso (solo biblioteca estandar, ~10 s) concluye "no hace falta" y
-# no instala nada ni descarga modelos (no repite el incidente de egress).
-# Si tuvo que intervenir TERMINA EN ROJO a proposito: Actions envia correo y asi el
-# fallo del submitter principal no queda invisible.
+# Red de seguridad INDEPENDIENTE del submitter (submissions.yml). El 2026-10-04 el
+# submitter estuvo 67 min en un runner sin ruta al servidor de Pulso, sin fallar, y se
+# perdieron 2 ciclos. Este job vive ~5.75 h en OTRO runner y cada 2 min revisa (solo
+# biblioteca estandar, ~1-10 s) si hay un ciclo abierto hace mas de 5 min que el ledger
+# (collector_state 'last_submission') no lista como entregado; si lo hay, lo entrega el
+# mismo. Es un bucle interno (como los otros workflows) y no depende del cron de
+# GitHub, que no tiene SLA: en el primer dia el cron de este workflow tardo >35 min en
+# disparar. En operacion normal no instala nada ni descarga modelos (no repite el
+# incidente de egress de Supabase). Si tuvo que intervenir, el job TERMINA EN ROJO al
+# final (Actions envia correo) y deja un ::error:: en el momento.
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "*/30 * * * *"
 
 concurrency:
   group: watchdog
@@ -22,7 +23,7 @@ concurrency:
 jobs:
   watch:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 355
     env:
       DATABASE_URL: ${{ secrets.SUPABASE_DATABASE_URL }}
       PULSO_API_KEY: ${{ secrets.PULSO_API_KEY }}
@@ -33,53 +34,49 @@ jobs:
       - name: Descargar código
         uses: actions/checkout@v4
 
-      - name: Revisar si hay un ciclo abierto sin entregar
-        id: check
-        run: python3 scripts/cycle_watch.py
-
       - name: Configurar Python
-        if: steps.check.outputs.needed == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Instalar dependencias
-        if: steps.check.outputs.needed == 'true'
-        run: pip install -r requirements.txt
-
-      - name: Descargar modelos desde Supabase Storage
-        if: steps.check.outputs.needed == 'true'
+      - name: Vigilar ciclos mientras el job siga vivo
         shell: bash
-        run: |
-          for attempt in 1 2 3 4; do
-            if scripts/download_models.sh; then
-              exit 0
-            fi
-            echo "Descarga de modelos fallo (intento $attempt/4); reintentando en 15s"
-            sleep 15
-          done
-          exit 1
-
-      - name: Entregar el ciclo hasta que cierre la ventana
-        if: steps.check.outputs.needed == 'true'
-        shell: bash
-        env:
-          CLOSES_AT: ${{ steps.check.outputs.closes_at }}
         run: |
           set +e
-          deadline=$(date -d "$CLOSES_AT" +%s)
-          while [ "$(date +%s)" -lt $(( deadline - 20 )) ]; do
-            timeout 300 python -m app.submit_xgboost
-            if python3 scripts/cycle_watch.py --until-delivered; then
-              exit 0
+          end=$(( $(date +%s) + 345 * 60 ))
+          prepared=0
+          interventions=0
+          out="${RUNNER_TEMP:-/tmp}/watch.out"
+          while [ "$(date +%s)" -lt "$end" ]; do
+            : > "$out"
+            GITHUB_OUTPUT="$out" python scripts/cycle_watch.py
+            if grep -q '^needed=true' "$out"; then
+              interventions=$((interventions + 1))
+              closes_at=$(grep '^closes_at=' "$out" | cut -d= -f2)
+              cycle_id=$(grep '^cycle_id=' "$out" | cut -d= -f2)
+              echo "::error::El submitter NO entrego el ciclo $cycle_id a tiempo; lo entrega el vigilante. Revisar 'Enviar predicciones'."
+              if [ "$prepared" -eq 0 ]; then
+                # Solo la primera vez que hace falta: dependencias y modelos.
+                pip install -r requirements.txt
+                for attempt in 1 2 3 4; do
+                  if scripts/download_models.sh; then break; fi
+                  echo "Descarga de modelos fallo (intento $attempt/4); reintentando en 15s"
+                  sleep 15
+                done
+                prepared=1
+              fi
+              deadline=$(date -d "$closes_at" +%s)
+              while [ "$(date +%s)" -lt $(( deadline - 20 )) ]; do
+                timeout 300 python -m app.submit_xgboost
+                if python scripts/cycle_watch.py --until-delivered; then
+                  break
+                fi
+                sleep 30
+              done
             fi
-            sleep 30
+            sleep 120
           done
-          echo "::error::El vigilante no logro entregar el ciclo antes de que cerrara."
-          exit 1
-
-      - name: Avisar que el submitter principal fallo
-        if: steps.check.outputs.needed == 'true'
-        run: |
-          echo "::error::El submitter principal NO entrego el ciclo ${{ steps.check.outputs.cycle_id }}; lo entrego el vigilante. Revisar el run de 'Enviar predicciones'."
-          exit 1
+          if [ "$interventions" -gt 0 ]; then
+            echo "::error::El vigilante tuvo que intervenir $interventions vez/veces: el submitter principal fallo."
+            exit 1
+          fi
