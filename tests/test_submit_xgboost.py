@@ -13,6 +13,11 @@ def _isolated_marker(tmp_path, monkeypatch):
     # La capa general viene apagada por defecto; las pruebas la ejercitan encendida
     # (las que prueban otra cosa la apagan explicitamente despues).
     monkeypatch.setattr("app.submit_xgboost.USE_GENERIC_REGIME", True)
+    # Nada de red ni de ledger real en las pruebas: la red de respaldo (stream) no
+    # responde, el ledger no existe y registrar una entrega no hace nada.
+    monkeypatch.setattr("app.submit_xgboost._latest_values_stream", lambda station_ids, cutoff: {})
+    monkeypatch.setattr("app.submit_xgboost.last_submission_cycle", lambda: None)
+    monkeypatch.setattr("app.submit_xgboost.record_submission", lambda *args, **kwargs: None)
     # La compuerta de tendencia lee la DB: por defecto sin pares guardados (inactiva).
     monkeypatch.setattr("app.submit_xgboost.station_recent_pairs", lambda station_id, cutoff, limit: [])
 
@@ -550,7 +555,7 @@ def test_submit_current_cycle_queries_only_needed_lag_timestamps(monkeypatch):
     except RuntimeError:
         pass  # expected: FakeConnection returns no rows, so no station has enough history
 
-    queries = [(q, p) for q, p in captured if "station_id = ANY" in q]
+    queries = [(q, p) for q, p in captured if "observed_at = ANY" in q]
     assert len(queries) == 2  # "Original Data" + "Temp"
     expected_timestamps = set(lag_timestamps(cutoff))
     # La onda de 4h (USE_4H_WAVE) suma una ventana fija de 119 slots (promedio de
@@ -601,12 +606,14 @@ def test_submit_current_cycle_queries_only_lag_timestamps_when_wave_is_off(monke
         submit_current_cycle()
     except RuntimeError:
         pass
-    queries = [(q, p) for q, p in captured if "station_id = ANY" in q]
+    queries = [(q, p) for q, p in captured if "observed_at = ANY" in q]
     for _, params in queries:
         assert sorted(params[1]) == lag_timestamps(cutoff)
 
 
-def _run_submit_with_history(monkeypatch, station, cutoff, series, horizons=(1, 2, 3, 4), bias=(-10.0, -10.0)):
+def _run_submit_with_history(
+    monkeypatch, station, cutoff, series, horizons=(1, 2, 3, 4), bias=(-10.0, -10.0), post_handler=None, model=None
+):
     """Corre submit_current_cycle con una historia sintetica `series` (funcion
     de numero de slot -> demanda; el cutoff es el slot 0) y devuelve
     (payload, veces que se leyo el sesgo EWMA)."""
@@ -664,6 +671,8 @@ def _run_submit_with_history(monkeypatch, station, cutoff, series, horizons=(1, 
             return {"submission_id": "s", "status": "accepted", "predictions_received": len(horizons), "expected_predictions": len(horizons)}
 
     def fake_post(url, headers=None, json=None, timeout=None):
+        if post_handler is not None:
+            return post_handler(url, headers, json)
         if "/submissions" in url:
             captured.update(json)
         return FakeResponse()
@@ -675,7 +684,7 @@ def _run_submit_with_history(monkeypatch, station, cutoff, series, horizons=(1, 
     monkeypatch.setattr("app.submit_xgboost.collect_new_data", lambda: {"collected": 0, "inserted": 0, "pages": 1, "cursor": None})
     monkeypatch.setattr("app.submit_xgboost.api_get", lambda path: cycle if "current" in path else {"display_name": "x"})
     monkeypatch.setattr("app.submit_xgboost.connection", lambda: FakeConnection())
-    monkeypatch.setattr("app.submit_xgboost.joblib.load", lambda path: FakeModel())
+    monkeypatch.setattr("app.submit_xgboost.joblib.load", lambda path: model if model is not None else FakeModel())
     monkeypatch.setattr("app.submit_xgboost.os.path.getmtime", lambda path: 0)
     monkeypatch.setattr("app.submit_xgboost.check_collector_heartbeat", lambda: None)
     monkeypatch.setattr("app.submit_xgboost.requests.post", fake_post)
@@ -874,3 +883,295 @@ def test_trend_gate_flag_off_restores_previous_behavior(monkeypatch):
     )
     payload, _ = _run_submit_with_history(monkeypatch, "A", cutoff, lambda slot: 500.0)
     assert [p["value"] for p in payload["predictions"]] == [90.0, 90.0, 90.0, 90.0]
+
+
+# --- Reliability (2026-10-04 audit): never lose a cycle ---------------------------------
+
+
+class Resp:
+    def __init__(self, status, body=None, text=""):
+        self.status_code = status
+        self._body = body if body is not None else {}
+        self.text = text or str(self._body)
+
+    def json(self):
+        return self._body
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            error = requests.HTTPError(f"{self.status_code}")
+            error.response = self
+            raise error
+
+
+OK_BODY = {"submission_id": "sub_1", "status": "accepted", "predictions_received": 4, "expected_predictions": 4}
+CUT = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+FLAT = lambda slot: 500.0
+
+
+def _posts(responses):
+    """post_handler that replays `responses` in order and records (headers, json)."""
+    seen = []
+
+    def handler(url, headers, payload):
+        seen.append((headers, payload))
+        return responses[min(len(seen) - 1, len(responses) - 1)]
+
+    handler.seen = seen
+    return handler
+
+
+def _persistence_check(payload, expected=500.0):
+    assert [p["value"] for p in payload["predictions"]] == [expected] * 4
+
+
+def test_current_cycle_is_fetched_first_and_an_outage_exits_75_without_other_calls(monkeypatch):
+    from app.net import UpstreamUnavailable
+
+    calls = []
+
+    def api(path):
+        calls.append(path)
+        raise UpstreamUnavailable("servidor caido")
+
+    monkeypatch.setattr("app.submit_xgboost.api_get", api)
+    monkeypatch.setattr("app.submit_xgboost.API_KEY", "k", raising=False)
+    monkeypatch.setattr("app.submit_xgboost.collect_new_data", lambda: calls.append("collect"))
+    with pytest.raises(SystemExit) as exit_info:
+        from app.submit_xgboost import main
+
+        main()
+    assert exit_info.value.code == 75
+    assert calls == ["/v1/forecast-cycles/current"]  # ni stream ni /v1/me antes de saber si hay servidor
+
+
+def test_stack_failure_degrades_to_persistence_instead_of_losing_the_cycle(monkeypatch):
+    class Boom:
+        def predict(self, features):
+            raise RuntimeError("modelo corrupto")
+
+    monkeypatch.setattr("app.submit_xgboost.USE_GENERIC_REGIME", False)
+    monkeypatch.setattr(
+        "app.submit_xgboost._latest_values_db", lambda ids, cutoff: {station: 321.0 for station in ids}
+    )
+    handler = _posts([Resp(201, OK_BODY)])
+    _run_submit_with_history(monkeypatch, "A", CUT, FLAT, post_handler=handler, model=Boom())
+    _persistence_check(handler.seen[0][1], 321.0)  # persistencia (ultimo dato de la BD), no un fallo
+
+
+def test_nan_model_output_is_never_submitted_as_zero(monkeypatch):
+    class NaNModel:
+        def predict(self, features):
+            return [float("nan")] * len(features)
+
+    monkeypatch.setattr("app.submit_xgboost.USE_GENERIC_REGIME", False)
+    monkeypatch.setattr("app.submit_xgboost._latest_values_db", lambda ids, cutoff: {s: 321.0 for s in ids})
+    handler = _posts([Resp(201, OK_BODY)])
+    _run_submit_with_history(monkeypatch, "A", CUT, FLAT, post_handler=handler, model=NaNModel())
+    _persistence_check(handler.seen[0][1], 321.0)
+
+
+def test_one_broken_station_does_not_take_down_the_others():
+    class Good:
+        def predict(self, features):
+            return [100.0]
+
+    class Boom:
+        def predict(self, features):
+            raise ValueError("shape mismatch")
+
+    cutoff = CUT
+    targets = [
+        {"station_id": s, "target_at": (cutoff + timedelta(minutes=15 * h)).isoformat()}
+        for s in ("A", "B")
+        for h in (1, 2, 3, 4)
+    ]
+    history = {**_full_history("A", cutoff, lambda o: 500.0), **_full_history("B", cutoff, lambda o: 500.0)}
+    result = predict_cycle_targets(targets, history, {"A": Good(), "B": Boom()}, cutoff.isoformat())
+    assert {p["station_id"] for p in result} == {"A"} and len(result) == 4
+
+
+def test_complete_predictions_sanitizes_fills_and_drops_extras(monkeypatch):
+    from app.submit_xgboost import _complete_predictions
+
+    monkeypatch.setattr("app.submit_xgboost._latest_values_db", lambda ids, cutoff: {s: 77.0 for s in ids})
+    cycle = {
+        "data_cutoff": CUT.isoformat(),
+        "targets": [{"station_id": "A", "target_at": f"t{i}"} for i in range(1, 6)],
+    }
+    raw = [
+        {"station_id": "A", "target_at": "t1", "value": 10.0},
+        {"station_id": "A", "target_at": "t2", "value": float("nan")},
+        {"station_id": "A", "target_at": "t3", "value": float("inf")},
+        {"station_id": "A", "target_at": "t4", "value": -5.0},
+        {"station_id": "A", "target_at": "extra", "value": 1.0},
+    ]
+    out = _complete_predictions(cycle, raw)
+    assert [p["target_at"] for p in out] == ["t1", "t2", "t3", "t4", "t5"]  # solo y todos los targets
+    assert [p["value"] for p in out] == [10.0, 77.0, 77.0, 0.0, 77.0]
+
+
+def test_complete_predictions_raises_only_when_there_is_no_data_anywhere(monkeypatch):
+    from app.submit_xgboost import _complete_predictions
+
+    monkeypatch.setattr("app.submit_xgboost._latest_values_db", lambda ids, cutoff: {})
+    cycle = {"data_cutoff": CUT.isoformat(), "targets": [{"station_id": "A", "target_at": "t1"}]}
+    with pytest.raises(RuntimeError, match="Sin ningun dato"):
+        _complete_predictions(cycle, [])
+
+
+def test_persistence_falls_back_to_the_stream_when_the_database_is_down(monkeypatch):
+    from app.submit_xgboost import _latest_values
+
+    def db_down(ids, cutoff):
+        raise RuntimeError("supabase 402")
+
+    monkeypatch.setattr("app.submit_xgboost._latest_values_db", db_down)
+    monkeypatch.setattr("app.submit_xgboost._latest_values_stream", lambda ids, cutoff: {s: 9.0 for s in ids})
+    assert _latest_values(["A", "B"], CUT) == {"A": 9.0, "B": 9.0}
+
+
+def test_stream_fallback_builds_a_recent_cursor_and_keeps_the_latest_value_at_or_before_cutoff(monkeypatch):
+    import base64
+    import json as jsonlib
+
+    from app import submit_xgboost as module
+
+    sent = {}
+
+    class StreamResponse:
+        status_code = 200
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            rec = lambda st, at, v: {"station_id": st, "observed_at": at, "measurement": {"value": v, "unit": "passengers", "quality": "observed"}}
+            return {
+                "data": [
+                    rec("A", "2026-01-01T11:30:00Z", "10.00"),
+                    rec("A", "2026-01-01T12:00:00Z", "20.00"),
+                    rec("A", "2026-01-01T12:15:00Z", "99.00"),  # despues del corte: no cuenta
+                    rec("B", "2026-01-01T11:45:00Z", "30.00"),
+                    {"station_id": "A", "observed_at": "2026-01-01T11:45:00Z", "measurement": {"value": None, "quality": "missing"}},
+                ]
+            }
+
+    def fake_get(url, params=None, timeout=None, headers=None):
+        sent.update(params)
+        return StreamResponse()
+
+    monkeypatch.undo()  # esta prueba usa la funcion real (el fixture autouse la reemplaza)
+    monkeypatch.setattr("app.submit_xgboost.requests.get", fake_get)
+    values = module._latest_values_stream(["A", "B"], CUT)
+    assert values == {"A": 20.0, "B": 30.0}
+    cursor = jsonlib.loads(base64.b64decode(sent["cursor"]))
+    assert cursor[2] == "00000" and cursor[1].startswith("2026-01-01T09:00:00")  # corte - 3h
+
+
+def test_409_cycle_closed_is_reported_as_missed_not_as_delivered(monkeypatch, capsys):
+    ledger = []
+    monkeypatch.setattr("app.submit_xgboost.USE_GENERIC_REGIME", False)
+    monkeypatch.setattr("app.submit_xgboost.record_submission", lambda *a, **k: ledger.append(a))
+    handler = _posts([Resp(409, {"detail": {"code": "cycle_closed"}})])
+    _run_submit_with_history(monkeypatch, "A", CUT, FLAT, post_handler=handler)
+    assert "PERDIDO" in capsys.readouterr().out
+    assert ledger == []  # no se marca como entregado
+
+
+def test_409_idempotency_conflict_is_delivered_and_recorded_without_overwriting(monkeypatch, capsys):
+    ledger = []
+    monkeypatch.setattr("app.submit_xgboost.USE_GENERIC_REGIME", False)
+    monkeypatch.setattr("app.submit_xgboost.record_submission", lambda *a, **k: ledger.append((a, k)))
+    handler = _posts([Resp(409, {"detail": {"code": "idempotency_conflict"}})])
+    _run_submit_with_history(monkeypatch, "A", CUT, FLAT, post_handler=handler)
+    assert "ya tenía una submission" in capsys.readouterr().out
+    assert len(ledger) == 1 and ledger[0][0][0] == "cycle-1" and ledger[0][0][2] is False
+
+
+def test_guardrail_rejection_retries_once_with_persistence_and_a_new_key(monkeypatch, capsys):
+    monkeypatch.setattr("app.submit_xgboost.USE_GENERIC_REGIME", False)
+    monkeypatch.setattr("app.submit_xgboost._latest_values_db", lambda ids, cutoff: {s: 500.0 for s in ids})
+    handler = _posts([Resp(422, {"detail": {"code": "invalid_targets"}}, "malo"), Resp(201, OK_BODY)])
+    _run_submit_with_history(monkeypatch, "A", CUT, FLAT, post_handler=handler)
+    assert len(handler.seen) == 2
+    assert handler.seen[0][0]["Idempotency-Key"] == "run-cycle-1"
+    assert handler.seen[1][0]["Idempotency-Key"] == "run-cycle-1-fb"
+    _persistence_check(handler.seen[1][1], 500.0)
+    assert "submission rechazada (422)" in capsys.readouterr().out
+
+
+def test_auth_errors_are_not_masked_by_the_fallback(monkeypatch):
+    monkeypatch.setattr("app.submit_xgboost.USE_GENERIC_REGIME", False)
+    handler = _posts([Resp(401, {"detail": {"code": "invalid_api_key"}})])
+    with pytest.raises(RuntimeError, match="rechazada"):
+        _run_submit_with_history(monkeypatch, "A", CUT, FLAT, post_handler=handler)
+    assert len(handler.seen) == 1
+
+
+def test_gateway_status_on_post_is_transient_then_upstream_unavailable(monkeypatch):
+    from app.net import UpstreamUnavailable
+
+    monkeypatch.setattr("app.net.time.sleep", lambda s: None)
+    monkeypatch.setattr("app.submit_xgboost.USE_GENERIC_REGIME", False)
+    handler = _posts([Resp(503, {}, "bad gateway")])
+    with pytest.raises(UpstreamUnavailable):
+        _run_submit_with_history(monkeypatch, "A", CUT, FLAT, post_handler=handler)
+    assert len(handler.seen) == 3  # 3 intentos, no un fallo "real"
+
+
+def test_successful_submission_is_recorded_in_the_ledger_with_receipt_and_commit(monkeypatch):
+    ledger = []
+    monkeypatch.setenv("GITHUB_SHA", "abcdef1234567890")
+    monkeypatch.setattr("app.submit_xgboost.USE_GENERIC_REGIME", False)
+    monkeypatch.setattr("app.submit_xgboost.record_submission", lambda cycle_id, details, overwrite=True: ledger.append((cycle_id, details, overwrite)))
+    handler = _posts([Resp(201, {**OK_BODY, "attempt": 1})])
+    _run_submit_with_history(monkeypatch, "A", CUT, FLAT, post_handler=handler)
+    cycle_id, details, overwrite = ledger[0]
+    assert cycle_id == "cycle-1" and overwrite is True
+    assert details["submission_id"] == "sub_1" and details["commit"] == "abcdef123456" and details["attempt"] == 1
+
+
+def test_ledger_failure_never_breaks_a_delivered_submission(monkeypatch):
+    def boom(*args, **kwargs):
+        raise RuntimeError("db caida")
+
+    monkeypatch.setattr("app.submit_xgboost.USE_GENERIC_REGIME", False)
+    monkeypatch.setattr("app.submit_xgboost.record_submission", boom)
+    handler = _posts([Resp(201, OK_BODY)])
+    _run_submit_with_history(monkeypatch, "A", CUT, FLAT, post_handler=handler)
+    assert len(handler.seen) == 1
+
+
+def test_cycle_delivered_by_the_watchdog_is_skipped_via_the_ledger(monkeypatch):
+    monkeypatch.setattr("app.submit_xgboost.USE_GENERIC_REGIME", False)
+    monkeypatch.setattr("app.submit_xgboost.last_submission_cycle", lambda: "cycle-1")
+    handler = _posts([Resp(201, OK_BODY)])
+    _run_submit_with_history(monkeypatch, "A", CUT, FLAT, post_handler=handler)
+    assert handler.seen == []
+
+
+def test_collection_failure_of_any_kind_is_swallowed_so_the_submission_still_goes(monkeypatch, capsys):
+    from app import submit_xgboost as module
+
+    def boom():
+        raise RuntimeError("psycopg.OperationalError")
+
+    monkeypatch.setattr("app.submit_xgboost.collect_new_data", boom)
+    module._collect_best_effort()  # no lanza
+    assert "no se pudo recolectar" in capsys.readouterr().out
+
+
+def test_collector_stale_exits_76_as_a_warning_not_a_failure(monkeypatch, capsys):
+    from app.health import CollectorStale
+
+    def stale():
+        raise CollectorStale("collector sin correr hace 120 min")
+
+    monkeypatch.setattr("app.submit_xgboost.submit_current_cycle", stale)
+    from app.submit_xgboost import main
+
+    with pytest.raises(SystemExit) as exit_info:
+        main()
+    assert exit_info.value.code == 76
+    assert "::warning::" in capsys.readouterr().out

@@ -640,6 +640,44 @@ cambia qué timestamps lee `predict_cycle_targets` (`lag_timestamps()` en
 el respaldo reemplaza estos valores, así que el efecto se nota sobre todo fuera
 de la onda y como base del XGBoost cuando esta se apague.
 
+## Continuidad de entregas: cómo se garantiza que no se pierda un ciclo (2026-10-04)
+
+**Incidente.** El 2026-10-04 entre 15:54 y 17:01 UTC el job de `submissions.yml` quedó en un
+runner sin ruta al servidor de Pulso (`ConnectTimeoutError` en cada llamada). El submitter
+terminaba cada vuelta con código 75 ("servidor no disponible, no es un fallo de la app") y el
+loop reintentaba para siempre sin contar fallos: el job figuraba *en curso*, nada falló y se
+perdieron 2 ciclos (los de las 15:51 y 16:51 UTC; la cobertura de 24h cayó a 83.3%). Los demás
+participantes tenían cobertura 1.0: fue de ese runner, no del servidor.
+
+**Capas de defensa** (cada una cubre un modo de fallo distinto):
+
+| Modo de fallo | Defensa |
+|---|---|
+| El runner no llega al servidor (el incidente) | `submit_current_cycle` pide **primero** el ciclo vigente: en una caída lo sabe en una ronda de reintentos (sale con 75) en vez de gastar ~3 min en el stream y `/v1/me`. Tras **3 vueltas seguidas con 75** el job termina en rojo (`::error::`) y el siguiente run en cola (cron `*/5`) arranca en un runner nuevo. |
+| El submitter principal está caído, atascado o en un runner malo | **Vigilante** `.github/workflows/watchdog.yml` + `scripts/cycle_watch.py` (otro workflow, otro runner, cada 5 min): si hay un ciclo abierto hace más de 5 min y el *ledger* no lo lista, **lo entrega él mismo** y termina en rojo a propósito (Actions envía correo). En operación normal el primer paso (solo biblioteca estándar, ~10 s) dice "no hace falta" y no instala ni descarga nada. |
+| Llamada colgada (red/BD) que deja el job "vivo" sin enviar | `timeout 600 python -m app.submit_xgboost` (el 124 cuenta como fallo; a los 3 el job se detiene) y `connect_timeout=15` en `app/db.py`. |
+| El stack de modelos falla (modelo corrupto, bug en una capa, BD caída) | Red de seguridad por ciclo: cualquier excepción degrada a **persistencia** (último valor real) en vez de perder el ciclo. Una estación rota no tumba a las otras 11. La persistencia sale de la BD y, si la BD no responde, **del propio stream** (cursor sintético de las últimas 3 h; verificado en vivo con BD caída y modelos rotos). |
+| Predicciones inválidas (`NaN`, infinito, negativo, faltantes, extras) | `_complete_predictions` deja exactamente los 48 targets, finitos y ≥ 0. (Antes `max(0.0, nan)` daba `0.0`: un NaN se habría enviado como cero.) |
+| Rechazo de guardrails (400/422/500) | Se registra el cuerpo de la respuesta y se reintenta una vez con persistencia y otra `Idempotency-Key` (`run-<ciclo>-fb`); un rechazo previo a insertar no consume uno de los 3 intentos. 401/403 no se enmascaran. |
+| Un 409 que NO significa "entregado" | Se lee `detail.code`: `cycle_closed` / `stale_cycle` = **ciclo perdido** (se registra `PERDIDO`, no se marca como enviado); `idempotency_conflict` / `attempt_limit_reached` = el servidor ya tiene una entrega. |
+| 429/502/503/504 del servidor o su proxy | Transitorios: se reintentan y luego 75. Un 500 sigue siendo un error real. |
+| Colector atrasado | Ya no mata al submitter: sale con 76 (`::warning::`), que el loop no cuenta como fallo. |
+
+**Ledger.** Tras cada entrega, `app.health.record_submission` guarda en `collector_state`
+(`state_key = 'last_submission'`) el `cycle_id`, `submission_id`, estado, intento, hora,
+`model_trained_at` y `commit`. Lo leen el vigilante y el propio submitter (si el vigilante
+ya entregó un ciclo, el loop lo omite). Es el "recibo persistido con modelo y commit" que pide
+la guía del profesor. Cualquier fallo al escribirlo se registra y nunca bloquea una entrega.
+
+**Cómo verificar continuidad.** (1) Cobertura en `GET /v1/leaderboard` (`coverage`, 1.0 = sin
+ciclos perdidos); (2) en Supabase, `select cursor_value from collector_state where state_key =
+'last_submission'` debe listar el ciclo vigente a los pocos minutos de abrirse; (3) el vigilante
+en rojo en Actions significa que el submitter principal no entregó a tiempo.
+
+**Qué NO se puede cubrir.** Un ciclo cuya ventana (25 min) cierra antes de que algún runner
+llegue al servidor se pierde igual; las capas anteriores acortan la ventana de riesgo de horas
+a ~5-10 min. Tampoco hay copia si la BD *y* el stream de Pulso caen a la vez.
+
 ## Reducción de tráfico a Supabase (2026-09-27)
 
 Varias consultas traían muchísimos más datos de los que en realidad usaban,

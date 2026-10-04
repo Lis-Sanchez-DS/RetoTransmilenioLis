@@ -939,6 +939,51 @@ component". Keep: `dashboard/` + `.streamlit/` (documented local dashboard),
 `web/`, `docs/figures/` (README references), `app/load_original.py` (restore
 workflow), `scripts/migrate_supabase.py`, all `database/migrations/*` (applied history).
 
+## Never miss a cycle: reliability layers (added 2026-10-04 after losing 2 cycles) - read before touching submissions
+
+**Incident.** 2026-10-04 15:54-17:01 UTC: the `submissions.yml` job sat on a runner that could not
+reach the Pulso server (connect timeouts on every call). `app.submit_xgboost` exited **75**
+("server unavailable - not an app failure") each round and the loop retried forever *without
+counting failures*, so the job stayed `in_progress`, nothing failed, and the 15:51 and 16:51 cycles
+were lost (rolling-24h coverage 0.833, cumulative 98.1% -> 96.1%). Other students had coverage 1.0,
+so it was that runner's network, not the server. Diagnosis trick: an in-progress job's log is
+unreadable, so `gh run cancel` it, redispatch immediately, then read the cancelled job's log
+(`gh api repos/{owner}/{repo}/actions/jobs/<job_id>/logs`).
+
+**Rules that now hold (do not undo):**
+- **Exit codes**: 75 = server unreachable (loop stops the job after 3 consecutive rounds so a fresh
+  runner takes over; never "retry forever"), 76 = collector heartbeat stale (warning only, not a
+  failure), 124 = `timeout 600` hang (counts as a failure), other non-zero = failure (3 in a row stops the job).
+- `submit_current_cycle` fetches `/v1/forecast-cycles/current` **first**; collection is best-effort
+  (any exception swallowed); `/v1/me` is only for the log line, after the POST.
+- **Safety net**: any exception in `_standard_predictions` (the whole model stack) degrades to
+  persistence; `_complete_predictions` guarantees exactly the cycle's 48 targets, finite and >= 0.
+  `predict_cycle_targets` isolates a broken station (and rejects NaN - `max(0.0, nan)` is `0.0`).
+  Persistence values: DB first, then the Pulso stream with a hand-built cursor (works with no DB).
+- **409 is not always "delivered"**: read `detail.code`. `cycle_closed`/`stale_cycle` = MISSED;
+  `idempotency_conflict`/`attempt_limit_reached` = the server already holds a delivery. A repeat POST with the
+  same `Idempotency-Key` and a different body is a 409 `idempotency_conflict`.
+- 400/422/500 on POST: log the body, retry once with persistence and key `run-<cycle>-fb` (guardrail
+  rejections do not consume the 3 attempts). 401/403 must surface.
+- 429/502/503/504 from the Pulso API are transient (`raise_for_gateway_error`); a plain 500 is a real error.
+- **Ledger**: `collector_state` key `last_submission` (JSON with cycle_id, submission_id, status, attempt,
+  model_trained_at, commit), written by `app.health.record_submission` after every delivery, read by
+  `app.health.last_submission_cycle` (the loop skips a cycle someone else delivered) and by the watchdog.
+  Ledger failures are logged and never block a submission.
+- **Watchdog** (`.github/workflows/watchdog.yml`, `scripts/cycle_watch.py`, stdlib only): own concurrency
+  group, every 5 min, steps in only if a cycle has been open > 5 min with no ledger entry; it downloads
+  models/installs deps ONLY then (a fresh runner downloads all 48 models - doing that every 5 min would
+  recreate the 2026-09-26 egress incident). It ends red on purpose when it had to intervene.
+- `app/db.py` uses `connect_timeout=15`. Tests that run the workflows' bash loop blocks against a fake
+  `python`: `tests/test_workflow_loops.py` - keep them in sync if the loop logic changes.
+- The local Postgres password for the new Supabase project is rejected from this machine; REST
+  (`NEW_SUPABASE_URL` + service key) works, and CI (secrets) works. SQL that only runs in CI (ledger
+  upsert, `_latest_values_db`) is covered by mocked-connection tests and verified live from the first runs.
+
+**Emergency manual submission from a dev machine (DB unreachable)**: build history from the DB over REST plus
+the live stream, stub `connection`/bias/alarm/pairs from that data, call the real `submit_current_cycle`
+with the real API POST. Keep `USE_PERIOD_FIT` off. A 409 on this means the cycle is already delivered.
+
 ## Pulso TransMi API quirks worth remembering
 
 - `GET /v1/forecast-cycles/current` - 404 with `no_open_cycle` is a normal

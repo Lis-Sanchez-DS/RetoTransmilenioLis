@@ -1,0 +1,85 @@
+name: Vigilante de ciclos
+
+# Red de seguridad INDEPENDIENTE del submitter principal (submissions.yml). El
+# 2026-10-04 el submitter estuvo 67 min en un runner sin ruta al servidor de Pulso,
+# sin fallar, y se perdieron 2 ciclos. Este workflow corre en OTRO runner cada 5 min:
+# si hay un ciclo abierto hace mas de 5 min que el ledger (collector_state
+# 'last_submission') no lista como entregado, lo entrega el mismo. En operacion
+# normal el primer paso (solo biblioteca estandar, ~10 s) concluye "no hace falta" y
+# no instala nada ni descarga modelos (no repite el incidente de egress).
+# Si tuvo que intervenir TERMINA EN ROJO a proposito: Actions envia correo y asi el
+# fallo del submitter principal no queda invisible.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/5 * * * *"
+
+concurrency:
+  group: watchdog
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      DATABASE_URL: ${{ secrets.SUPABASE_DATABASE_URL }}
+      PULSO_API_KEY: ${{ secrets.PULSO_API_KEY }}
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      PULSO_API_URL: https://pulso-transmi.72-60-245-2.sslip.io
+    steps:
+      - name: Descargar código
+        uses: actions/checkout@v4
+
+      - name: Revisar si hay un ciclo abierto sin entregar
+        id: check
+        run: python3 scripts/cycle_watch.py
+
+      - name: Configurar Python
+        if: steps.check.outputs.needed == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar dependencias
+        if: steps.check.outputs.needed == 'true'
+        run: pip install -r requirements.txt
+
+      - name: Descargar modelos desde Supabase Storage
+        if: steps.check.outputs.needed == 'true'
+        shell: bash
+        run: |
+          for attempt in 1 2 3 4; do
+            if scripts/download_models.sh; then
+              exit 0
+            fi
+            echo "Descarga de modelos fallo (intento $attempt/4); reintentando en 15s"
+            sleep 15
+          done
+          exit 1
+
+      - name: Entregar el ciclo hasta que cierre la ventana
+        if: steps.check.outputs.needed == 'true'
+        shell: bash
+        env:
+          CLOSES_AT: ${{ steps.check.outputs.closes_at }}
+        run: |
+          set +e
+          deadline=$(date -d "$CLOSES_AT" +%s)
+          while [ "$(date +%s)" -lt $(( deadline - 20 )) ]; do
+            timeout 300 python -m app.submit_xgboost
+            if python3 scripts/cycle_watch.py --until-delivered; then
+              exit 0
+            fi
+            sleep 30
+          done
+          echo "::error::El vigilante no logro entregar el ciclo antes de que cerrara."
+          exit 1
+
+      - name: Avisar que el submitter principal fallo
+        if: steps.check.outputs.needed == 'true'
+        run: |
+          echo "::error::El submitter principal NO entrego el ciclo ${{ steps.check.outputs.cycle_id }}; lo entrego el vigilante. Revisar el run de 'Enviar predicciones'."
+          exit 1

@@ -1,6 +1,7 @@
 """Genera y envía la primera submission usando los XGBoost guardados."""
 
 from datetime import datetime, timedelta, timezone
+import math
 import os
 import sys
 
@@ -11,7 +12,7 @@ from app import context as context_module
 from app import regime as regime_module
 from app import regime_4h as wave_module
 from app import trend_gate
-from app.collector import collect_new_data
+from app.collector import _synthetic_cursor, collect_new_data, normalize_record
 from app.db import connection
 from app.drift import (
     LAGS,
@@ -21,8 +22,8 @@ from app.drift import (
     station_recent_pairs,
 )
 from app.features import temporal_features
-from app.health import check_collector_heartbeat
-from app.net import with_retries, UpstreamUnavailable
+from app.health import CollectorStale, check_collector_heartbeat, last_submission_cycle, record_submission
+from app.net import raise_for_gateway_error, with_retries, UpstreamUnavailable
 
 
 BASE_URL = os.getenv("PULSO_API_URL", "https://pulso-transmi.72-60-245-2.sslip.io").rstrip("/")
@@ -80,6 +81,15 @@ LAST_SUBMITTED_MARKER = os.path.join(MODEL_DIR, ".last_submitted_cycle")
 
 
 def _cycle_already_submitted(cycle_id: str) -> bool:
+    if _marker_says_submitted(cycle_id):
+        return True
+    try:  # another submitter (the watchdog) may have delivered it; the ledger is best-effort
+        return last_submission_cycle() == cycle_id
+    except Exception:
+        return False
+
+
+def _marker_says_submitted(cycle_id: str) -> bool:
     try:
         with open(LAST_SUBMITTED_MARKER) as handle:
             return handle.read().strip() == cycle_id
@@ -118,6 +128,10 @@ def api_get(path: str) -> dict:
             headers={"Authorization": f"Bearer {API_KEY}"},
             timeout=30,
         )
+        # 429/502/503/504 = the server (or its proxy) is momentarily unavailable
+        # -> retried and, if it persists, UpstreamUnavailable (exit 75). A 500 is
+        # still a real application error.
+        raise_for_gateway_error(response)
         response.raise_for_status()
         return response.json()
     return with_retries(_get)
@@ -278,51 +292,49 @@ def predict_cycle_targets(
         # depend on an earlier one's prediction regardless of whether that
         # earlier horizon has its own target in this cycle.
         predicted_by_horizon: dict[int, float] = {}
-        for horizon in range(1, max(targets_by_horizon) + 1):
-            target_ts = cutoff + timedelta(minutes=15 * horizon)
-            feature_values = []
-            for lag in LAGS:
-                if lag >= horizon:
-                    feature_values.append(real_lag_values[(lag, horizon)])
-                else:
-                    feature_values.append(predicted_by_horizon[horizon - lag])
-            features = feature_values + temporal_features(target_ts)
-            if context_module.USE_CONTEXT_FEATURES:
-                features += context_module.context_features(target_ts, context)
-            value = max(0.0, float(model.predict([features])[0]))
-            if is_alarm:
-                value = min(max(value, band_lo), band_hi)
-            predicted_by_horizon[horizon] = value
-            if horizon in targets_by_horizon:
-                predictions.append(
-                    {
-                        "station_id": station_id,
-                        "target_at": targets_by_horizon[horizon]["target_at"],
-                        "value": round(value, 3),
-                    }
-                )
+        station_predictions: list[dict] = []
+        try:
+            for horizon in range(1, max(targets_by_horizon) + 1):
+                target_ts = cutoff + timedelta(minutes=15 * horizon)
+                feature_values = []
+                for lag in LAGS:
+                    if lag >= horizon:
+                        feature_values.append(real_lag_values[(lag, horizon)])
+                    else:
+                        feature_values.append(predicted_by_horizon[horizon - lag])
+                features = feature_values + temporal_features(target_ts)
+                if context_module.USE_CONTEXT_FEATURES:
+                    features += context_module.context_features(target_ts, context)
+                raw = float(model.predict([features])[0])
+                if not math.isfinite(raw):
+                    # max(0.0, nan) is 0.0: a NaN would have been SUBMITTED as a zero.
+                    raise ValueError(f"el modelo devolvio {raw}")
+                value = max(0.0, raw)
+                if is_alarm:
+                    value = min(max(value, band_lo), band_hi)
+                predicted_by_horizon[horizon] = value
+                if horizon in targets_by_horizon:
+                    station_predictions.append(
+                        {
+                            "station_id": station_id,
+                            "target_at": targets_by_horizon[horizon]["target_at"],
+                            "value": round(value, 3),
+                        }
+                    )
+        except Exception as exc:
+            # One broken station (corrupt/mismatched model, NaN) must not take the
+            # other 11 down: it is left out and the safety net in
+            # submit_current_cycle fills it with persistence.
+            print(f"ERROR: la prediccion de {station_id} fallo ({exc!r}); se usara persistencia para esta estacion.", flush=True)
+            continue
+        predictions.extend(station_predictions)
     return predictions
 
 
-def submit_current_cycle() -> dict | None:
-    if not API_KEY:
-        raise RuntimeError("Define PULSO_API_KEY antes de ejecutar el script.")
-    # Pull the freshest data first, exactly like the reference student loop
-    # (collect, then check the cycle). Without this, a station's history can
-    # lag the cycle's data_cutoff by up to a collector cycle whenever
-    # collection and submission run as separate, independently-scheduled jobs.
-    #
-    # This call shares the same "collector_state" cursor with collector.py's
-    # own collect_new_data() call, and this one runs 6x more often (every
-    # ~5min here vs ~30min there) - so it routinely wins the race and drains
-    # each new batch before collector.yml's own check ever sees it, making
-    # collector.yml legitimately log "0 new" even while data keeps flowing.
-    # Logging the count here (never logged before) makes that race visible
-    # instead of something that has to be inferred from timing after the
-    # fact - see has_pending_data's docstring for why collector.py's drift
-    # check no longer depends on seeing "new" data in its own call.
-    # A timeout on the observations stream must not block the submission: the
-    # cycle window is short and the history already in the DB is enough to predict.
+def _collect_best_effort() -> None:
+    """Pull the freshest observations into the DB before predicting. Best effort:
+    ANY failure here (stream timeout, DB hiccup) must not block the submission -
+    the cycle window is short and the history already stored is enough."""
     try:
         collect_result = collect_new_data()
         print(
@@ -331,19 +343,272 @@ def submit_current_cycle() -> dict | None:
             f"cursor={collect_result['cursor']}",
             flush=True,
         )
-    except UpstreamUnavailable as exc:
-        print(f"AVISO: no se pudo leer el stream ({exc}); se envia con la historia ya guardada.", flush=True)
-    identity = api_get("/v1/me")
+    except Exception as exc:
+        print(f"AVISO: no se pudo recolectar el stream ({exc!r}); se envia con la historia ya guardada.", flush=True)
+
+
+def _latest_values_db(station_ids: list[str], cutoff: datetime) -> dict[str, float]:
+    lower = cutoff - timedelta(hours=6)
+    with connection() as conn:
+        rows = conn.execute(
+            'SELECT DISTINCT ON (station_id) station_id, demand FROM ('
+            'SELECT station_id, observed_at, demand FROM "Original Data" '
+            "WHERE station_id = ANY(%s) AND observed_at <= %s AND observed_at > %s "
+            'UNION ALL SELECT station_id, observed_at, demand FROM "Temp" '
+            "WHERE station_id = ANY(%s) AND observed_at <= %s AND observed_at > %s"
+            ") recent ORDER BY station_id, observed_at DESC",
+            (station_ids, cutoff, lower, station_ids, cutoff, lower),
+        ).fetchall()
+    return {station_id: float(demand) for station_id, demand in rows}
+
+
+def _latest_values_stream(station_ids: list[str], cutoff: datetime) -> dict[str, float]:
+    """Last resort with NO database: ask the stream for just the last few hours
+    by sending a hand-built cursor (the same encoding collector.py already relies
+    on) and keep each station's latest observation at or before the cutoff."""
+    cursor = _synthetic_cursor(
+        {
+            "released_at": (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat(),
+            "observed_at": (cutoff - timedelta(hours=3)).isoformat(),
+            "station_id": "00000",
+        }
+    )
+
+    def _get():
+        response = requests.get(
+            f"{BASE_URL}/v1/stream/observations", params={"limit": 5000, "cursor": cursor}, timeout=30
+        )
+        raise_for_gateway_error(response)
+        response.raise_for_status()
+        return response.json()
+
+    payload = with_retries(_get)
+    latest: dict[str, tuple[datetime, float]] = {}
+    for record in payload.get("data", payload.get("observations", [])):
+        record = normalize_record(record)
+        if record is None or record["station_id"] not in station_ids:
+            continue
+        observed = _parse_utc(record["observed_at"])
+        if observed <= cutoff and (record["station_id"] not in latest or observed > latest[record["station_id"]][0]):
+            latest[record["station_id"]] = (observed, float(record["demand"]))
+    return {station_id: value for station_id, (_, value) in latest.items()}
+
+
+def _latest_values(station_ids: list[str], cutoff: datetime) -> dict[str, float]:
+    """Persistence values (last real observation) for the safety net: the DB
+    first, then the stream API directly if the DB can't answer."""
+    values: dict[str, float] = {}
+    for source in (_latest_values_db, _latest_values_stream):
+        missing = [station_id for station_id in station_ids if station_id not in values]
+        if not missing:
+            break
+        try:
+            values.update(source(missing, cutoff))
+        except Exception as exc:
+            print(f"AVISO: {source.__name__} fallo ({exc!r}).", flush=True)
+    return values
+
+
+def _complete_predictions(cycle: dict, predictions: list[dict]) -> list[dict]:
+    """Exactly the cycle's targets, every value finite and >= 0 (the server rejects
+    NaN/inf/negative/missing/extra targets, and a rejected or empty submission is a
+    missed cycle). Anything the stack did not produce - or produced invalid - is
+    replaced by persistence (the last real value for that station)."""
+    cutoff = _parse_utc(cycle["data_cutoff"])
+    valid: dict[tuple[str, str], float] = {}
+    for prediction in predictions:
+        try:
+            value = float(prediction["value"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if math.isfinite(value):
+            valid[(prediction["station_id"], prediction["target_at"])] = max(0.0, value)
+    missing = [t for t in cycle["targets"] if (t["station_id"], t["target_at"]) not in valid]
+    fallback: dict[str, float] = {}
+    if missing:
+        print(f"AVISO: {len(missing)}/{len(cycle['targets'])} targets sin prediccion valida; se usa persistencia.", flush=True)
+        fallback = _latest_values(sorted({t["station_id"] for t in missing}), cutoff)
+    completed = []
+    for target in cycle["targets"]:
+        key = (target["station_id"], target["target_at"])
+        if key in valid:
+            value = valid[key]
+        elif target["station_id"] in fallback:
+            value = max(0.0, fallback[target["station_id"]])
+        else:
+            raise RuntimeError(f"Sin ningun dato para {target['station_id']}: no se puede predecir este ciclo.")
+        completed.append({"station_id": target["station_id"], "target_at": target["target_at"], "value": round(value, 3)})
+    return completed
+
+
+def _persistence_predictions(cycle: dict) -> list[dict]:
+    return _complete_predictions(cycle, [])
+
+
+def _error_code(response) -> str | None:
+    try:
+        return response.json()["detail"]["code"]
+    except Exception:
+        return None
+
+
+def _post_submission(payload: dict, idempotency_key: str):
+    def _post():
+        response = requests.post(
+            f"{BASE_URL}/v1/submissions",
+            headers={
+                "Authorization": f"Bearer {API_KEY}",
+                "Idempotency-Key": idempotency_key,
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=30,
+        )
+        raise_for_gateway_error(response)
+        return response
+
+    return with_retries(_post)
+
+
+def _classify(response) -> str:
+    """ok | already (the server already holds a delivery for this cycle/key) |
+    missed (the window is gone or the cycle changed) | rejected (anything else)."""
+    if response.status_code < 300:
+        return "ok"
+    if response.status_code == 409:
+        # 409 is NOT always "already delivered": cycle_closed / stale_cycle mean
+        # this submission did NOT land. idempotency_conflict / attempt_limit_reached
+        # mean the server already holds one.
+        return "missed" if _error_code(response) in ("cycle_closed", "stale_cycle") else "already"
+    return "rejected"
+
+
+def _ledger(cycle_id: str, details: dict, overwrite: bool = True) -> None:
+    try:
+        record_submission(cycle_id, details, overwrite)
+    except Exception as exc:
+        print(f"AVISO: no se pudo registrar la entrega en el ledger ({exc!r}).", flush=True)
+
+
+def submit_current_cycle() -> dict | None:
+    if not API_KEY:
+        raise RuntimeError("Define PULSO_API_KEY antes de ejecutar el script.")
+    # The current cycle goes FIRST (2026-10-04): when the Pulso server is unreachable
+    # from this runner (it was, for 67 min, and two cycles were lost) we find out
+    # in one retry round and exit 75 instead of burning ~3 min per iteration on the
+    # observations stream and /v1/me first. Collection stays best-effort and runs on
+    # every iteration, as before; the /v1/me display name is only for the log.
     try:
         cycle = api_get("/v1/forecast-cycles/current")
     except requests.HTTPError as exc:
         if exc.response is not None and exc.response.status_code == 404:
+            _collect_best_effort()
             return None
         raise
+    _collect_best_effort()
     if _cycle_already_submitted(cycle["cycle_id"]):
-        print(f"Ciclo {cycle['cycle_id']} ya enviado por este job; se omite.", flush=True)
+        print(f"Ciclo {cycle['cycle_id']} ya enviado; se omite.", flush=True)
         check_collector_heartbeat()
         return None
+    station_ids = sorted({target["station_id"] for target in cycle["targets"]})
+
+    # Safety net: ANY failure in the model stack (bad model file, DB hiccup, a bug in
+    # a layer) degrades to persistence instead of losing the cycle. A late, simple
+    # forecast scores far better than a missing one (a miss counts as zero).
+    try:
+        predictions = _standard_predictions(cycle)
+    except Exception as exc:
+        print(f"ERROR: el stack de prediccion fallo ({exc!r}); se envia persistencia para no perder el ciclo.", flush=True)
+        predictions = []
+    predictions = _complete_predictions(cycle, predictions)
+
+    run_id = f"run-{cycle['cycle_id']}"
+    try:
+        trained_at = datetime.fromtimestamp(
+            os.path.getmtime(os.path.join(MODEL_DIR, f"xgboost_{station_ids[0]}_h1.joblib")), timezone.utc
+        ).isoformat()
+    except OSError:
+        trained_at = datetime.now(timezone.utc).isoformat()
+    model_info = {
+        "version": "v1",
+        "trained_at": trained_at,
+        "training_data_end": cycle["data_cutoff"],
+    }
+
+    def _payload(values: list[dict]) -> dict:
+        return {
+            "schema_version": "1.0",
+            "cycle_id": cycle["cycle_id"],
+            "client_run_id": run_id,
+            "data_cutoff": cycle["data_cutoff"],
+            "model": model_info,
+            "predictions": values,
+        }
+
+    response = _post_submission(_payload(predictions), run_id)
+    outcome = _classify(response)
+    if outcome == "rejected" and response.status_code in (400, 422, 500):
+        # Guardrail rejections happen before anything is stored and do not consume
+        # one of the 3 attempts: say why, then retry once with plain persistence.
+        print(f"ERROR: submission rechazada ({response.status_code}): {response.text[:500]}", flush=True)
+        response = _post_submission(_payload(_persistence_predictions(cycle)), f"{run_id}-fb")
+        outcome = _classify(response)
+    if outcome == "rejected":
+        raise RuntimeError(f"Submission rechazada ({response.status_code}): {response.text[:500]}")
+    if outcome == "missed":
+        print(
+            f"ERROR: ciclo {cycle['cycle_id']} PERDIDO ({response.status_code} {_error_code(response)}): "
+            "la ventana ya cerro o el ciclo cambio antes de que llegara el envio.",
+            flush=True,
+        )
+        return None
+    _mark_cycle_submitted(cycle["cycle_id"])
+    if outcome == "already":
+        # The server already holds a delivery for this cycle (this job's earlier one,
+        # or the watchdog's) - an expected steady-state case, not a failure.
+        print(f"Ciclo {cycle['cycle_id']} ya tenía una submission enviada; se omite.", flush=True)
+        _ledger(cycle["cycle_id"], {"status": "already", "at": datetime.now(timezone.utc).isoformat()}, overwrite=False)
+        check_collector_heartbeat()
+        return None
+    receipt = response.json()
+    try:
+        student = api_get("/v1/me")["display_name"]
+    except Exception:
+        student = "?"
+    result = {
+        "student": student,
+        "submission_id": receipt["submission_id"],
+        "status": receipt["status"],
+        "predictions_received": receipt["predictions_received"],
+        "expected_predictions": receipt["expected_predictions"],
+    }
+    _ledger(
+        cycle["cycle_id"],
+        {
+            "submission_id": receipt["submission_id"],
+            "status": receipt["status"],
+            "attempt": receipt.get("attempt"),
+            "predictions_received": receipt["predictions_received"],
+            "at": datetime.now(timezone.utc).isoformat(),
+            "model_trained_at": trained_at,
+            "commit": os.getenv("GITHUB_SHA", "")[:12],
+        },
+    )
+    print(f"Estudiante: {result['student']}")
+    print(f"Entrega: {result['submission_id']}")
+    print(f"Estado: {result['status']}")
+    print(f"Predicciones: {result['predictions_received']}/{result['expected_predictions']}")
+    # Checked last, after the submission is already out: a stale collector
+    # shouldn't block a submission that otherwise succeeded; main() turns it into
+    # exit code 76 (a loud ::warning:: that the loop does NOT count as a failure).
+    check_collector_heartbeat()
+    return result
+
+
+def _standard_predictions(cycle: dict) -> list[dict]:
+    """The full stack: recursive XGBoost chain + alarm clamp + 4h wave + EWMA +
+    trend gate (+ optional generic layer). Raises on any failure; the caller
+    degrades to persistence."""
     cutoff = _parse_utc(cycle["data_cutoff"])
     station_ids = sorted({target["station_id"] for target in cycle["targets"]})
     # Every target's lag features only ever look up cutoff - 15*(lag-1)
@@ -507,71 +772,7 @@ def submit_current_cycle() -> dict | None:
             print(f"Compuerta de tendencia: {blended}/{len(predictions)} predicciones mezcladas.", flush=True)
         except Exception as exc:
             print(f"AVISO: compuerta de tendencia fallo ({exc!r}); se usan los valores sin mezclar.", flush=True)
-
-    run_id = f"run-{cycle['cycle_id']}"
-    model_info = {
-        "version": "v1",
-        "trained_at": datetime.fromtimestamp(
-            os.path.getmtime(os.path.join(MODEL_DIR, f"xgboost_{station_ids[0]}_h1.joblib")),
-            timezone.utc,
-        ).isoformat(),
-        "training_data_end": cycle["data_cutoff"],
-    }
-    payload = {
-        "schema_version": "1.0",
-        "cycle_id": cycle["cycle_id"],
-        "client_run_id": run_id,
-        "data_cutoff": cycle["data_cutoff"],
-        "model": model_info,
-        "predictions": predictions,
-    }
-
-    def _post():
-        response = requests.post(
-            f"{BASE_URL}/v1/submissions",
-            headers={
-                "Authorization": f"Bearer {API_KEY}",
-                "Idempotency-Key": run_id,
-                "Content-Type": "application/json",
-            },
-            json=payload,
-            timeout=30,
-        )
-        response.raise_for_status()
-        return response.json()
-
-    try:
-        receipt = with_retries(_post)
-    except requests.HTTPError as exc:
-        # The forecast cycle window (currently longer than our 5-minute poll
-        # interval) can still be "current" on the next loop iteration after
-        # we already submitted for it. The server rejects the repeat as a
-        # real conflict rather than replaying the original response, so this
-        # is an expected steady-state case, not a failure - treat it as a
-        # no-op instead of letting it count toward the loop's fail counter.
-        if exc.response is not None and exc.response.status_code == 409:
-            print(f"Ciclo {cycle['cycle_id']} ya tenía una submission enviada; se omite.", flush=True)
-            _mark_cycle_submitted(cycle["cycle_id"])
-            check_collector_heartbeat()
-            return None
-        raise
-    _mark_cycle_submitted(cycle["cycle_id"])
-    result = {
-        "student": identity["display_name"],
-        "submission_id": receipt["submission_id"],
-        "status": receipt["status"],
-        "predictions_received": receipt["predictions_received"],
-        "expected_predictions": receipt["expected_predictions"],
-    }
-    print(f"Estudiante: {result['student']}")
-    print(f"Entrega: {result['submission_id']}")
-    print(f"Estado: {result['status']}")
-    print(f"Predicciones: {result['predictions_received']}/{result['expected_predictions']}")
-    # Checked last, after the submission is already out: a stale collector
-    # shouldn't block a submission that otherwise succeeded, but it should
-    # still surface as a loud failure so it doesn't go unnoticed.
-    check_collector_heartbeat()
-    return result
+    return predictions
 
 
 def main() -> None:
@@ -580,6 +781,9 @@ def main() -> None:
     except UpstreamUnavailable as exc:
         print(f"AVISO: {exc}", flush=True)
         sys.exit(75)
+    except CollectorStale as exc:
+        print(f"::warning::{exc}", flush=True)
+        sys.exit(76)
 
 
 if __name__ == "__main__":
