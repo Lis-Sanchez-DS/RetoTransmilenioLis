@@ -876,6 +876,69 @@ table read now returns `[]`, a direct write is explicitly rejected
 (`"new row violates row-level security policy"`), and all four RPC
 endpoints return real data.
 
+## The teacher's repo (source of truth for the rules) - read 2026-10-03
+
+**https://github.com/uexternadojz/pulso-transmi** (public, default branch `main`)
+is the professor's platform: FastAPI + Postgres + scheduler + portal + docs. It is
+NOT a template for this repo and prescribes no folder layout - students own their
+own pipeline. Read it with `gh api repos/uexternadojz/pulso-transmi/contents/<path>
+--jq .content | base64 -d`. Where it and this skill differ on API behavior, the
+live API and its `docs/api-contract.md` win (the teacher's guide says so itself).
+Most useful files: `docs/api-contract.md` (endpoints, errors, submission rules),
+`docs/fase-final.md` (v2 observations, final-phase evidence), `docs/fase-drift.md`
+(what the project must be able to explain), `docs/primer-corte-evaluacion.md`
+(Corte 1 definition), `docs/guides/pulso-transmi-guia-operativa-v2.0.md` (the
+operational guide and "project is ready when" checklist), `docs/runbook.md`.
+
+Course rules that matter for decisions in this repo:
+
+- **Deadline: Sunday 2026-10-04 23:59 America/Bogota** (final phase, `0.9.0`). The
+  gap between the previous close and reopening creates no cycles and no absences.
+- **Cycles:** one per hour, 25-minute delivery window, 12 stations x 4 horizons =
+  48 targets, always taken from `GET /v1/forecast-cycles/current`, never from a
+  local clock or cron. Observations release every 30 min.
+- **Submission rules:** max 3 accepted attempts per cycle (the last valid one is
+  official; a guardrail rejection does NOT consume an attempt), body <= 64 KB, max
+  10 requests/min per key, exact target set only, `training_data_end` <= cutoff,
+  stable `Idempotency-Key` reused on retry (same key + different body = 409).
+- **Leaderboard:** `cumulative` counts only cycles opened since **Corte 1 =
+  2026-09-25 00:00 Bogota** (older history stays in the DB for audit); the portal
+  chart's "last 6 cycles" is the last six RESOLVED cycles, not your last six
+  submissions. Accepted != evaluated: a cycle only scores once truth is revealed.
+- **Observation v2** (after virtual 2026-09-20T12:00Z): `measurement.value` text
+  decimal or `null` with `quality: missing` (missing != 0); v1 `demand` rows keep
+  coexisting in one page. Evaluation truth stays complete; gaps are training-side only.
+- **What the teacher grades on (evidence, not just rank):** the repo must let the
+  student explain (1) how ingestion/submission continuity is verified, (2) how
+  operational problems are told apart from demand change, (3) what triggers a
+  retrain and which data it uses, (4) how versions are compared temporally with no
+  future leakage, (5) what justifies keeping/promoting/retiring a version, (6) what
+  happened before/during/after a detected change. Changing a model label is explicitly
+  NOT evidence of retraining. Ranking is evidence, not an automatic grade; weights are
+  set by the teacher. Keep README/decision records answering these.
+- **Teacher's "ready" checklist** (guia operativa): no duplicate data, cursor only
+  advanced after a confirmed write, champion with version + metadata + stable
+  location, cron plus manual run, 404 = green exit, delivered cycle never re-POSTed,
+  receipts persisted with model and commit, **training and inference in separate
+  workflows**, accuracy/coverage/drift explainable. Known gap vs. this repo: retrain
+  runs inside `collector.yml` rather than its own workflow, and receipts store no git
+  commit; the loops are self-looping instead of the recommended 10-minute cron.
+  Neither is a violation, but be ready to justify (see "Why workflows self-loop").
+- Secrets never in the repo (`PULSO_API_KEY` etc. only as Actions secrets). The
+  public Supabase key in `web/config.js` is meant to be public (see dashboards).
+
+### Repo hygiene (cleanup 2026-10-03)
+
+The repo is Actions + Supabase only. Removed as dead: the Docker stack (`Dockerfile`,
+`docker-compose.yml`, `.dockerignore`, `app/scheduler.py`, `app/prediction_scheduler.py`),
+`database/init/000_roles.sh` (Docker-Postgres roles), `app/train_comparison_models.py`
+(exploratory), empty `src/ data/ deploy/ notebooks/ workflows/ config/`, and the
+unused `statsmodels`/`httpx` requirements; `.env.example` now lists only the 4 real
+variables. Don't re-add a Docker/local-scheduler path - it contradicts "no local
+component". Keep: `dashboard/` + `.streamlit/` (documented local dashboard),
+`web/`, `docs/figures/` (README references), `app/load_original.py` (restore
+workflow), `scripts/migrate_supabase.py`, all `database/migrations/*` (applied history).
+
 ## Pulso TransMi API quirks worth remembering
 
 - `GET /v1/forecast-cycles/current` - 404 with `no_open_cycle` is a normal

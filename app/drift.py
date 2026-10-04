@@ -714,7 +714,7 @@ def station_accuracy_stats() -> pd.DataFrame:
     predicted/actual pairs.
 
     Accuracy = max(0, 1 - WAPE), i.e. 1 - sum(|demand - prediction|) / sum(|demand|),
-    the same formula as train_comparison_models.py's score() (there scaled by 100).
+    the project's accuracy metric.
 
     A count-based window (not a time window) per station: a station that has
     fallen behind or whose data is arriving irregularly still gets judged on

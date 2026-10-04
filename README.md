@@ -84,8 +84,6 @@ app/
   net.py                  reintentos de red para fallos transitorios
   db.py                    conexión a Supabase Postgres
   load_original.py         carga única del histórico inicial (45 días) en "Original Data"
-  scheduler.py / prediction_scheduler.py   loops usados para ejecución local/Docker (no usados en producción)
-  train_comparison_models.py               script exploratorio para comparar variantes de modelo
 
 .github/workflows/
   collector.yml            workflow de recolección + drift (ver arriba)
